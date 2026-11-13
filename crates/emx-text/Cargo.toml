@@ -12,6 +12,8 @@ memchr.workspace = true
 parking_lot.workspace = true
 rustix.workspace = true
 thiserror.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]

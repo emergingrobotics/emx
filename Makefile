@@ -30,7 +30,7 @@ build:
 	cp target/release/emx bin/emx
 
 test:
-	cargo test --workspace $(TEST_ARGS)
+	cargo test $(if $(TEST_ARGS),$(TEST_ARGS),--workspace)
 
 run-tests: test
 
