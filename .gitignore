@@ -5,3 +5,7 @@
 bin/
 .llm/
 target/
+.superpowers/
+crates/emx-text/fuzz/artifacts/
+crates/emx-text/fuzz/corpus/
+bench/corpus/
