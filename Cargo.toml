@@ -9,4 +9,18 @@ readme = "VISION.md"
 keywords = ["editor", "emacs", "terminal", "tui"]
 categories = ["text-editors", "command-line-utilities"]
 
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/emergingrobotics/emx"
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
+
 [dependencies]
+clap = { workspace = true }
