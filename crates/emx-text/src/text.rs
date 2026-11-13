@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::block_cache::BLOCK_SIZE;
-use crate::line_index::NthNewline;
+use crate::line_index::{BlockReader, NthNewline};
 use crate::piece_tree::{
     self, Piece, PieceSource, Pieces, PiecesBackward, Tree, last_piece, leaf, merge,
     replace_last_piece, split, summary,
@@ -72,6 +72,13 @@ fn is_file_backed(sources: &Sources, piece: &Piece) -> bool {
     piece.source == PieceSource::Original && matches!(sources.original, Original::File(_))
 }
 
+fn block_reader(original: &Original) -> BlockReader<'_> {
+    match original {
+        Original::Memory(bytes) => BlockReader::Memory(bytes),
+        Original::File(cache) => BlockReader::Cache(cache),
+    }
+}
+
 fn memory_range(piece: &Piece, within: Range<u64>) -> Range<usize> {
     let start = usize::try_from(piece.start + within.start).expect("memory offset fits");
     let end = usize::try_from(piece.start + within.end).expect("memory offset fits");
@@ -82,15 +89,9 @@ fn memory_range(piece: &Piece, within: Range<u64>) -> Range<usize> {
 fn count_piece(sources: &Sources, piece: &Piece) -> Result<Option<u64>, ReadError> {
     match (piece.source, &sources.original) {
         (PieceSource::Add, _) => Ok(Some(sources.add.count_newlines(piece.start, piece.len))),
-        (PieceSource::Original, Original::Memory(bytes)) => {
-            let range = memory_range(piece, 0..piece.len);
-            Ok(Some(
-                memchr::memchr_iter(b'\n', &bytes[range]).count() as u64
-            ))
-        }
-        (PieceSource::Original, Original::File(cache)) => sources
+        (PieceSource::Original, original) => sources
             .index
-            .count_range(cache, piece.start..piece.start + piece.len),
+            .count_range_in(block_reader(original), piece.start..piece.start + piece.len),
     }
 }
 
@@ -463,28 +464,23 @@ impl Text {
         {
             return Ok(Nth::NotFound { count });
         }
-        let found = match (piece.source, &self.sources.original) {
-            (PieceSource::Add, _) => self.sources.add.nth_newline(piece.start, piece.len, n),
-            (PieceSource::Original, Original::Memory(bytes)) => {
-                let range = memory_range(piece, 0..piece.len);
-                let skip = usize::try_from(n).expect("ordinal below a memory piece's count");
-                memchr::memchr_iter(b'\n', &bytes[range])
-                    .nth(skip)
-                    .map(|position| position as u64)
-            }
-            (PieceSource::Original, Original::File(cache)) => {
-                let file_range = piece.start..piece.start + piece.len;
-                return Ok(
-                    match self.sources.index.nth_newline(cache, file_range, n)? {
-                        NthNewline::Found(file_offset) => Nth::Found(file_offset - piece.start),
-                        NthNewline::NotInRange { count } => Nth::NotFound { count },
-                        NthNewline::Unknown => Nth::Unknown,
-                    },
-                );
-            }
-        };
-        let found = found.expect("memory and add pieces hold their counted newlines");
-        Ok(Nth::Found(found))
+        if piece.source == PieceSource::Add {
+            let found = self
+                .sources
+                .add
+                .nth_newline(piece.start, piece.len, n)
+                .expect("an add piece holds its counted newlines");
+            return Ok(Nth::Found(found));
+        }
+        let reader = block_reader(&self.sources.original);
+        let file_range = piece.start..piece.start + piece.len;
+        Ok(
+            match self.sources.index.nth_newline_in(reader, file_range, n)? {
+                NthNewline::Found(file_offset) => Nth::Found(file_offset - piece.start),
+                NthNewline::NotInRange { count } => Nth::NotFound { count },
+                NthNewline::Unknown => Nth::Unknown,
+            },
+        )
     }
 
     /// Number of newlines strictly before `pos`, or `None` while unindexed.
@@ -537,18 +533,15 @@ impl Text {
     }
 
     /// Fills unknown piece newline counts from the line index as it
-    /// progresses. A piece whose count cannot be computed yet (unindexed, or
-    /// its partial edge block unreadable) stays unknown: the read error itself
-    /// surfaces through the read paths, and the next refresh retries.
-    pub fn refresh_newlines(&self) -> Text {
+    /// progresses. A piece stays unknown only while its region is unindexed;
+    /// reading a partly covered edge block can fail, and that error propagates.
+    pub fn refresh_newlines(&self) -> Result<Text, ReadError> {
         let sources = &self.sources;
-        let root = piece_tree::refresh(&self.root, &mut |piece| {
-            count_piece(sources, piece).ok().flatten()
-        });
-        Text {
+        let root = piece_tree::refresh(&self.root, &mut |piece| count_piece(sources, piece))?;
+        Ok(Text {
             root,
             sources: self.sources.clone(),
-        }
+        })
     }
 
     pub fn pieces(&self) -> impl Iterator<Item = (u64, Piece)> + use<> {
@@ -562,5 +555,59 @@ impl Text {
             (None, None) => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EDIT_STEPS: u64 = 6000;
+    /// Slack for small trees, where `4 * log2(pieces)` is tight.
+    const DEPTH_SLACK: u64 = 8;
+
+    fn random(step: u64, salt: u64) -> u64 {
+        xxhash_rust::xxh3::xxh3_64(&[step.to_le_bytes(), salt.to_le_bytes()].concat())
+    }
+
+    fn assert_balanced(text: &Text) {
+        let pieces = text.piece_count().max(1);
+        let bound = 4 * u64::from(pieces.ilog2() + 1) + DEPTH_SLACK;
+        let depth = piece_tree::depth(&text.root);
+        assert!(
+            depth <= bound,
+            "depth {depth} exceeds {bound} for {pieces} pieces"
+        );
+    }
+
+    #[test]
+    fn random_edits_on_one_original_piece_stay_balanced() {
+        let content: Vec<u8> = (0..200_000u32).map(|index| (index % 251) as u8).collect();
+        let mut text = Text::from_original(Sources::memory(Arc::from(content)));
+        for step in 0..EDIT_STEPS {
+            let position = random(step, 1) % (text.len() + 1);
+            text = if step % 2 == 0 {
+                let end = (position + random(step, 2) % 8).min(text.len());
+                text.delete(position..end).expect("delete")
+            } else {
+                text.insert(position, b"ab\n").expect("insert")
+            };
+            if step % 500 == 0 {
+                assert_balanced(&text);
+            }
+        }
+        assert!(text.piece_count() > 1000, "edits produced many pieces");
+        assert_balanced(&text);
+    }
+
+    #[test]
+    fn deletes_only_on_one_original_piece_stay_balanced() {
+        let content = vec![b'x'; 100_000];
+        let mut text = Text::from_original(Sources::memory(Arc::from(content)));
+        for step in 0..EDIT_STEPS / 2 {
+            let position = random(step, 3) % text.len();
+            text = text.delete(position..position + 1).expect("delete");
+        }
+        assert_balanced(&text);
     }
 }

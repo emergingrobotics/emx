@@ -119,40 +119,53 @@ pub(crate) type NewlineCounter<'counter> =
     dyn FnMut(&Piece) -> Result<Option<u64>, ReadError> + 'counter;
 
 /// Splits into bytes `[0, at)` and `[at, len)`, cutting a piece when `at`
-/// falls inside it.
+/// falls inside it. The two halves of a cut piece become fresh leaves joined
+/// at the top level: reusing the cut node's priority for both would tie them,
+/// and repeated cuts of one piece would then pile up into a chain.
 pub(crate) fn split(
     tree: &Tree,
     at: u64,
     count: &mut NewlineCounter<'_>,
 ) -> Result<(Tree, Tree), ReadError> {
+    let (before, cut, after) = split_around(tree, at);
+    match cut {
+        None => Ok((before, after)),
+        Some((piece, offset)) => {
+            let (head, tail) = split_piece(&piece, offset, count)?;
+            Ok((merge(&before, &leaf(head)), merge(&leaf(tail), &after)))
+        }
+    }
+}
+
+/// Structural split at `at`. When `at` falls strictly inside a piece, that
+/// piece's node is removed and returned with the offset into it; `before` and
+/// `after` then hold the bytes on either side of the piece.
+fn split_around(tree: &Tree, at: u64) -> (Tree, Option<(Piece, u64)>, Tree) {
     let Some(node) = tree else {
-        return Ok((None, None));
+        return (None, None, None);
     };
     if at == 0 {
-        return Ok((None, tree.clone()));
+        return (None, None, tree.clone());
     }
     if at >= node.summary.bytes {
-        return Ok((tree.clone(), None));
+        return (tree.clone(), None, None);
     }
     let left_bytes = summary(&node.left).bytes;
     let piece_end = left_bytes + node.piece.len;
     if at <= left_bytes {
-        let (outer, inner) = split(&node.left, at, count)?;
+        let (outer, cut, inner) = split_around(&node.left, at);
         let rebuilt = Node::build(node.piece, node.priority, inner, node.right.clone());
-        Ok((outer, Some(rebuilt)))
+        (outer, cut, Some(rebuilt))
     } else if at >= piece_end {
-        let (inner, outer) = split(&node.right, at - piece_end, count)?;
+        let (inner, cut, outer) = split_around(&node.right, at - piece_end);
         let rebuilt = Node::build(node.piece, node.priority, node.left.clone(), inner);
-        Ok((Some(rebuilt), outer))
+        (Some(rebuilt), cut, outer)
     } else {
-        let (head, tail) = split_piece(&node.piece, at - left_bytes, count)?;
-        // Both halves keep the cut node's priority: a fresh priority could
-        // exceed an ancestor's once the caller re-attaches this result,
-        // breaking heap order and with it the balance guarantee.
-        Ok((
-            Some(Node::build(head, node.priority, node.left.clone(), None)),
-            Some(Node::build(tail, node.priority, None, node.right.clone())),
-        ))
+        (
+            node.left.clone(),
+            Some((node.piece, at - left_bytes)),
+            node.right.clone(),
+        )
     }
 }
 
@@ -206,18 +219,27 @@ pub(crate) fn replace_last_piece(tree: &Tree, piece: Piece) -> Tree {
 }
 
 /// Fills unknown piece counts, reusing every subtree whose count is known.
-pub(crate) fn refresh(tree: &Tree, count: &mut dyn FnMut(&Piece) -> Option<u64>) -> Tree {
-    let node = tree.as_ref()?;
+pub(crate) fn refresh(tree: &Tree, count: &mut NewlineCounter<'_>) -> Result<Tree, ReadError> {
+    let Some(node) = tree else {
+        return Ok(None);
+    };
     if node.summary.newlines.is_some() {
-        return tree.clone();
+        return Ok(tree.clone());
     }
     let mut piece = node.piece;
     if piece.newlines.is_none() {
-        piece.newlines = count(&piece);
+        piece.newlines = count(&piece)?;
     }
-    let left = refresh(&node.left, count);
-    let right = refresh(&node.right, count);
-    Some(Node::build(piece, node.priority, left, right))
+    let left = refresh(&node.left, count)?;
+    let right = refresh(&node.right, count)?;
+    Ok(Some(Node::build(piece, node.priority, left, right)))
+}
+
+/// Longest root-to-leaf path, in nodes.
+#[cfg(test)]
+pub(crate) fn depth(tree: &Tree) -> u64 {
+    tree.as_ref()
+        .map_or(0, |node| 1 + depth(&node.left).max(depth(&node.right)))
 }
 
 /// In-order iterator over `(buffer offset, piece)`.

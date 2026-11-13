@@ -653,7 +653,7 @@ fn unknown_before_indexed() {
     );
     assert!(index.is_complete());
     assert_eq!(text.line_count(), None, "old text keeps its unknown piece");
-    let refreshed = text.refresh_newlines();
+    let refreshed = text.refresh_newlines().expect("refresh");
     assert_eq!(refreshed.line_count(), Some(newline_count(&content) + 1));
     assert_eq!(read_all(&refreshed), content);
 }
@@ -789,4 +789,126 @@ fn newline_search_crosses_block_boundaries_in_file_original() {
         .map(|chunk| chunk.expect("chunk").start)
         .collect();
     assert_eq!(chunk_starts, vec![BLOCK - 2, BLOCK, 2 * BLOCK]);
+}
+
+/// Indexes exactly the blocks selected by `mask` (cycled), straight from
+/// `content`, leaving the rest unknown.
+fn partially_indexed_file_text(
+    path: &Path,
+    content: &[u8],
+    mask: &[bool],
+) -> (Text, Arc<BlockCache>) {
+    fs::write(path, content).expect("write fixture");
+    let cache = BlockCache::open(path, TEST_CACHE_BYTES).expect("open cache");
+    let index = LineIndex::new(cache.len());
+    for (block, bytes) in content.chunks(BLOCK_SIZE).enumerate() {
+        if mask[block % mask.len()] {
+            index.set_block(block as u64, newline_count(bytes) as u32);
+        }
+    }
+    let text = Text::from_original(Sources::file(cache.clone(), index));
+    (text, cache)
+}
+
+fn check_lines_never_wrong(
+    text: &Text,
+    reference: &[u8],
+    probes: &[Probe],
+    lines: &[u64],
+) -> Result<(), TestCaseError> {
+    let total = reference.len() as u64;
+    if let Some(count) = text.line_count() {
+        prop_assert_eq!(count, newline_count(reference) + 1);
+    }
+    for &probe in probes {
+        let position = probe_position(probe, total);
+        if let Some(line) = text.line_of(position).expect("line_of") {
+            prop_assert_eq!(line, newline_count(&reference[..position as usize]));
+        }
+    }
+    for &line in lines {
+        let lookup = text.line_start(line).expect("line_start");
+        if lookup != LineLookup::Unknown {
+            prop_assert_eq!(lookup, reference_line_start(reference, line));
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
+
+    #[test]
+    fn edits_on_partially_indexed_file_original(
+        pattern in prop::collection::vec(byte_run_strategy(), 1..30).prop_map(|runs| runs.concat()),
+        repetitions in 1usize..5000,
+        mask in prop::collection::vec(any::<bool>(), 1..6),
+        ops in prop::collection::vec(op_strategy(), 0..30),
+        probes in probes_strategy(),
+        lines in prop::collection::vec(0u64..20_000, 1..4),
+    ) {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let content = pattern.repeat(repetitions);
+        let (mut text, cache) =
+            partially_indexed_file_text(&directory.path().join("partial.txt"), &content, &mask);
+        let mut reference = content.clone();
+        check_matches_bytes(&text, &reference)?;
+        check_lines_never_wrong(&text, &reference, &probes, &lines)?;
+        for op in &ops {
+            text = apply(&text, &mut reference, op)?;
+            check_matches_bytes(&text, &reference)?;
+            check_lines_never_wrong(&text, &reference, &probes, &lines)?;
+        }
+
+        let index = text.sources().index.clone();
+        index_file(&cache, &index, &AtomicBool::new(false), &mut |_| {}).expect("finish indexing");
+        let refreshed = text.refresh_newlines().expect("refresh");
+        prop_assert_eq!(refreshed.line_count(), Some(newline_count(&reference) + 1));
+        for &line in &lines {
+            prop_assert_eq!(refreshed.line_start(line).expect("line_start"), reference_line_start(&reference, line));
+        }
+        for &probe in &probes {
+            let position = probe_position(probe, reference.len() as u64);
+            prop_assert_eq!(
+                refreshed.line_of(position).expect("line_of"),
+                Some(newline_count(&reference[..position as usize]))
+            );
+        }
+        check_matches(&refreshed, &reference)?;
+    }
+}
+
+fn check_matches_bytes(text: &Text, reference: &[u8]) -> Result<(), TestCaseError> {
+    prop_assert_eq!(text.len(), reference.len() as u64);
+    prop_assert_eq!(read_all(text), reference.to_vec());
+    Ok(())
+}
+
+#[test]
+fn refresh_newlines_propagates_read_errors() {
+    let content = generated_content(3 * BLOCK_SIZE, 17);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("refresh.txt");
+    let (text, cache) = partially_indexed_file_text(&path, &content, &[false]);
+    let edited = text
+        .insert(BLOCK + 100, b"x")
+        .expect("insert in unindexed region");
+    assert_eq!(edited.line_count(), None);
+    let index = edited.sources().index.clone();
+    for (block, bytes) in content.chunks(BLOCK_SIZE).enumerate() {
+        index.set_block(block as u64, newline_count(bytes) as u32);
+    }
+    let file = OpenOptions::new().write(true).open(&path).expect("reopen");
+    file.set_len(10).expect("truncate");
+    cache.invalidate_from(0);
+    match edited.refresh_newlines() {
+        Err(ReadError::Truncated {
+            expected_len,
+            actual_len,
+        }) => {
+            assert_eq!(expected_len, 3 * BLOCK);
+            assert_eq!(actual_len, 10);
+        }
+        other => panic!("expected Truncated, got {other:?}"),
+    }
 }
