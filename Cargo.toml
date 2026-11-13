@@ -1,0 +1,12 @@
+[package]
+name = "emx"
+version = "0.0.1"
+edition = "2024"
+description = "A fast terminal editor with Emacs keybindings, built for working alongside coding agents"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/emergingrobotics/emx"
+readme = "VISION.md"
+keywords = ["editor", "emacs", "terminal", "tui"]
+categories = ["text-editors", "command-line-utilities"]
+
+[dependencies]

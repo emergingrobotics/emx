@@ -1,0 +1,7 @@
+/target
+.env
+.envrc
+*~
+bin/
+.llm/
+target/
