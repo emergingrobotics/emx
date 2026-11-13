@@ -117,7 +117,7 @@ crates/emx-term/src/
   kitty.rs                       KittyDecoder, InputEvent
   terminal.rs                    raw mode, setup/restore, kitty probe
   screen.rs                      Grid -> escape-sequence diff
-crates/emx/src/
+src/                             the `emx` binary: the existing root package (crates.io name, publish metadata)
   main.rs                        clap CLI dispatch
   paths.rs                       socket dir, state dir, config path; ownership checks
   server/mod.rs                  accept loop, editor thread, lifetime
@@ -128,7 +128,7 @@ crates/emx/src/
   client.rs                      TUI client (socket or in-process)
   cli.rs                         open/list-buffers/reload/goto/save-all/events/diff-external
   noserver.rs                    in-process runner
-crates/emx/tests/                PTY and server integration tests
+tests/                           PTY and server integration tests (root package)
 crates/emx-bench/src/main.rs     benchmark harness (M4)
 difftest/emx-difftest.el         Emacs batch driver
 difftest/cases/*.jsonl           differential cases
@@ -141,15 +141,18 @@ crates/emx-core/tests/difftest.rs  differential runner
 
 ### Task 1: Workspace scaffolding, Makefile, git
 
+**Existing state:** the repo already has the root package `emx` (version 0.0.1, crates.io metadata: description, license, repository, readme, keywords, categories), `src/main.rs` (hello world), `LICENSE-MIT`, `LICENSE-APACHE`, a Makefile with `help build test run-tests check clean publish-dry-run publish`, and `.gitignore`. Keep all of that metadata and the publish targets.
+
 **Files:**
-- Create: `Cargo.toml`, `rust-toolchain.toml`, `Makefile`, `.gitignore`, `LICENSE-MIT`, `LICENSE-APACHE`, `README.md`, `crates/*/Cargo.toml`, `crates/*/src/lib.rs` (or `main.rs`)
+- Modify: `Cargo.toml` (add `[workspace]` with `members = ["crates/*"]`, `resolver = "3"`, `[workspace.package]` and `[workspace.dependencies]`; the root package stays the `emx` binary), `Makefile`, `src/main.rs`
+- Create: `rust-toolchain.toml`, `README.md`, `crates/{emx-types,emx-text,emx-core,emx-proto,emx-term,emx-bench}/Cargo.toml` and `src/lib.rs` (`emx-bench`: `src/main.rs`)
 
 **Interfaces:**
-- Produces: workspace members `emx-types`, `emx-text`, `emx-core`, `emx-proto`, `emx-term`, `emx` (binary named `emx`), `emx-bench` (binary).
+- Produces: workspace members `emx-types`, `emx-text`, `emx-core`, `emx-proto`, `emx-term`, `emx-bench` (binary); the root package `emx` (binary named `emx`).
 
-- [ ] **Step 1:** `git init`; `.gitignore` with `.env`, `.envrc`, `*~`, `bin/`, `.llm/`, `target/`, `crates/emx-text/fuzz/artifacts/`, `crates/emx-text/fuzz/corpus/`, `bench/corpus/`.
-- [ ] **Step 2:** Makefile. Default target prints the target list. Targets: `build` (release build of `emx`, binary copied to `bin/emx`), `test` (`cargo test --workspace $(TEST_ARGS)`), `run-tests` (alias of `test` plus `difftest`), `difftest` (`cargo test -p emx-core --test difftest`), `check` (fmt check, clippy `-D warnings`, `run-tests`), `fmt`, `fuzz` (each fuzz target for `FUZZ_SECONDS ?= 60` on nightly), `bench` (10 MB and 1 GB corpora), `bench-full` (adds 10 GB), `static` (x86_64 and aarch64 musl via `cargo zigbuild`), `clean`. Every recipe echoes its command.
-- [ ] **Step 3:** Each crate compiles with `#![forbid(unsafe_code)]`; `emx` prints `emx 0.1.0` for `--version`.
+- [ ] **Step 1:** `.gitignore` is already correct; leave it.
+- [ ] **Step 2:** Makefile (keep `help` as the default goal and keep `publish-dry-run`/`publish`). Default target prints the target list. Targets: `build` (release build of `emx`, binary copied to `bin/emx`), `test` (`cargo test --workspace $(TEST_ARGS)`), `run-tests` (alias of `test` plus `difftest`), `difftest` (`cargo test -p emx-core --test difftest`), `check` (fmt check, clippy `-D warnings`, `run-tests`), `fmt`, `fuzz` (each fuzz target for `FUZZ_SECONDS ?= 60` on nightly), `bench` (10 MB and 1 GB corpora), `bench-full` (adds 10 GB), `static` (x86_64 and aarch64 musl via `cargo zigbuild`), `clean`. Every recipe echoes its command.
+- [ ] **Step 3:** Each crate compiles with `#![forbid(unsafe_code)]`; `emx --version` prints `emx <CARGO_PKG_VERSION>`.
 - [ ] **Step 4:** Run `make check`. Expected: passes with zero tests.
 - [ ] **Step 5:** Commit `chore: scaffold emx workspace`.
 
@@ -402,7 +405,7 @@ proptest! {
 
 ### Task 13: Server, client, `--no-server`, CLI (`emx` binary)
 
-**Files:** Create `paths.rs`, `server/*`, `client.rs`, `cli.rs`, `noserver.rs`, `main.rs`; tests `crates/emx/tests/{pty_basic.rs, server.rs, cli.rs, crash.rs, paths.rs}` with a shared `tests/common/mod.rs` PTY harness (`portable-pty` + `vt100`; the harness answers `CSI ? u` with `CSI ? 1 u` and `CSI c` with `CSI ? 62 c`, and encodes keys with the Kitty encoding).
+**Files:** Create `src/paths.rs`, `src/server/*`, `src/client.rs`, `src/cli.rs`, `src/noserver.rs`, modify `src/main.rs`; tests `tests/{pty_basic.rs, server.rs, cli.rs, crash.rs, paths.rs}` with a shared `tests/common/mod.rs` PTY harness (`portable-pty` + `vt100`; the harness answers `CSI ? u` with `CSI ? 1 u` and `CSI c` with `CSI ? 62 c`, and encodes keys with the Kitty encoding).
 
 **Interfaces:**
 - Consumes: everything above.
@@ -452,7 +455,7 @@ proptest! {
 
 ### Task 15: Watcher, polling, notifications, change markers, events (server side)
 
-**Files:** Create `crates/emx/src/server/watcher.rs`; extend editor notifications and `EditorEvent` emission; tests `crates/emx/tests/reload_e2e.rs`.
+**Files:** Create `src/server/watcher.rs`; extend editor notifications and `EditorEvent` emission; tests `tests/reload_e2e.rs`.
 
 **Interfaces:**
 - Produces:
@@ -538,7 +541,7 @@ proptest! {
 
 ### Task 21: Background indexer, unknown line numbers, pending goto
 
-**Files:** `crates/emx/src/server/workers.rs` (indexer thread), `emx-core` editor and render updates.
+**Files:** `src/server/workers.rs` (indexer thread), `emx-core` editor and render updates.
 
 **Interfaces:**
 - Produces: `Effect::StartIndex` spawns `index_file` on its own thread with progress every 256 blocks as `Event::IndexProgress`; on progress the editor calls `Text::refresh_newlines`. Modeline shows `L?` while the point's line is unknown and `Indexing NN%` badge. `M->` jumps instantly. `goto-line N` with N beyond the indexed prefix enters a pending state showing `Indexing to line N... NN%` and completes when reached; `C-g` cancels. Cold start: `index_file` uses `fadvise(Sequential)`.
