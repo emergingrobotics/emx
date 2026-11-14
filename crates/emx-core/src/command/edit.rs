@@ -19,11 +19,23 @@ pub(super) fn self_insert_command(ctx: &mut CommandContext) -> Result<(), Comman
         ctx.ding();
         return Ok(());
     };
-    let count = usize::try_from(count)
-        .map_err(|_| ctx.error(format!("Repetition argument {count} is too large")))?;
     let mut encoded = [0; 4];
-    let bytes = character.encode_utf8(&mut encoded).as_bytes().repeat(count);
-    ctx.insert(&bytes)
+    let encoded = character.encode_utf8(&mut encoded).as_bytes();
+    // The count comes from typed digits, so it is bounded before anything is
+    // allocated: one insertion may not exceed what a buffer holds in memory.
+    let limit = ctx.editor().config().in_memory_max;
+    let total = u64::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(encoded.len() as u64))
+        .filter(|total| *total <= limit)
+        .ok_or_else(|| {
+            ctx.error(format!(
+                "Repetition argument {count} is too large (limit {limit} bytes)"
+            ))
+        })?;
+    let repeat = usize::try_from(total / encoded.len() as u64)
+        .expect("a total within in_memory_max fits in usize");
+    ctx.insert(&encoded.repeat(repeat))
 }
 
 /// Only an unmodified character key inserts; Emacs rings the bell when the

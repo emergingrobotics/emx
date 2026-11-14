@@ -127,7 +127,9 @@ enum Completion {
     /// A prefix-argument command ran: the argument and `last-command`
     /// carry over to the next command.
     KeepPrefixState(PrefixArg),
-    /// Emacs `prefix-arg` was set without `universal-argument--mode`.
+    /// Any other command. Emacs `universal-argument-more` after digits sets
+    /// `prefix-arg` without `universal-argument--mode`; the argument still
+    /// carries over.
     Ran {
         this_command: Option<&'static str>,
         next_prefix_arg: PrefixArg,
@@ -148,6 +150,9 @@ pub struct Editor {
     effects: Vec<Effect>,
     timers: HashMap<TimerId, TimerPurpose>,
     next_timer: u64,
+    /// The one grace timer that may shut the daemon down; earlier ones were
+    /// superseded by a later detach or cancelled by an attach.
+    grace_timer: Option<TimerId>,
 }
 
 impl Editor {
@@ -167,6 +172,7 @@ impl Editor {
             effects: Vec::new(),
             timers: HashMap::new(),
             next_timer: 0,
+            grace_timer: None,
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -241,6 +247,7 @@ impl Editor {
             !self.clients.contains_key(&client),
             "the server attaches each client id once"
         );
+        self.grace_timer = None;
         let buffer_id = self.scratch;
         let buffer = &mut self.buffers[buffer_id];
         let window = Window {
@@ -271,7 +278,8 @@ impl Editor {
             buffer.delete_marker(window.start);
         }
         if self.clients.is_empty() && !self.has_unsaved() {
-            self.set_timer(TimerPurpose::DaemonGrace, self.config.daemon_grace_ms);
+            let id = self.set_timer(TimerPurpose::DaemonGrace, self.config.daemon_grace_ms);
+            self.grace_timer = Some(id);
         }
     }
 
@@ -304,7 +312,8 @@ impl Editor {
                 }
             }
             TimerPurpose::DaemonGrace => {
-                if self.clients.is_empty() && !self.has_unsaved() {
+                if self.grace_timer == Some(id) && self.clients.is_empty() && !self.has_unsaved() {
+                    self.grace_timer = None;
                     self.effects.push(Effect::Shutdown);
                 }
             }
@@ -453,8 +462,14 @@ impl Editor {
                 next_prefix_arg,
             } => {
                 state.end_command();
-                state.prefix_arg = next_prefix_arg;
-                state.last_command = this_command;
+                // Emacs command_loop_1 updates last-command only when the
+                // command left prefix-arg nil.
+                if next_prefix_arg == PrefixArg::None {
+                    state.last_command = this_command;
+                } else {
+                    state.prefix_arg = next_prefix_arg;
+                    self.update_echo(client_id);
+                }
             }
         }
     }
@@ -729,6 +744,21 @@ mod tests {
         attach(&mut editor, SECOND);
         editor.handle(Event::Timer(pending[0].0));
         assert!(editor.take_effects().is_empty());
+    }
+
+    #[test]
+    fn stale_grace_timer_does_not_shut_down() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        editor.handle(Event::ClientDetached(FIRST));
+        let first = timers(&editor.take_effects());
+        attach(&mut editor, SECOND);
+        editor.handle(Event::ClientDetached(SECOND));
+        let second = timers(&editor.take_effects());
+        editor.handle(Event::Timer(first[0].0));
+        assert!(editor.take_effects().is_empty(), "superseded timer ignored");
+        editor.handle(Event::Timer(second[0].0));
+        assert_eq!(editor.take_effects(), vec![Effect::Shutdown]);
     }
 
     #[test]

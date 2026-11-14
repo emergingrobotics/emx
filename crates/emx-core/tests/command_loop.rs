@@ -303,6 +303,15 @@ fn self_insert_amalgamates_like_emacs() {
     harness.keys("a C-u 2 b");
     undo_once(&mut harness);
     assert_eq!(harness.text(), "a");
+    // a M-1 C-u b C-/ => "" and a C-u 1 C-u b C-/ => "": C-u after digits
+    // leaves the argument set, so last-command stays self-insert-command.
+    for keys in ["a M-1 C-u b", "a C-u 1 C-u b"] {
+        let mut harness = Harness::new();
+        harness.keys(keys);
+        assert_eq!(harness.text(), "ab", "{keys}");
+        undo_once(&mut harness);
+        assert_eq!(harness.text(), "", "{keys}");
+    }
     // a C-f b C-/ => "a": another command breaks the run.
     let mut harness = Harness::new();
     harness.keys("a C-b C-f b");
@@ -422,6 +431,39 @@ fn zero_echo_keystrokes_disables_echo() {
     harness.keys("C-x");
     harness.fire_timers();
     assert_eq!(harness.echo(), "");
+}
+
+#[test]
+fn absurd_repeat_counts_error_without_allocating() {
+    for keys in [
+        "C-u 1 0 0 0 0 0 0 0 0 0 0 a",
+        &["C-u"; 32].join(" "),
+        "C-u 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 9 \u{3bb}",
+    ] {
+        let mut harness = Harness::with_text("x|");
+        harness.keys(keys);
+        if !keys.ends_with("a") && !keys.ends_with("\u{3bb}") {
+            harness.keys("a");
+        }
+        assert_eq!(harness.text(), "x", "{keys}");
+        assert_eq!(harness.point(), 1, "{keys}");
+        assert!(
+            harness.echo().contains("too large"),
+            "{keys}: {}",
+            harness.echo()
+        );
+        assert_eq!(bells(&mut harness), 1, "{keys}");
+    }
+}
+
+#[test]
+fn numeric_argument_kept_by_c_u_still_echoes() {
+    let mut harness = Harness::new();
+    harness.keys("C-u 5 C-u");
+    harness.fire_timers();
+    assert_eq!(harness.echo(), "C-u 5-");
+    harness.keys("1");
+    assert_eq!(harness.text(), "11111");
 }
 
 #[test]
