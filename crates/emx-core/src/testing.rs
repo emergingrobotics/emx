@@ -6,7 +6,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use emx_proto::{ClientKind, ServerMsg};
+use emx_proto::{ClientKind, Request, ServerMsg};
 use emx_text::{Sources, Text};
 use emx_types::{Grid, Key, KeyCode, Mods, parse_kbd};
 
@@ -90,6 +90,10 @@ pub struct Harness {
     /// Auto-save files that could not be deleted.
     io_errors: Vec<String>,
     journal_ops: Vec<JournalOp>,
+    /// Every message sent, to whom.
+    messages: Vec<(ClientId, ServerMsg)>,
+    next_client: u64,
+    next_request: u64,
 }
 
 impl Default for Harness {
@@ -126,6 +130,9 @@ impl Harness {
             sinks: None,
             io_errors: Vec::new(),
             journal_ops: Vec::new(),
+            messages: Vec::new(),
+            next_client: HARNESS_CLIENT.0 + 1,
+            next_request: 1,
         };
         harness.handle(Event::ClientAttached {
             client: HARNESS_CLIENT,
@@ -192,7 +199,121 @@ impl Harness {
     }
 
     pub fn paste(&mut self, bytes: &[u8]) {
-        self.handle(Event::Paste(self.client, bytes.to_vec()));
+        self.handle(Event::Paste {
+            client: self.client,
+            data: bytes.to_vec(),
+            last: true,
+        });
+    }
+
+    /// Attaches another 80x24 client and returns its id.
+    pub fn attach(&mut self, kind: ClientKind) -> ClientId {
+        let client = ClientId(self.next_client);
+        self.next_client += 1;
+        self.handle(Event::ClientAttached {
+            client,
+            cols: HARNESS_COLS,
+            rows: HARNESS_ROWS,
+            kind,
+        });
+        client
+    }
+
+    pub fn detach(&mut self, client: ClientId) {
+        self.handle(Event::ClientDetached(client));
+    }
+
+    /// Feeds an Emacs `kbd` sequence from `client`.
+    pub fn keys_as(&mut self, client: ClientId, kbd: &str) {
+        for key in parse_kbd(kbd).expect("test key sequence is valid kbd") {
+            self.handle(Event::Key(client, key));
+        }
+    }
+
+    /// Feeds each character of `text` from `client`.
+    pub fn type_as(&mut self, client: ClientId, text: &str) {
+        for character in text.chars() {
+            let key = Key {
+                code: KeyCode::Char(character),
+                mods: Mods::default(),
+            };
+            self.handle(Event::Key(client, key));
+        }
+    }
+
+    /// One chunk of a bracketed paste from `client`.
+    pub fn paste_chunk(&mut self, client: ClientId, bytes: &[u8], last: bool) {
+        self.handle(Event::Paste {
+            client,
+            data: bytes.to_vec(),
+            last,
+        });
+    }
+
+    /// Sends a socket API request from `client`; returns its id.
+    pub fn request(&mut self, client: ClientId, request: Request) -> u64 {
+        let id = self.next_request;
+        self.next_request += 1;
+        self.handle(Event::Request(client, id, request));
+        id
+    }
+
+    /// Messages sent to `client` since the last call for it.
+    pub fn take_messages(&mut self, client: ClientId) -> Vec<ServerMsg> {
+        let (taken, kept) = std::mem::take(&mut self.messages)
+            .into_iter()
+            .partition(|(to, _)| *to == client);
+        self.messages = kept;
+        taken.into_iter().map(|(_, message)| message).collect()
+    }
+
+    /// Point in `client`'s selected window.
+    pub fn point_of(&self, client: ClientId) -> u64 {
+        let window = self.editor.selected_window_id(client);
+        self.editor.window_point(client, window)
+    }
+
+    /// `client`'s frame as text, as `screen` gives the harness client's.
+    pub fn screen_of(&self, client: ClientId) -> Vec<String> {
+        let grid = render(&self.editor, client).0;
+        (0..grid.rows)
+            .map(|row| {
+                grid.row(row)
+                    .iter()
+                    .filter(|cell| cell.width > 0)
+                    .map(|cell| cell.text.as_str())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `client`'s echo area message.
+    pub fn echo_of(&self, client: ClientId) -> String {
+        self.editor.echo(client).to_string()
+    }
+
+    /// `client`'s echo area line.
+    pub fn echo_line_of(&self, client: ClientId) -> String {
+        self.editor.echo_area(client).0
+    }
+
+    /// The text of the buffer named `name`; invalid UTF-8 is replaced.
+    pub fn buffer_text(&self, name: &str) -> Option<String> {
+        let buffer = self.editor.find_buffer(name)?;
+        let mut bytes = Vec::new();
+        buffer
+            .text
+            .read(0..buffer.text.len(), &mut bytes)
+            .expect("harness buffers are readable");
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Panics when no buffer is named `name`.
+    pub fn buffer_modified(&self, name: &str) -> bool {
+        self.editor
+            .find_buffer(name)
+            .expect("the buffer exists")
+            .is_modified()
     }
 
     /// Feeds each character of `text` as a plain key, as typing it would.
@@ -221,7 +342,12 @@ impl Harness {
 
     fn run_effect(&mut self, effect: Effect) -> Option<Event> {
         match effect {
-            Effect::Send(_, message) => self.sent.push(message),
+            Effect::Send(client, message) => {
+                if client == self.client {
+                    self.sent.push(message.clone());
+                }
+                self.messages.push((client, message));
+            }
             Effect::SetTimer { id, .. } => self.timers.push(id),
             Effect::Prefetch(request) => self.prefetches.push(request),
             Effect::Shutdown => self.shutdown = true,

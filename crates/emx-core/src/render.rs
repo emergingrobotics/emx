@@ -5,7 +5,7 @@
 
 use std::ops::{ControlFlow, Range};
 
-use emx_text::{display_units, unit_width};
+use emx_text::{DisplayUnit, display_units, unit_width};
 use emx_types::{Cell, Face, Grid};
 
 use crate::buffer::{Buffer, BufferId};
@@ -46,6 +46,7 @@ const MODELINE_MODES_LOADING: &str = "(Fundamental Loading) ";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
 const MODELINE_FILL: &str = "-";
 const UNKNOWN_LINE: &str = "?";
+const NEWLINE: u8 = b'\n';
 /// `%p` computes differently above this size to avoid overflow.
 const LARGE_BUFFER: u64 = 1_000_000;
 const PERCENT: u64 = 100;
@@ -301,6 +302,7 @@ impl RowWriter<'_> {
     fn write(&mut self, bytes: &[u8], face: Face, escape_face: Face) {
         let cols = usize::from(self.grid.cols);
         for (offset, unit) in display_units(bytes) {
+            let unit = one_line(unit);
             let column = self.col as u64;
             let flow = unit_glyphs(
                 &bytes[offset..],
@@ -469,10 +471,20 @@ fn draw_minibuffer(
     Some((col, row))
 }
 
+/// The echo area and modeline are one row: a newline in a message (a file
+/// name can hold one) shows as `^J`, as Emacs shows it in a one-line
+/// minibuffer.
+fn one_line(unit: DisplayUnit) -> DisplayUnit {
+    match unit {
+        DisplayUnit::Newline => DisplayUnit::Control(NEWLINE),
+        other => other,
+    }
+}
+
 fn text_width(bytes: &[u8], tab_width: usize) -> usize {
     let mut column = 0;
     for (_, unit) in display_units(bytes) {
-        column += unit_width(&unit, column, tab_width);
+        column += unit_width(&one_line(unit), column, tab_width);
     }
     column
 }

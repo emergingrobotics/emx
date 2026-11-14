@@ -844,7 +844,7 @@ pub(crate) fn create_temp(
 }
 
 /// The C library's message for an OS error, as Emacs prints it.
-pub(crate) fn strerror(error: &io::Error) -> String {
+pub fn strerror(error: &io::Error) -> String {
     let text = error.to_string();
     match error.raw_os_error() {
         Some(code) => text

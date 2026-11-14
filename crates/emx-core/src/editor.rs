@@ -1,4 +1,5 @@
 mod files;
+mod requests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -17,12 +18,13 @@ use crate::event::{ClientId, Effect, Event, TimerId};
 use crate::journal::{JournalId, JournalOutbox};
 use crate::keymap::{Keymap, Lookup, describe_keys, universal_argument_binding};
 use crate::killring::KillRing;
-use crate::marker::InsertionType;
+use crate::marker::{InsertionType, MarkerId};
 use crate::minibuffer::{Histories, Minibuffer};
 use crate::render::{PrefetchRequest, render};
 use crate::undo::{UndoLimits, outer_limit_warning};
 pub(crate) use files::Purpose;
 use files::{AutoSaveRequest, ExitWait, SaveRequest};
+use requests::{GroupReply, OpenRequest, Reply};
 
 use crate::window::{
     Fetch, Frame, Layout, Reader, ScreenLine, Window, WindowId, frame_layout, not_cached_block,
@@ -122,6 +124,31 @@ struct Client {
     /// Keys go to the minibuffer while it reads something.
     minibuffer: Option<Minibuffer>,
     exit_wait: Option<ExitWait>,
+    /// The chunks of a bracketed paste received so far.
+    paste: Option<PendingPaste>,
+    /// The text this client's last yank inserted. Emacs finds it between
+    /// point and the mark, but the mark is the buffer's, shared by every
+    /// client, so another client could move it before `M-y`.
+    yank: Option<YankRange>,
+    /// The cursor `emx events` last reported, and the timer that holds back
+    /// the next report.
+    cursor_reported: Option<(BufferId, u64)>,
+    cursor_timer: Option<TimerId>,
+}
+
+#[derive(Debug, Default)]
+struct PendingPaste {
+    data: Vec<u8>,
+    /// The paste outgrew `in_memory_max`; the rest is dropped until the
+    /// last chunk.
+    overflowed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct YankRange {
+    buffer: BufferId,
+    start: MarkerId,
+    end: MarkerId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +162,8 @@ enum TimerPurpose {
     MinibufferMessage(ClientId, u64),
     /// Emacs `auto-save-timeout`.
     AutoSaveIdle,
+    /// The client's cursor may be reported to `emx events` again.
+    CursorEvent(ClientId),
 }
 
 /// How a command finished, for the command loop's bookkeeping.
@@ -186,6 +215,22 @@ pub struct Editor {
     edits_since_auto_save: u64,
     edits_total: u64,
     auto_save_timer: Option<(TimerId, u64)>,
+    /// Clients streaming `emx events`.
+    subscribers: BTreeSet<ClientId>,
+    /// Terminal clients, most recently active first: where a CLI `open`
+    /// shows its file.
+    terminal_recency: Vec<ClientId>,
+    /// Open requests waiting for their file to be read.
+    pending_opens: HashMap<BufferId, Vec<OpenRequest>>,
+    /// `--wait` requests, released by `C-x #` or by killing the buffer.
+    waiting: HashMap<BufferId, Vec<Reply>>,
+    /// Buffers created for a `--wait` request, killed when it is done, as
+    /// Emacs `server-kill-new-buffers` does.
+    created_for_wait: BTreeSet<BufferId>,
+    /// Buffers being read again for a reload request.
+    reverting: BTreeSet<BufferId>,
+    reload_replies: Vec<GroupReply>,
+    save_replies: Vec<GroupReply>,
 }
 
 impl Editor {
@@ -226,6 +271,14 @@ impl Editor {
             edits_since_auto_save: 0,
             edits_total: 0,
             auto_save_timer: None,
+            subscribers: BTreeSet::new(),
+            terminal_recency: Vec::new(),
+            pending_opens: HashMap::new(),
+            waiting: HashMap::new(),
+            created_for_wait: BTreeSet::new(),
+            reverting: BTreeSet::new(),
+            reload_replies: Vec::new(),
+            save_replies: Vec::new(),
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -255,13 +308,24 @@ impl Editor {
                 kind,
             } => self.attach(client, cols, rows, kind),
             Event::ClientDetached(client) => self.detach(client),
-            Event::Key(client, key) => self.handle_key(client, key.canonical()),
-            Event::Paste(client, bytes) => self.handle_paste(client, bytes),
+            Event::Key(client, key) => {
+                self.note_terminal_activity(client);
+                self.handle_key(client, key.canonical());
+            }
+            Event::Paste { client, data, last } => {
+                self.note_terminal_activity(client);
+                self.paste_chunk(client, data, last);
+            }
             Event::Resize(client, cols, rows) => {
                 let client = self.client_mut(client);
                 client.cols = cols;
                 client.rows = rows;
             }
+            Event::Request(client, id, request) => self.handle_request(client, id, request),
+            Event::Redraw(client) => self.request_full_redraw(client),
+            Event::BlockReady { buffer, result, .. } => self.block_ready(buffer, result),
+            Event::IndexProgress { .. } => {}
+            Event::IndexFinished { buffer, result } => self.index_finished(buffer, result),
             Event::Timer(id) => self.handle_timer(id),
             Event::FileLoaded { buffer, result } => self.file_loaded(buffer, result),
             Event::SaveFinished { buffer, result } => self.save_finished(buffer, result),
@@ -270,6 +334,7 @@ impl Editor {
             Event::Recovered(buffers) => self.recovered(buffers),
         }
         self.redisplay();
+        self.report_cursors();
         self.flush_journal();
     }
 
@@ -391,6 +456,7 @@ impl Editor {
         for client in clients {
             self.set_echo(client, message.clone());
         }
+        self.redisplay();
         self.flush_journal();
     }
 
@@ -454,8 +520,16 @@ impl Editor {
                 temporary_goal_column: 0,
                 minibuffer: None,
                 exit_wait: None,
+                paste: None,
+                yank: None,
+                cursor_reported: None,
+                cursor_timer: None,
             },
         );
+        if kind == ClientKind::Tui {
+            self.note_terminal_activity(client);
+            self.client_attached_event(client);
+        }
     }
 
     fn detach(&mut self, client: ClientId) {
@@ -468,6 +542,13 @@ impl Editor {
             buffer.delete_marker(window.point);
             buffer.delete_marker(window.start);
         }
+        if let Some(yank) = removed.yank
+            && let Some(buffer) = self.buffers.get_mut(yank.buffer)
+        {
+            buffer.delete_marker(yank.start);
+            buffer.delete_marker(yank.end);
+        }
+        self.client_detached(client, removed.kind);
         self.grace_timer = None;
         self.maybe_arm_grace();
     }
@@ -512,6 +593,7 @@ impl Editor {
                 self.minibuffer_message_expired(client, serial);
             }
             TimerPurpose::AutoSaveIdle => self.auto_save_idle(id),
+            TimerPurpose::CursorEvent(client) => self.cursor_timer_expired(client, id),
         }
     }
 
@@ -607,6 +689,38 @@ impl Editor {
     fn run_key_command(&mut self, client_id: ClientId, name: &'static str, key: Key) {
         let spec = command::lookup(name).expect("keymaps bind only registered commands");
         self.run_command(client_id, name, Some(key), spec.run);
+    }
+
+    /// Collects the chunks of a bracketed paste, then pastes once. A paste
+    /// larger than a buffer may hold in memory is dropped whole: half of it
+    /// would be worse than none.
+    fn paste_chunk(&mut self, client_id: ClientId, data: Vec<u8>, last: bool) {
+        let limit = self.config.in_memory_max;
+        let pending = self.client_mut(client_id).paste.get_or_insert_default();
+        if !pending.overflowed {
+            if (pending.data.len() + data.len()) as u64 > limit {
+                pending.overflowed = true;
+                pending.data = Vec::new();
+            } else {
+                pending.data.extend_from_slice(&data);
+            }
+        }
+        if !last {
+            return;
+        }
+        let pending = self
+            .client_mut(client_id)
+            .paste
+            .take()
+            .expect("filled above");
+        if pending.overflowed {
+            let error = CommandError::User(format!(
+                "Paste discarded: larger than {limit} bytes (in_memory_max)"
+            ));
+            self.signal(client_id, None, &error);
+            return;
+        }
+        self.handle_paste(client_id, pending.data);
     }
 
     fn handle_paste(&mut self, client_id: ClientId, bytes: Vec<u8>) {
@@ -873,8 +987,52 @@ impl Editor {
         self.client(client_id).signaled
     }
 
+    /// Only terminals have a bell.
     pub(crate) fn ring_bell(&mut self, client_id: ClientId) {
-        self.effects.push(Effect::Send(client_id, ServerMsg::Bell));
+        if self.client(client_id).kind == ClientKind::Tui {
+            self.effects.push(Effect::Send(client_id, ServerMsg::Bell));
+        }
+    }
+
+    /// Remembers the text a yank just inserted, between `start` and `end`
+    /// of the client's selected buffer, for a following `M-y`.
+    pub(crate) fn set_yank_range(&mut self, client_id: ClientId, start: u64, end: u64) {
+        let buffer_id = self.selected_buffer(client_id);
+        if let Some(old) = self.client_mut(client_id).yank.take()
+            && let Some(buffer) = self.buffers.get_mut(old.buffer)
+        {
+            buffer.delete_marker(old.start);
+            buffer.delete_marker(old.end);
+        }
+        let buffer = &mut self.buffers[buffer_id];
+        // Text another client inserts at either edge is not the yank's.
+        let range = YankRange {
+            buffer: buffer_id,
+            start: buffer.create_marker_without_undo(start, InsertionType::AdvanceAfter),
+            end: buffer.create_marker_without_undo(end, InsertionType::StayBefore),
+        };
+        self.client_mut(client_id).yank = Some(range);
+    }
+
+    /// The text the client's last yank inserted, if it is in the selected
+    /// buffer. Insertions by others at its start can leave the start past
+    /// the end; the range is then empty at its end.
+    pub(crate) fn yank_range(&self, client_id: ClientId) -> Option<(u64, u64)> {
+        let range = self.client(client_id).yank?;
+        if range.buffer != self.selected_buffer(client_id) {
+            return None;
+        }
+        let buffer = &self.buffers[range.buffer];
+        let end = buffer.marker_pos(range.end);
+        Some((buffer.marker_pos(range.start).min(end), end))
+    }
+
+    /// The sources a buffer's text reads, for the server's prefetch and
+    /// indexing workers; `None` once the buffer is killed.
+    pub fn buffer_sources(&self, buffer: BufferId) -> Option<Arc<Sources>> {
+        self.buffers
+            .get(buffer)
+            .map(|buffer| buffer.text.sources().clone())
     }
 
     pub(crate) fn kill_ring(&self) -> &KillRing {
@@ -1007,7 +1165,11 @@ mod tests {
         let mut editor = Editor::new(Config::default()).expect("valid config");
         attach(&mut editor, FIRST);
         type_keys(&mut editor, FIRST, "a C-u 2 b");
-        editor.handle(Event::Paste(FIRST, b"xy".to_vec()));
+        editor.handle(Event::Paste {
+            client: FIRST,
+            data: b"xy".to_vec(),
+            last: true,
+        });
         let records: Vec<Record> = editor
             .take_effects()
             .into_iter()

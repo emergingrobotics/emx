@@ -90,6 +90,10 @@ pub(crate) enum Purpose {
         buffer: BufferId,
         file: PathBuf,
     },
+    /// `C-x #` in a modified buffer a client waits for: save it first?
+    ServerDone {
+        buffer: BufferId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +115,8 @@ enum Method {
 pub(crate) enum AfterSave {
     Nothing,
     Kill,
+    /// Release the clients waiting for the buffer (`C-x #`).
+    ServerDone,
 }
 
 /// A save being prepared: the checks already confirmed by the user and
@@ -125,10 +131,18 @@ pub(crate) struct SaveFlow {
     write_protected_confirmed: bool,
     method: Option<Method>,
     session: Option<SaveSession>,
+    /// A socket API save has nobody to answer questions: a save that
+    /// would ask fails instead, naming the question.
+    interactive: bool,
 }
 
 impl SaveFlow {
-    fn new(buffer: BufferId, quiet: bool, after: AfterSave, session: Option<SaveSession>) -> Self {
+    pub(super) fn new(
+        buffer: BufferId,
+        quiet: bool,
+        after: AfterSave,
+        session: Option<SaveSession>,
+    ) -> Self {
         SaveFlow {
             buffer,
             quiet,
@@ -137,7 +151,27 @@ impl SaveFlow {
             write_protected_confirmed: false,
             method: None,
             session,
+            interactive: true,
         }
+    }
+
+    /// A save for the socket API: quiet, and never asking.
+    pub(super) fn unattended(buffer: BufferId) -> Self {
+        SaveFlow {
+            interactive: false,
+            ..SaveFlow::new(buffer, true, AfterSave::Nothing, None)
+        }
+    }
+
+    /// Fails an unattended save at a question it cannot ask.
+    fn refuse_unattended(&self, question: &str) -> Result<(), CommandError> {
+        if self.interactive {
+            return Ok(());
+        }
+        Err(user_error(format!(
+            "{} (answer it by saving from a terminal client)",
+            question.trim_end()
+        )))
     }
 }
 
@@ -308,7 +342,7 @@ impl Editor {
     }
 
     /// Emacs `y-or-n-p`, which pads the question with a space.
-    fn y_or_n_p(&mut self, client: ClientId, question: String, purpose: Purpose) {
+    pub(super) fn y_or_n_p(&mut self, client: ClientId, question: String, purpose: Purpose) {
         let separator = if question.is_empty() || question.ends_with(' ') {
             ""
         } else {
@@ -500,6 +534,19 @@ impl Editor {
                 }
                 Ok(())
             }
+            (Purpose::ServerDone { buffer }, Answer::Yes(yes)) => {
+                if !self.buffers.contains_key(buffer) {
+                    Ok(())
+                } else if yes {
+                    self.continue_save(
+                        client,
+                        SaveFlow::new(buffer, false, AfterSave::ServerDone, None),
+                    )
+                } else {
+                    self.server_buffer_done(client, buffer);
+                    Ok(())
+                }
+            }
             (Purpose::Recover { buffer, file }, Answer::Yes(yes)) => {
                 if yes {
                     self.pending_reads.insert(buffer, client);
@@ -526,7 +573,7 @@ impl Editor {
 
     /// Shows the buffer visiting `path`, creating it in the loading state
     /// and asking for the file to be read when there is none.
-    fn visit_file(&mut self, client: ClientId, path: PathBuf) {
+    pub(super) fn visit_file(&mut self, client: ClientId, path: PathBuf) {
         let existing = self
             .buffers
             .iter()
@@ -574,6 +621,10 @@ impl Editor {
     }
 
     pub(super) fn file_loaded(&mut self, buffer: BufferId, result: Result<Loaded, String>) {
+        if self.reverting.remove(&buffer) {
+            self.revert_loaded(buffer, result);
+            return;
+        }
         let client = self.pending_loads.remove(&buffer);
         if !self.buffers.contains_key(buffer) {
             return;
@@ -581,6 +632,7 @@ impl Editor {
         let loaded = match result {
             Ok(loaded) => loaded,
             Err(message) => {
+                self.fail_pending_opens(buffer, &message);
                 self.kill_buffer(buffer);
                 if let Some(client) = client {
                     self.fail(client, &user_error(message));
@@ -634,9 +686,10 @@ impl Editor {
         if let (Some(client), Some(message)) = (client, message) {
             self.message_to(client, message);
         }
+        self.buffer_opened(buffer);
     }
 
-    fn show_in_selected_window(&mut self, client: ClientId, buffer: BufferId) {
+    pub(super) fn show_in_selected_window(&mut self, client: ClientId, buffer: BufferId) {
         let window = self.selected_window_id(client);
         self.show_buffer(client, window, buffer);
     }
@@ -763,8 +816,10 @@ impl Editor {
         Ok(())
     }
 
-    /// Removes the buffer; windows showing it show another buffer.
+    /// Removes the buffer; windows showing it show another buffer, and
+    /// clients waiting for it are released.
     pub(super) fn kill_buffer(&mut self, buffer: BufferId) {
+        self.buffer_killed(buffer);
         let replacement = self.other_buffer(buffer);
         let showing: Vec<(ClientId, WindowId)> = self
             .clients
@@ -923,7 +978,11 @@ impl Editor {
 
     /// Runs the checks `basic-save-buffer` makes, asking where Emacs asks,
     /// then plans the save and starts it.
-    fn continue_save(&mut self, client: ClientId, mut flow: SaveFlow) -> Result<(), CommandError> {
+    pub(super) fn continue_save(
+        &mut self,
+        client: ClientId,
+        mut flow: SaveFlow,
+    ) -> Result<(), CommandError> {
         let buffer = flow.buffer;
         // A question may have been pending while another client saved, or
         // the buffer was killed.
@@ -951,6 +1010,7 @@ impl Editor {
             && Some(existing.identity) != binding.identity
         {
             let question = format!("{name} has changed since visited or saved.  Save anyway? ");
+            flow.refuse_unattended(&question)?;
             self.yes_or_no_p(
                 client,
                 question,
@@ -964,6 +1024,7 @@ impl Editor {
         let directory = directory_name(&binding.path);
         if !info.directory_exists {
             let question = format!("Directory \u{2018}{directory}\u{2019} does not exist; create?");
+            flow.refuse_unattended(&question)?;
             self.y_or_n_p(
                 client,
                 question,
@@ -977,6 +1038,7 @@ impl Editor {
         match &info.existing {
             Some(existing) if !existing.writable && !flow.write_protected_confirmed => {
                 let question = format!("File {name} is write-protected; try to save anyway? ");
+                flow.refuse_unattended(&question)?;
                 self.yes_or_no_p(
                     client,
                     question,
@@ -1007,6 +1069,9 @@ impl Editor {
                 && shifts
                 && let Some(reason) = io::in_place_reason(&info, euid)
             {
+                flow.refuse_unattended(&format!(
+                    "{name}: saving in place is not crash-safe and needs confirmation"
+                ))?;
                 self.ask_in_place_risk(client, flow, &name, reason, info.directory_writable);
                 return Ok(());
             }
@@ -1022,6 +1087,7 @@ impl Editor {
                         "Saving {name} rewrites {size} and needs {size} free. \
                          (r)ewrite safely, (i)n place, (c)ancel? "
                     );
+                    flow.refuse_unattended(&prompt)?;
                     let mode = Mode::Keys {
                         choices: vec![
                             choice(plain('r'), 'r'),
@@ -1229,6 +1295,7 @@ impl Editor {
             return;
         };
         let client = request.client;
+        let mut outcome = Err("the buffer was killed while it was saved".to_string());
         if let Some(binding) = self
             .buffers
             .get_mut(buffer)
@@ -1251,8 +1318,14 @@ impl Editor {
                     } else if !request.quiet {
                         self.message_to(client, format!("Wrote {}", path.display()));
                     }
-                    if request.after == AfterSave::Kill && !self.buffers[buffer].is_modified() {
-                        self.kill_buffer(buffer);
+                    self.buffer_saved(buffer);
+                    let unmodified = !self.buffers[buffer].is_modified();
+                    match request.after {
+                        AfterSave::Kill if unmodified => self.kill_buffer(buffer),
+                        AfterSave::ServerDone if unmodified => {
+                            self.server_buffer_done(client, buffer);
+                        }
+                        _ => {}
                     }
                 }
                 Err(failure) => {
@@ -1274,7 +1347,12 @@ impl Editor {
                     self.abandon_exits(&message);
                 }
             }
+            outcome = result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|failure| format!("{}: {}", file_name(&path), failure.message));
         }
+        self.save_completed(buffer, outcome);
         let waiting: Vec<ClientId> = self
             .clients
             .iter_mut()
@@ -1929,6 +2007,11 @@ impl Editor {
                     target.read_only = true;
                 }
             }
+        }
+        // Recovery is the server's first event: a server nobody attaches
+        // to exits like one everybody left, unless it holds unsaved work.
+        if self.session == Session::Server {
+            self.maybe_arm_grace();
         }
     }
 }

@@ -69,7 +69,13 @@ fn client_messages() -> Vec<ClientMsg> {
         ClientMsg::Key { key: sample_key() },
         ClientMsg::Paste {
             data_b64: "aGk=".to_string(),
+            r#final: false,
         },
+        ClientMsg::Paste {
+            data_b64: String::new(),
+            r#final: true,
+        },
+        ClientMsg::Redraw,
         ClientMsg::Resize {
             cols: 100,
             rows: 50,
@@ -386,4 +392,19 @@ fn serde_roundtrip_all_variants() {
     for message in server_messages() {
         roundtrip(message);
     }
+}
+
+#[test]
+fn paste_final_flag_is_named_final_on_the_wire() {
+    let mut line = Vec::new();
+    write_msg(
+        &mut line,
+        &ClientMsg::Paste {
+            data_b64: "aGk=".to_string(),
+            r#final: true,
+        },
+    )
+    .expect("write");
+    let text = String::from_utf8(line).expect("json");
+    assert!(text.contains("\"final\":true"), "{text}");
 }

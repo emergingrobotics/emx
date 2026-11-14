@@ -77,6 +77,12 @@ const ANGLE_KEYS: [(&str, KeyCode); 10] = [
     ("next", KeyCode::PageDown),
 ];
 
+const DELETE_CHARACTER: char = '\u{7f}';
+const FIRST_PRINTABLE: u32 = 0x20;
+/// XOR with a C0 control character gives the character typed with Ctrl
+/// (`^J` for 10), as Emacs prints them.
+const CONTROL_TO_CARET: u32 = 0x40;
+
 /// Control characters Emacs reads as the same event as a named key.
 const CONTROL_ALIASES: [(char, KeyCode); 3] = [
     ('i', KeyCode::Tab),
@@ -95,6 +101,20 @@ impl Key {
 
     fn normalized(code: KeyCode, mut mods: Mods) -> Key {
         let mut code = code;
+        // A control character is the key that types it: Emacs reads byte
+        // 10 as C-j and 127 as DEL. No terminal sends them as characters,
+        // but a client can.
+        if let KeyCode::Char(character) = code {
+            if character == DELETE_CHARACTER {
+                code = KeyCode::Backspace;
+            } else if (character as u32) < FIRST_PRINTABLE {
+                let letter = char::from_u32(character as u32 ^ CONTROL_TO_CARET)
+                    .expect("C0 controls map to ASCII")
+                    .to_ascii_lowercase();
+                code = KeyCode::Char(letter);
+                mods.ctrl = true;
+            }
+        }
         if let KeyCode::Char(character) = code {
             if mods.ctrl {
                 if let Some(lower) = single_case_mapping(character.to_lowercase(), character) {
@@ -371,6 +391,31 @@ mod tests {
         );
         let left = raw(KeyCode::Left, shift);
         assert_eq!(left.canonical(), left);
+    }
+
+    #[test]
+    fn control_characters_are_their_ctrl_keys() {
+        let raw = |character| Key {
+            code: KeyCode::Char(character),
+            mods: Mods::default(),
+        };
+        let kbd = |text| parse_kbd(text).unwrap().remove(0);
+        assert_eq!(raw('\n').canonical(), kbd("C-j"));
+        assert_eq!(raw('\u{1}').canonical(), kbd("C-a"));
+        assert_eq!(raw('\r').canonical(), kbd("RET"));
+        assert_eq!(raw('\t').canonical(), kbd("TAB"));
+        assert_eq!(raw('\u{1b}').canonical(), kbd("ESC"));
+        assert_eq!(raw('\u{0}').canonical(), kbd("C-@"));
+        assert_eq!(raw('\u{1f}').canonical(), kbd("C-_"));
+        assert_eq!(raw('\u{7f}').canonical(), kbd("DEL"));
+        let meta = Key {
+            code: KeyCode::Char('\n'),
+            mods: Mods {
+                meta: true,
+                ..Mods::default()
+            },
+        };
+        assert_eq!(meta.canonical(), kbd("C-M-j"));
     }
 
     #[test]

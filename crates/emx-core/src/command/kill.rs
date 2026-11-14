@@ -200,6 +200,7 @@ pub(super) fn yank(ctx: &mut CommandContext) -> Result<(), CommandError> {
     push_mark(ctx, point, false, false);
     let kill = current_kill(ctx, rotation)?;
     ctx.insert(&kill)?;
+    ctx.record_yank(point, ctx.point());
     if matches!(ctx.prefix_arg, PrefixArg::Raw(_)) {
         swap_point_and_mark_quietly(ctx);
     }
@@ -208,24 +209,29 @@ pub(super) fn yank(ctx: &mut CommandContext) -> Result<(), CommandError> {
 }
 
 /// Emacs `yank-pop` right after a yank: replace the yanked text with the
-/// kill N further along the ring.
+/// kill N further along the ring. Emacs finds the yanked text between point
+/// and the mark; the mark is shared by every client of a buffer, so the
+/// range the client's own yank recorded is used instead.
 pub(super) fn yank_pop(ctx: &mut CommandContext) -> Result<(), CommandError> {
     if !ctx.last_command_is(YANK) {
         return Err(ctx.error(NOT_A_YANK));
     }
+    // Another client may have killed the buffer or shown another one.
+    let Some((start, end)) = ctx.yank_range() else {
+        return Err(ctx.error(NOT_A_YANK));
+    };
     ctx.this_command = YANK;
     let rotation = ctx.prefix_arg.numeric_value();
     let point = ctx.point();
-    let mark = ctx
-        .mark()
-        .expect("a yank leaves the mark at the start of the yanked text");
-    let mark_first = point < mark;
-    ctx.delete_with_point(point.min(mark)..point.max(mark), point)?;
-    let point = ctx.point();
-    ctx.set_mark_position(point);
+    // Point before the end means a `C-u` yank left point at the start.
+    let point_first = point < end;
+    ctx.delete_with_point(start..end, point)?;
+    ctx.set_point(start);
+    ctx.set_mark_position(start);
     let kill = current_kill(ctx, rotation)?;
     ctx.insert(&kill)?;
-    if mark_first {
+    ctx.record_yank(start, ctx.point());
+    if point_first {
         swap_point_and_mark_quietly(ctx);
     }
     Ok(())
@@ -241,6 +247,7 @@ pub(crate) fn xterm_paste(ctx: &mut CommandContext, bytes: &[u8]) -> Result<(), 
     ctx.kill_ring_mut().kill_new(bytes.to_vec());
     let kill = current_kill(ctx, 0)?;
     ctx.insert(&kill)?;
+    ctx.record_yank(point, ctx.point());
     ctx.this_command = YANK;
     Ok(())
 }

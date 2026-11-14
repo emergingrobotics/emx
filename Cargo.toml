@@ -39,4 +39,17 @@ xattr = "1"
 crc32fast = "1"
 
 [dependencies]
+anyhow = "1"
+base64 = "0.22"
 clap = { workspace = true }
+emx-core = { path = "crates/emx-core" }
+emx-proto = { path = "crates/emx-proto" }
+emx-text = { path = "crates/emx-text" }
+emx-types = { path = "crates/emx-types" }
+rustix = { workspace = true, features = ["fs", "net", "process", "stdio"] }
+signal-hook = "0.3"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }

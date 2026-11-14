@@ -108,8 +108,11 @@ pub enum ClientMsg {
     Key {
         key: Key,
     },
+    /// One chunk of a bracketed paste; the editor inserts the whole paste
+    /// once the chunk with `final` set arrives.
     Paste {
         data_b64: String,
+        r#final: bool,
     },
     Resize {
         cols: u16,
@@ -119,6 +122,9 @@ pub enum ClientMsg {
         id: u64,
         req: Request,
     },
+    /// The client could not use a frame (it failed validation or did not
+    /// match the terminal): the next frame is sent whole.
+    Redraw,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +170,23 @@ pub enum Response {
     Ok,
     Buffers(Vec<BufferInfo>),
     Diff(String),
+}
+
+/// The `code` of a `WireError`, for scripts to match on.
+pub mod error_code {
+    /// A request that shows a buffer came from a CLI client while no
+    /// terminal client is attached.
+    pub const NO_CLIENT: &str = "no_client";
+    /// No buffer visits the file named.
+    pub const NO_BUFFER: &str = "no_buffer";
+    pub const BUFFER_MODIFIED: &str = "buffer_modified";
+    pub const OPEN_FAILED: &str = "open_failed";
+    pub const RELOAD_FAILED: &str = "reload_failed";
+    pub const SAVE_FAILED: &str = "save_failed";
+    pub const GOTO_FAILED: &str = "goto_failed";
+    pub const NO_EXTERNAL_CHANGE: &str = "no_external_change";
+    /// The connection broke the protocol; the server closes it.
+    pub const PROTOCOL: &str = "protocol";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

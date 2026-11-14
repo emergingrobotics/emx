@@ -37,10 +37,11 @@ pub(super) fn save_buffers_kill_terminal(ctx: &mut CommandContext) -> Result<(),
     ctx.editor().save_buffers_kill_terminal_command(client)
 }
 
-/// Emacs `server-edit` when no client is waiting for a buffer, which is
-/// always the case until `--wait` clients exist.
+/// Emacs `server-edit`: this buffer is done; release the clients waiting
+/// for it.
 pub(super) fn server_edit(ctx: &mut CommandContext) -> Result<(), CommandError> {
-    ctx.message("No server editing buffers exist");
+    let client = ctx.client;
+    ctx.editor().server_edit_command(client);
     Ok(())
 }
 

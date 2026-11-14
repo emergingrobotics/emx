@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use emx_proto::{ClientKind, ServerMsg};
+use emx_proto::{ClientKind, Request, ServerMsg};
 use emx_text::{FileIdentity, Text};
 use emx_types::Key;
 
@@ -28,9 +28,19 @@ pub enum Event {
     },
     ClientDetached(ClientId),
     Key(ClientId, Key),
-    /// Bracketed paste: inserted as one change, never looked up as keys.
-    Paste(ClientId, Vec<u8>),
+    /// A chunk of a bracketed paste. The chunks are collected until the
+    /// `last` one, then inserted as one change, never looked up as keys.
+    Paste {
+        client: ClientId,
+        data: Vec<u8>,
+        last: bool,
+    },
     Resize(ClientId, u16, u16),
+    /// A socket API request; answered with `ServerMsg::Response` carrying
+    /// the same id.
+    Request(ClientId, u64, Request),
+    /// The client could not use its last frame: send the next one whole.
+    Redraw(ClientId),
     /// A timer requested by `Effect::SetTimer` expired. Timers are never
     /// cancelled, so the editor ignores ones that no longer apply.
     Timer(TimerId),
@@ -57,6 +67,25 @@ pub enum Event {
     /// What `journal::replay_dir` rebuilt from the previous session's
     /// journals, delivered once at startup.
     Recovered(Vec<RecoveredBuffer>),
+    /// A block asked for by `Effect::Prefetch` was read into the cache (or
+    /// could not be), so the frames that needed it can be drawn.
+    BlockReady {
+        buffer: BufferId,
+        block: u64,
+        result: Result<(), String>,
+    },
+    /// The line indexer of an `Effect::StartIndex` has counted the lines of
+    /// `indexed_blocks` of `total_blocks` blocks.
+    IndexProgress {
+        buffer: BufferId,
+        indexed_blocks: u64,
+        total_blocks: u64,
+    },
+    /// The line indexer stopped: done, or the file could not be read.
+    IndexFinished {
+        buffer: BufferId,
+        result: Result<(), String>,
+    },
 }
 
 /// Output of the editor state machine, carried out by the server.
@@ -68,9 +97,10 @@ pub enum Effect {
         id: TimerId,
         after: Duration,
     },
-    /// Read a cache block that redisplay needed, then deliver an event so
-    /// the frame is rendered again. Repeated after every event until the
-    /// block is cached, so the server keeps one read per block in flight.
+    /// Read a cache block that redisplay needed (from the buffer's
+    /// `Editor::buffer_sources`), then deliver `Event::BlockReady` so the
+    /// frame is rendered again. Repeated after every event until the block
+    /// is cached, so the server keeps one read per block in flight.
     Prefetch(PrefetchRequest),
     /// Read `path` with `io::load_file` and deliver `Event::FileLoaded`.
     Load {
@@ -84,7 +114,8 @@ pub enum Effect {
         plan: SavePlan,
     },
     /// Build the line index of a buffer whose original is read through the
-    /// block cache.
+    /// block cache (`Editor::buffer_sources`), reporting
+    /// `Event::IndexProgress` and `Event::IndexFinished`.
     StartIndex {
         buffer: BufferId,
     },

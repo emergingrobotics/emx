@@ -460,6 +460,16 @@ impl<'a> CommandContext<'a> {
         Ok(mark.min(point)..mark.max(point))
     }
 
+    /// Remembers what a yank inserted, for `M-y`, per client.
+    pub(crate) fn record_yank(&mut self, start: u64, end: u64) {
+        self.editor.set_yank_range(self.client, start, end);
+    }
+
+    /// What this client's last yank inserted in this buffer.
+    pub(crate) fn yank_range(&self) -> Option<(u64, u64)> {
+        self.editor.yank_range(self.client)
+    }
+
     pub fn kill_ring_mut(&mut self) -> &mut KillRing {
         self.editor.kill_ring_mut()
     }

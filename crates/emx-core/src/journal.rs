@@ -644,6 +644,26 @@ struct OpenJournal {
     torn: bool,
 }
 
+/// How a journal file's data is made durable; `fdatasync` except where a
+/// test injects failures.
+pub type SyncData = Box<dyn FnMut(&File) -> std::io::Result<()> + Send>;
+
+struct SyncHook(SyncData);
+
+impl std::fmt::Debug for SyncHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SyncHook")
+    }
+}
+
+/// Data that could not be made durable: a journal's, or (`journal` is
+/// `None`) the directory's entries.
+#[derive(Debug)]
+pub struct SyncFailure {
+    pub journal: Option<JournalId>,
+    pub error: JournalError,
+}
+
 /// Applies journal operations to files. It holds no threads: the session
 /// server's journal thread owns it and decides when to sync.
 #[derive(Debug)]
@@ -654,6 +674,11 @@ pub struct JournalWriter {
     directory_dirty: bool,
     /// Journals whose last write failed; see `JournalError::Poisoned`.
     poisoned: BTreeSet<JournalId>,
+    /// Journals whose sync failed. After a failed `fsync` Linux may drop
+    /// the unwritten pages and report success later, so nothing in the
+    /// file is trusted: the next header starts it over.
+    afresh: BTreeSet<JournalId>,
+    sync_data: SyncHook,
 }
 
 impl JournalWriter {
@@ -661,6 +686,12 @@ impl JournalWriter {
     /// belong to this user and be closed to everyone else: journals hold
     /// unsaved text.
     pub fn new(directory: &Path) -> std::io::Result<JournalWriter> {
+        JournalWriter::with_sync(directory, Box::new(|file: &File| file.sync_data()))
+    }
+
+    /// A writer that makes journal data durable with `sync_data`, the seam
+    /// tests use to make `fsync` fail.
+    pub fn with_sync(directory: &Path, sync_data: SyncData) -> std::io::Result<JournalWriter> {
         prepare_directory(directory)?;
         Ok(JournalWriter {
             directory: directory.to_path_buf(),
@@ -668,6 +699,8 @@ impl JournalWriter {
             dirty: BTreeSet::new(),
             directory_dirty: false,
             poisoned: BTreeSet::new(),
+            afresh: BTreeSet::new(),
+            sync_data: SyncHook(sync_data),
         })
     }
 
@@ -681,6 +714,9 @@ impl JournalWriter {
                 if !writer.journals.contains_key(&buffer) {
                     let journal = writer.open_journal(buffer)?;
                     writer.journals.insert(buffer, journal);
+                }
+                if writer.afresh.contains(&buffer) {
+                    writer.start_afresh(buffer)?;
                 }
                 writer.append(buffer, &Record::Header(header))
             }),
@@ -702,6 +738,7 @@ impl JournalWriter {
                 self.journals.remove(&buffer);
                 self.dirty.remove(&buffer);
                 self.poisoned.remove(&buffer);
+                self.afresh.remove(&buffer);
                 let path = self.journal_path(buffer);
                 fs::remove_file(&path).map_err(|source| JournalError::Write { path, source })?;
                 self.directory_dirty = true;
@@ -711,28 +748,80 @@ impl JournalWriter {
     }
 
     /// Makes everything applied so far durable: the journals written to,
-    /// and the directory entries created or removed.
+    /// and the directory entries created or removed. Fails with the first
+    /// failure `sync` reports.
     pub fn flush_and_sync(&mut self) -> Result<(), JournalError> {
-        for id in std::mem::take(&mut self.dirty) {
-            if let Some(journal) = self.journals.get(&id) {
-                journal
-                    .file
-                    .sync_data()
-                    .map_err(|source| JournalError::Write {
-                        path: self.journal_path(id),
-                        source,
-                    })?;
+        match self.sync().into_iter().next() {
+            Some(failure) => Err(failure.error),
+            None => Ok(()),
+        }
+    }
+
+    /// Syncs every journal written to and the directory, and reports each
+    /// failure. What failed stays to be synced again. A journal whose sync
+    /// failed is poisoned until its buffer starts it afresh
+    /// (`Editor::journal_write_failed` emits the header and new epoch).
+    pub fn sync(&mut self) -> Vec<SyncFailure> {
+        let mut failures = Vec::new();
+        for id in self.dirty.clone() {
+            let Some(journal) = self.journals.get(&id) else {
+                self.dirty.remove(&id);
+                continue;
+            };
+            match (self.sync_data.0)(&journal.file) {
+                Ok(()) => {
+                    self.dirty.remove(&id);
+                }
+                Err(source) => {
+                    self.poisoned.insert(id);
+                    self.afresh.insert(id);
+                    failures.push(SyncFailure {
+                        journal: Some(id),
+                        error: JournalError::Write {
+                            path: self.journal_path(id),
+                            source,
+                        },
+                    });
+                }
             }
         }
         if self.directory_dirty {
-            File::open(&self.directory)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|source| JournalError::Write {
-                    path: self.directory.clone(),
-                    source,
-                })?;
-            self.directory_dirty = false;
+            match File::open(&self.directory).and_then(|directory| directory.sync_all()) {
+                Ok(()) => self.directory_dirty = false,
+                Err(source) => failures.push(SyncFailure {
+                    journal: None,
+                    error: JournalError::Write {
+                        path: self.directory.clone(),
+                        source,
+                    },
+                }),
+            }
         }
+        failures
+    }
+
+    /// Empties a journal whose sync failed, keeping only the magic, so the
+    /// header and epoch that follow are all it holds.
+    fn start_afresh(&mut self, id: JournalId) -> Result<(), JournalError> {
+        let path = self.journal_path(id);
+        let journal = self
+            .journals
+            .get_mut(&id)
+            .ok_or(JournalError::NotOpen { journal: id })?;
+        let reset = |journal: &mut OpenJournal| -> std::io::Result<()> {
+            journal.file.set_len(0)?;
+            journal.file.seek(SeekFrom::Start(0))?;
+            journal.file.write_all(MAGIC)?;
+            Ok(())
+        };
+        if let Err(source) = reset(journal) {
+            journal.torn = true;
+            return Err(JournalError::Write { path, source });
+        }
+        journal.length = MAGIC.len() as u64;
+        journal.torn = false;
+        self.afresh.remove(&id);
+        self.dirty.insert(id);
         Ok(())
     }
 

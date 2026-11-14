@@ -45,6 +45,8 @@ pub const LONG_LINE_THRESHOLD: u64 = 4096;
 /// Emacs `echo-keystrokes` (1 second): how long an unfinished key sequence
 /// waits before it is echoed. Zero disables echoing.
 pub const ECHO_KEYSTROKES_MS: u64 = 1000;
+/// `emx events` reports a client's cursor at most once per this interval.
+pub const CURSOR_EVENT_INTERVAL_MS: u64 = 50;
 pub const MAX_WIRE_MESSAGE: u64 = 16 * MIB;
 pub const FRAME_QUEUE_DEPTH: u64 = 8;
 
@@ -86,6 +88,7 @@ pub struct Config {
     pub long_line_threshold: u64,
     /// Zero is valid: Emacs `echo-keystrokes` 0 turns echoing off.
     pub echo_keystrokes_ms: u64,
+    pub cursor_event_interval_ms: u64,
 }
 
 impl Default for Config {
@@ -117,6 +120,7 @@ impl Default for Config {
             column_checkpoint_interval: COLUMN_CHECKPOINT_INTERVAL,
             long_line_threshold: LONG_LINE_THRESHOLD,
             echo_keystrokes_ms: ECHO_KEYSTROKES_MS,
+            cursor_event_interval_ms: CURSOR_EVENT_INTERVAL_MS,
         }
     }
 }
@@ -200,6 +204,7 @@ impl Config {
                 self.column_checkpoint_interval,
             ),
             ("long_line_threshold", self.long_line_threshold),
+            ("cursor_event_interval_ms", self.cursor_event_interval_ms),
         ];
         for (key, value) in nonzero {
             if value == 0 {
@@ -309,7 +314,7 @@ mod tests {
              auto_save_timeout_s = 16\ntab_width = 4\nnext_screen_context_lines = 0\n\
              amalgamation_limit = 17\ncolumn_checkpoint_interval = 18\n\
              long_line_threshold = 19\necho_keystrokes_ms = 0\nmark_ring_max = 20\n\
-             indent_tabs_mode = false\n",
+             indent_tabs_mode = false\ncursor_event_interval_ms = 21\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -339,6 +344,7 @@ mod tests {
             column_checkpoint_interval: 18,
             long_line_threshold: 19,
             echo_keystrokes_ms: 0,
+            cursor_event_interval_ms: 21,
         };
         assert_eq!(config, expected);
     }
@@ -356,6 +362,7 @@ mod tests {
         assert_eq!(config.long_line_threshold, 4096);
         assert_eq!(config.append_tail_hash_bytes, 64 * 1024);
         assert_eq!(config.echo_keystrokes_ms, 1000);
+        assert_eq!(config.cursor_event_interval_ms, 50);
         assert!(config.validate().is_ok());
     }
 

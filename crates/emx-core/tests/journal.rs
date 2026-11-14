@@ -1172,3 +1172,60 @@ fn failed_write_poisons_the_journal_until_a_new_epoch() {
     assert_eq!(rebuilt(&recovered).3, harness.text().as_bytes());
     assert!(harness.text().starts_with("abc"));
 }
+
+/// Linux may drop the pages of a failed `fsync` and report the next one
+/// clean, so the journal cannot be trusted after one: it is poisoned, and
+/// the restart the editor emits empties it before the new epoch.
+#[test]
+fn sync_failure_starts_the_journal_afresh() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let journal = directory.path().join(JOURNAL_DIRECTORY);
+    let fail = Arc::new(AtomicBool::new(true));
+    let failing = fail.clone();
+    let mut writer = JournalWriter::with_sync(
+        &journal,
+        Box::new(move |file: &fs::File| {
+            if failing.swap(false, Ordering::SeqCst) {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            file.sync_data()
+        }),
+    )
+    .expect("writer");
+    let mut harness = Harness::new();
+    harness.type_text(&"x".repeat(1000));
+    let ops = harness.journal_ops();
+    let id = journal_id(&ops);
+    for op in ops {
+        writer.apply(op).expect("apply");
+    }
+    let failures = writer.sync();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].journal, Some(id));
+    assert!(!fail.load(Ordering::SeqCst), "the failure was injected");
+    harness.type_text("y");
+    for op in harness.journal_ops() {
+        assert!(matches!(
+            writer.apply(op),
+            Err(JournalError::Poisoned { journal }) if journal == id
+        ));
+    }
+    assert!(writer.sync().is_empty(), "the retried sync succeeds");
+
+    harness.journal_write_failed(id, "Input/output error");
+    harness.type_text("z");
+    apply_journal(&mut writer, harness.journal_ops()).expect("restarted journal");
+    let recovered = replay_dir(&journal, &Config::default()).expect("replay");
+    assert_eq!(rebuilt(&recovered).3, harness.text().as_bytes());
+    let size = fs::metadata(journal.join(id.file_name()))
+        .expect("journal file")
+        .len();
+    let text = harness.text().len() as u64;
+    assert!(
+        size < 2 * text,
+        "only the new epoch is in the file ({size} bytes for {text} bytes of text)"
+    );
+}
