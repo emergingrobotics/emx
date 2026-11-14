@@ -3,7 +3,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use emx_types::KbdError;
 use serde::Deserialize;
+
+use crate::keymap::Keymap;
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -35,6 +38,9 @@ pub const NEXT_SCREEN_CONTEXT_LINES: u64 = 2;
 pub const AMALGAMATION_LIMIT: u64 = 20;
 pub const COLUMN_CHECKPOINT_INTERVAL: u64 = 4096;
 pub const LONG_LINE_THRESHOLD: u64 = 4096;
+/// Emacs `echo-keystrokes` (1 second): how long an unfinished key sequence
+/// waits before it is echoed. Zero disables echoing.
+pub const ECHO_KEYSTROKES_MS: u64 = 1000;
 pub const MAX_WIRE_MESSAGE: u64 = 16 * MIB;
 pub const FRAME_QUEUE_DEPTH: u64 = 8;
 
@@ -72,6 +78,8 @@ pub struct Config {
     pub amalgamation_limit: u64,
     pub column_checkpoint_interval: u64,
     pub long_line_threshold: u64,
+    /// Zero is valid: Emacs `echo-keystrokes` 0 turns echoing off.
+    pub echo_keystrokes_ms: u64,
 }
 
 impl Default for Config {
@@ -100,6 +108,7 @@ impl Default for Config {
             amalgamation_limit: AMALGAMATION_LIMIT,
             column_checkpoint_interval: COLUMN_CHECKPOINT_INTERVAL,
             long_line_threshold: LONG_LINE_THRESHOLD,
+            echo_keystrokes_ms: ECHO_KEYSTROKES_MS,
         }
     }
 }
@@ -119,6 +128,13 @@ pub enum ConfigError {
         key: &'static str,
         reason: String,
     },
+    #[error("invalid key sequence {keys:?} in [keys]: {source}")]
+    InvalidKey { keys: String, source: KbdError },
+    #[error("unknown command {command:?} bound to {keys:?} in [keys]")]
+    UnknownCommand { keys: String, command: String },
+    /// Emacs `define-key` wording.
+    #[error("Key sequence {keys} starts with non-prefix key {prefix}")]
+    NonPrefixKey { keys: String, prefix: String },
 }
 
 /// A rejected setting: the key and why.
@@ -205,6 +221,12 @@ impl Config {
                 ),
             });
         }
+        Keymap::emacs_default()
+            .apply_overrides(&self.keys)
+            .map_err(|error| InvalidSetting {
+                key: "keys",
+                reason: error.to_string(),
+            })?;
         Ok(())
     }
 }
@@ -234,14 +256,14 @@ mod tests {
     #[test]
     fn partial_file_overrides_only_named_keys() {
         let config = load_str(
-            "undo_limit = 10\nkeyboard_encoding = \"kitty\"\n[keys]\n\"C-x C-s\" = \"save-buffer\"\n",
+            "undo_limit = 10\nkeyboard_encoding = \"kitty\"\n[keys]\n\"C-c f\" = \"forward-char\"\n",
         )
         .expect("valid config");
         assert_eq!(config.undo_limit, 10);
         assert_eq!(config.undo_strong_limit, UNDO_STRONG_LIMIT);
         assert_eq!(
-            config.keys.get("C-x C-s").map(String::as_str),
-            Some("save-buffer")
+            config.keys.get("C-c f").map(String::as_str),
+            Some("forward-char")
         );
     }
 
@@ -277,7 +299,7 @@ mod tests {
              undo_outer_limit = 13\nkill_ring_max = 14\nauto_save_interval_keys = 15\n\
              auto_save_timeout_s = 16\ntab_width = 4\nnext_screen_context_lines = 0\n\
              amalgamation_limit = 17\ncolumn_checkpoint_interval = 18\n\
-             long_line_threshold = 19\n",
+             long_line_threshold = 19\necho_keystrokes_ms = 0\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -304,6 +326,7 @@ mod tests {
             amalgamation_limit: 17,
             column_checkpoint_interval: 18,
             long_line_threshold: 19,
+            echo_keystrokes_ms: 0,
         };
         assert_eq!(config, expected);
     }
@@ -320,6 +343,7 @@ mod tests {
         assert_eq!(config.column_checkpoint_interval, 4096);
         assert_eq!(config.long_line_threshold, 4096);
         assert_eq!(config.append_tail_hash_bytes, 64 * 1024);
+        assert_eq!(config.echo_keystrokes_ms, 1000);
         assert!(config.validate().is_ok());
     }
 
@@ -367,6 +391,18 @@ mod tests {
             "undo_outer_limit"
         );
         assert!(load_str("undo_limit = 5\nundo_strong_limit = 5\nundo_outer_limit = 5\n").is_ok());
+    }
+
+    #[test]
+    fn key_overrides_are_validated_at_load() {
+        let error = load_str("[keys]\n\"C-c t\" = \"no-such-command\"\n")
+            .expect_err("unknown command rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("keys") && message.contains("no-such-command"),
+            "{message}"
+        );
+        assert!(load_str("[keys]\n\"C-c t\" = \"forward-char\"\n").is_ok());
     }
 
     #[test]

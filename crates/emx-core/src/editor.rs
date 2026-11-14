@@ -1,0 +1,790 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
+
+use emx_proto::ServerMsg;
+use emx_text::{Sources, Text};
+use emx_types::{Key, KeyCode, Mods};
+use slotmap::SlotMap;
+
+use crate::buffer::{Buffer, BufferId, Change, ChangeRecorder};
+use crate::command::{self, CommandContext, CommandError, PrefixArg};
+use crate::config::{Config, ConfigError};
+use crate::event::{ClientId, Effect, Event, TimerId};
+use crate::keymap::{Keymap, Lookup, describe_keys, universal_argument_binding};
+use crate::killring::KillRing;
+use crate::marker::InsertionType;
+use crate::undo::{UndoLimits, outer_limit_warning};
+use crate::window::{Frame, Window, WindowId};
+
+const SCRATCH_BUFFER: &str = "*scratch*";
+const PASTE_COMMAND: &str = "xterm-paste";
+/// How Emacs describes a bracketed-paste event in a key sequence.
+const PASTE_EVENT_DESCRIPTION: &str = "<xterm-paste>";
+/// The quit character: in Emacs it aborts any key sequence being read,
+/// whatever the keymaps say.
+const QUIT_KEY: Key = Key {
+    code: KeyCode::Char('g'),
+    mods: Mods {
+        ctrl: true,
+        meta: false,
+        shift: false,
+        super_: false,
+    },
+};
+
+/// Every change made to every buffer, in order, waiting for the journal.
+/// It is a separate field so commands can borrow a buffer and the recorder
+/// at the same time.
+#[derive(Debug, Default)]
+pub struct JournalOutbox {
+    changes: Vec<(BufferId, Change)>,
+}
+
+impl JournalOutbox {
+    pub fn len(&self) -> usize {
+        self.changes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    pub fn drain(&mut self) -> Vec<(BufferId, Change)> {
+        std::mem::take(&mut self.changes)
+    }
+
+    fn buffers_since(&self, start: usize) -> impl Iterator<Item = BufferId> + '_ {
+        self.changes[start..].iter().map(|(buffer, _)| *buffer)
+    }
+}
+
+impl ChangeRecorder for JournalOutbox {
+    fn record(&mut self, buffer: BufferId, change: &Change) {
+        self.changes.push((buffer, change.clone()));
+    }
+}
+
+/// Emacs's per-keyboard command-loop state.
+#[derive(Debug, Default)]
+struct CommandLoopState {
+    /// The key sequence read so far.
+    pending: Vec<Key>,
+    /// Emacs `prefix-arg`: the argument for the next command.
+    prefix_arg: PrefixArg,
+    /// `universal-argument-map` is active for the next key.
+    universal_argument_map: bool,
+    last_command: Option<&'static str>,
+    /// The unfinished sequence is being echoed; once it is, every further
+    /// key echoes at once, as in Emacs.
+    echoing: bool,
+    echo_timer: Option<TimerId>,
+}
+
+impl CommandLoopState {
+    fn mid_command(&self) -> bool {
+        !self.pending.is_empty() || self.prefix_arg != PrefixArg::None
+    }
+
+    /// The echo of an unfinished command: the argument, then the keys.
+    fn echo_text(&self) -> String {
+        let mut parts: Vec<String> = self.prefix_arg.description().into_iter().collect();
+        if !self.pending.is_empty() {
+            parts.push(describe_keys(&self.pending));
+        }
+        format!("{}-", parts.join(" "))
+    }
+
+    fn end_command(&mut self) {
+        self.pending.clear();
+        self.prefix_arg = PrefixArg::None;
+        self.universal_argument_map = false;
+        self.echoing = false;
+        self.echo_timer = None;
+    }
+}
+
+#[derive(Debug)]
+struct Client {
+    cols: u16,
+    rows: u16,
+    frame: Frame,
+    command_loop: CommandLoopState,
+    /// The echo area: the last message, or the echo of keys being read.
+    echo: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerPurpose {
+    EchoKeystrokes(ClientId),
+    /// The daemon exits once no client is attached and nothing is unsaved,
+    /// after a grace period that lets a client reattach.
+    DaemonGrace,
+}
+
+/// How a command finished, for the command loop's bookkeeping.
+enum Completion {
+    /// A prefix-argument command ran: the argument and `last-command`
+    /// carry over to the next command.
+    KeepPrefixState(PrefixArg),
+    /// Emacs `prefix-arg` was set without `universal-argument--mode`.
+    Ran {
+        this_command: Option<&'static str>,
+        next_prefix_arg: PrefixArg,
+    },
+}
+
+/// The editor core: a deterministic state machine that consumes `Event`s,
+/// mutates buffers and per-client state, and emits `Effect`s.
+#[derive(Debug)]
+pub struct Editor {
+    config: Config,
+    keymap: Keymap,
+    buffers: SlotMap<BufferId, Buffer>,
+    scratch: BufferId,
+    clients: BTreeMap<ClientId, Client>,
+    kill_ring: KillRing,
+    journal_outbox: JournalOutbox,
+    effects: Vec<Effect>,
+    timers: HashMap<TimerId, TimerPurpose>,
+    next_timer: u64,
+}
+
+impl Editor {
+    /// Fails when the `[keys]` overrides are invalid.
+    pub fn new(config: Config) -> Result<Editor, ConfigError> {
+        let mut keymap = Keymap::emacs_default();
+        keymap.apply_overrides(&config.keys)?;
+        let kill_ring_max =
+            usize::try_from(config.kill_ring_max).expect("kill_ring_max fits in usize");
+        let mut editor = Editor {
+            keymap,
+            buffers: SlotMap::with_key(),
+            scratch: BufferId::default(),
+            clients: BTreeMap::new(),
+            kill_ring: KillRing::new(kill_ring_max),
+            journal_outbox: JournalOutbox::default(),
+            effects: Vec::new(),
+            timers: HashMap::new(),
+            next_timer: 0,
+            config,
+        };
+        editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
+        Ok(editor)
+    }
+
+    fn create_buffer(&mut self, name: &str) -> BufferId {
+        let limits = UndoLimits::from(&self.config);
+        let text = Text::empty(Sources::memory(Arc::from(Vec::new())));
+        let id = self
+            .buffers
+            .insert_with_key(|id| Buffer::new(id, name.to_string(), text, limits));
+        // Creating a buffer is a command's change: it gets its boundary.
+        self.buffers[id].undo.boundary(0);
+        id
+    }
+
+    pub fn handle(&mut self, event: Event) {
+        match event {
+            Event::ClientAttached {
+                client,
+                cols,
+                rows,
+                kind: _,
+            } => self.attach(client, cols, rows),
+            Event::ClientDetached(client) => self.detach(client),
+            Event::Key(client, key) => self.handle_key(client, key.canonical()),
+            Event::Paste(client, bytes) => self.handle_paste(client, bytes),
+            Event::Resize(client, cols, rows) => {
+                let client = self.client_mut(client);
+                client.cols = cols;
+                client.rows = rows;
+            }
+            Event::Timer(id) => self.handle_timer(id),
+        }
+    }
+
+    pub fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
+    }
+
+    /// Changes waiting for the journal writer.
+    pub fn take_journal_changes(&mut self) -> Vec<(BufferId, Change)> {
+        self.journal_outbox.drain()
+    }
+
+    /// A buffer visiting a file has edits not yet saved. Like Emacs on exit,
+    /// buffers without a file do not count.
+    pub fn has_unsaved(&self) -> bool {
+        self.buffers
+            .values()
+            .any(|buffer| buffer.file.is_some() && buffer.is_modified())
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Terminal size in columns and rows.
+    pub fn client_size(&self, client: ClientId) -> (u16, u16) {
+        let client = self.client(client);
+        (client.cols, client.rows)
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Every client kind gets a frame; CLI clients simply never send keys.
+    fn attach(&mut self, client: ClientId, cols: u16, rows: u16) {
+        assert!(
+            !self.clients.contains_key(&client),
+            "the server attaches each client id once"
+        );
+        let buffer_id = self.scratch;
+        let buffer = &mut self.buffers[buffer_id];
+        let window = Window {
+            buffer: buffer_id,
+            point: buffer.create_marker_without_undo(0, InsertionType::StayBefore),
+            start: buffer.create_marker_without_undo(0, InsertionType::StayBefore),
+        };
+        self.clients.insert(
+            client,
+            Client {
+                cols,
+                rows,
+                frame: Frame::new(window),
+                command_loop: CommandLoopState::default(),
+                echo: String::new(),
+            },
+        );
+    }
+
+    fn detach(&mut self, client: ClientId) {
+        let removed = self
+            .clients
+            .remove(&client)
+            .expect("the server detaches only attached clients");
+        for window in removed.frame.windows.values() {
+            let buffer = &mut self.buffers[window.buffer];
+            buffer.delete_marker(window.point);
+            buffer.delete_marker(window.start);
+        }
+        if self.clients.is_empty() && !self.has_unsaved() {
+            self.set_timer(TimerPurpose::DaemonGrace, self.config.daemon_grace_ms);
+        }
+    }
+
+    fn set_timer(&mut self, purpose: TimerPurpose, after_ms: u64) -> TimerId {
+        let id = TimerId(self.next_timer);
+        self.next_timer += 1;
+        self.timers.insert(id, purpose);
+        self.effects.push(Effect::SetTimer {
+            id,
+            after: Duration::from_millis(after_ms),
+        });
+        id
+    }
+
+    fn handle_timer(&mut self, id: TimerId) {
+        let purpose = self
+            .timers
+            .remove(&id)
+            .expect("timer events come only for timers the editor set");
+        match purpose {
+            TimerPurpose::EchoKeystrokes(client_id) => {
+                let Some(client) = self.clients.get_mut(&client_id) else {
+                    return;
+                };
+                let state = &mut client.command_loop;
+                if state.echo_timer == Some(id) && state.mid_command() {
+                    state.echo_timer = None;
+                    state.echoing = true;
+                    client.echo = state.echo_text();
+                }
+            }
+            TimerPurpose::DaemonGrace => {
+                if self.clients.is_empty() && !self.has_unsaved() {
+                    self.effects.push(Effect::Shutdown);
+                }
+            }
+        }
+    }
+
+    fn handle_key(&mut self, client_id: ClientId, key: Key) {
+        let client = self.client_mut(client_id);
+        // Reading an input event wipes the echo area.
+        client.echo.clear();
+        let state = &mut client.command_loop;
+        if !state.pending.is_empty() && key == QUIT_KEY {
+            self.signal(client_id, None, &CommandError::Quit);
+            return;
+        }
+        if state.pending.is_empty() && state.universal_argument_map {
+            state.universal_argument_map = false;
+            if let Some(name) = universal_argument_binding(key, &state.prefix_arg) {
+                self.run_key_command(client_id, name, key);
+                return;
+            }
+        }
+        state.pending.push(key);
+        let pending = state.pending.clone();
+        match self.keymap.lookup(&pending) {
+            Lookup::Command(name) => self.run_key_command(client_id, name, key),
+            Lookup::Prefix => self.continue_sequence(client_id),
+            Lookup::Undefined => self.shift_translate_or_undefined(client_id),
+        }
+    }
+
+    /// Emacs falls back to the unshifted key when a shifted one is unbound
+    /// (`M-F` runs `M-f`); if that is unbound too, the original keys are
+    /// reported.
+    fn shift_translate_or_undefined(&mut self, client_id: ClientId) {
+        let state = &mut self.client_mut(client_id).command_loop;
+        let last = *state.pending.last().expect("a key was just pushed");
+        if let Some(unshifted) = unshift(last) {
+            let mut translated = state.pending.clone();
+            *translated.last_mut().expect("non-empty") = unshifted;
+            match self.keymap.lookup(&translated) {
+                Lookup::Command(name) => {
+                    self.client_mut(client_id).command_loop.pending = translated;
+                    self.run_key_command(client_id, name, unshifted);
+                    return;
+                }
+                Lookup::Prefix => {
+                    self.client_mut(client_id).command_loop.pending = translated;
+                    self.continue_sequence(client_id);
+                    return;
+                }
+                Lookup::Undefined => {}
+            }
+        }
+        let keys = describe_keys(&self.client_mut(client_id).command_loop.pending);
+        self.undefined(client_id, keys);
+    }
+
+    /// Emacs `undefined`: ring the bell, report the keys (without the
+    /// prefix-argument keys), and drop the prefix argument.
+    fn undefined(&mut self, client_id: ClientId, keys: String) {
+        self.ring_bell(client_id);
+        let client = self.client_mut(client_id);
+        client.echo = format!("{keys} is undefined");
+        client.command_loop.end_command();
+        client.command_loop.last_command = None;
+        self.finish_command(client_id, self.journal_outbox.len());
+    }
+
+    fn continue_sequence(&mut self, client_id: ClientId) {
+        self.update_echo(client_id);
+    }
+
+    /// Echo an unfinished command now if echoing has started, otherwise
+    /// after `echo_keystrokes_ms` without input.
+    fn update_echo(&mut self, client_id: ClientId) {
+        let delay = self.config.echo_keystrokes_ms;
+        let client = self.client_mut(client_id);
+        let state = &client.command_loop;
+        if !state.mid_command() {
+            return;
+        }
+        if state.echoing {
+            client.echo = state.echo_text();
+        } else if delay > 0 {
+            let id = self.set_timer(TimerPurpose::EchoKeystrokes(client_id), delay);
+            self.client_mut(client_id).command_loop.echo_timer = Some(id);
+        }
+    }
+
+    fn run_key_command(&mut self, client_id: ClientId, name: &'static str, key: Key) {
+        let spec = command::lookup(name).expect("keymaps bind only registered commands");
+        self.run_command(client_id, name, Some(key), spec.run);
+    }
+
+    fn handle_paste(&mut self, client_id: ClientId, bytes: Vec<u8>) {
+        let client = self.client_mut(client_id);
+        client.echo.clear();
+        if !client.command_loop.pending.is_empty() {
+            let keys = describe_keys(&client.command_loop.pending);
+            self.undefined(client_id, format!("{keys} {PASTE_EVENT_DESCRIPTION}"));
+            return;
+        }
+        self.run_command(client_id, PASTE_COMMAND, None, |ctx| ctx.insert(&bytes));
+    }
+
+    fn run_command(
+        &mut self,
+        client_id: ClientId,
+        name: &'static str,
+        key: Option<Key>,
+        run: impl FnOnce(&mut CommandContext) -> Result<(), CommandError>,
+    ) {
+        let journal_start = self.journal_outbox.len();
+        let state = &mut self.client_mut(client_id).command_loop;
+        let prefix_arg = std::mem::take(&mut state.prefix_arg);
+        let last_command = state.last_command;
+        let mut context = CommandContext::new(self, client_id, name, key, prefix_arg, last_command);
+        let result = run(&mut context);
+        let completion = if context.keep_prefix_state {
+            Completion::KeepPrefixState(context.next_prefix_arg)
+        } else {
+            Completion::Ran {
+                this_command: Some(name),
+                next_prefix_arg: context.next_prefix_arg,
+            }
+        };
+        match result {
+            Ok(()) => self.complete(client_id, completion),
+            Err(error) => self.signal(client_id, Some(name), &error),
+        }
+        self.finish_command(client_id, journal_start);
+    }
+
+    fn complete(&mut self, client_id: ClientId, completion: Completion) {
+        let state = &mut self.client_mut(client_id).command_loop;
+        match completion {
+            Completion::KeepPrefixState(next_prefix_arg) => {
+                state.pending.clear();
+                state.prefix_arg = next_prefix_arg;
+                state.universal_argument_map = true;
+                self.update_echo(client_id);
+            }
+            Completion::Ran {
+                this_command,
+                next_prefix_arg,
+            } => {
+                state.end_command();
+                state.prefix_arg = next_prefix_arg;
+                state.last_command = this_command;
+            }
+        }
+    }
+
+    /// An error ends the command: Emacs's `command-error` shows the message,
+    /// rings the bell and drops the prefix argument. `last-command` becomes
+    /// the failed command (nil when the key sequence itself was quit).
+    fn signal(
+        &mut self,
+        client_id: ClientId,
+        this_command: Option<&'static str>,
+        error: &CommandError,
+    ) {
+        self.ring_bell(client_id);
+        let client = self.client_mut(client_id);
+        client.echo = error.to_string();
+        client.command_loop.end_command();
+        client.command_loop.last_command = this_command;
+        if this_command.is_none() {
+            self.finish_command(client_id, self.journal_outbox.len());
+        }
+    }
+
+    /// Emacs `undo-auto--add-boundary` after every command, on every buffer
+    /// the command changed and on the selected buffer (whose boundary point
+    /// is Emacs's `point_before_last_command_or_undo`).
+    fn finish_command(&mut self, client_id: ClientId, journal_start: usize) {
+        let mut buffers: BTreeSet<BufferId> =
+            self.journal_outbox.buffers_since(journal_start).collect();
+        let selected = self.client(client_id).frame.selected_window().buffer;
+        buffers.insert(selected);
+        for buffer_id in buffers {
+            let point = self.boundary_point(client_id, buffer_id);
+            let buffer = &mut self.buffers[buffer_id];
+            buffer.undo.boundary(point);
+            if buffer.undo.take_outer_limit_warning() {
+                let warning = outer_limit_warning(&buffer.name);
+                self.set_echo(client_id, warning);
+            }
+        }
+    }
+
+    /// Point for a buffer's undo boundary: the acting client's selected
+    /// window if it shows the buffer, else any window showing it. A buffer
+    /// in no window has no point to restore; Emacs records none for a
+    /// buffer that was not current, and 0 never differs from where a first
+    /// change in a fresh buffer starts.
+    fn boundary_point(&self, client_id: ClientId, buffer_id: BufferId) -> u64 {
+        let acting = self.client(client_id);
+        let selected = acting.frame.selected_window();
+        let window = std::iter::once(selected)
+            .chain(acting.frame.windows.values())
+            .chain(
+                self.clients
+                    .values()
+                    .flat_map(|client| client.frame.windows.values()),
+            )
+            .find(|window| window.buffer == buffer_id);
+        window.map_or(0, |window| self.buffers[buffer_id].marker_pos(window.point))
+    }
+
+    fn client(&self, client_id: ClientId) -> &Client {
+        self.clients
+            .get(&client_id)
+            .expect("events name only attached clients")
+    }
+
+    fn client_mut(&mut self, client_id: ClientId) -> &mut Client {
+        self.clients
+            .get_mut(&client_id)
+            .expect("events name only attached clients")
+    }
+
+    pub(crate) fn selected_window_id(&self, client_id: ClientId) -> WindowId {
+        self.client(client_id).frame.selected
+    }
+
+    pub(crate) fn window(&self, client_id: ClientId, window: WindowId) -> &Window {
+        &self.client(client_id).frame.windows[window]
+    }
+
+    pub(crate) fn window_point(&self, client_id: ClientId, window: WindowId) -> u64 {
+        let window = self.window(client_id, window);
+        self.buffers[window.buffer].marker_pos(window.point)
+    }
+
+    pub(crate) fn set_window_point(&mut self, client_id: ClientId, window: WindowId, pos: u64) {
+        let window = *self.window(client_id, window);
+        self.buffers[window.buffer].set_marker(window.point, pos);
+    }
+
+    pub(crate) fn buffer(&self, id: BufferId) -> &Buffer {
+        &self.buffers[id]
+    }
+
+    pub(crate) fn buffer_mut(&mut self, id: BufferId) -> &mut Buffer {
+        &mut self.buffers[id]
+    }
+
+    pub(crate) fn buffer_and_recorder(
+        &mut self,
+        id: BufferId,
+    ) -> (&mut Buffer, &mut dyn ChangeRecorder) {
+        (&mut self.buffers[id], &mut self.journal_outbox)
+    }
+
+    pub(crate) fn set_echo(&mut self, client_id: ClientId, text: String) {
+        self.client_mut(client_id).echo = text;
+    }
+
+    pub(crate) fn echo(&self, client_id: ClientId) -> &str {
+        &self.client(client_id).echo
+    }
+
+    pub(crate) fn ring_bell(&mut self, client_id: ClientId) {
+        self.effects.push(Effect::Send(client_id, ServerMsg::Bell));
+    }
+
+    pub(crate) fn kill_ring(&self) -> &KillRing {
+        &self.kill_ring
+    }
+
+    pub(crate) fn selected_buffer(&self, client_id: ClientId) -> BufferId {
+        self.client(client_id).frame.selected_window().buffer
+    }
+}
+
+/// The key Emacs's shift translation tries: shift removed, or an uppercase
+/// letter downcased.
+fn unshift(key: Key) -> Option<Key> {
+    if key.mods.shift {
+        return Some(Key {
+            code: key.code,
+            mods: Mods {
+                shift: false,
+                ..key.mods
+            },
+        });
+    }
+    let KeyCode::Char(character) = key.code else {
+        return None;
+    };
+    let mut lower = character.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(lowercase), None) if lowercase != character => Some(Key {
+            code: KeyCode::Char(lowercase),
+            mods: key.mods,
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use emx_types::parse_kbd;
+
+    use emx_proto::ClientKind;
+
+    use super::*;
+    use crate::buffer::FileBinding;
+
+    const FIRST: ClientId = ClientId(1);
+    const SECOND: ClientId = ClientId(2);
+
+    fn attach(editor: &mut Editor, client: ClientId) {
+        editor.handle(Event::ClientAttached {
+            client,
+            cols: 80,
+            rows: 24,
+            kind: ClientKind::Tui,
+        });
+    }
+
+    fn type_keys(editor: &mut Editor, client: ClientId, keys: &str) {
+        for key in parse_kbd(keys).expect("valid kbd") {
+            editor.handle(Event::Key(client, key));
+        }
+    }
+
+    fn point(editor: &Editor, client: ClientId) -> u64 {
+        editor.window_point(client, editor.selected_window_id(client))
+    }
+
+    fn timers(effects: &[Effect]) -> Vec<(TimerId, Duration)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::SetTimer { id, after } => Some((*id, *after)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clients_share_buffers_but_keep_their_own_point() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        attach(&mut editor, SECOND);
+        type_keys(&mut editor, FIRST, "a b c");
+        assert_eq!(point(&editor, FIRST), 3);
+        assert_eq!(
+            point(&editor, SECOND),
+            0,
+            "insertion at its point leaves it before"
+        );
+        type_keys(&mut editor, SECOND, "C-f C-f x");
+        assert_eq!(point(&editor, SECOND), 3);
+        assert_eq!(point(&editor, FIRST), 4, "insertion before it moves it");
+        assert_eq!(editor.client_count(), 2);
+        assert_eq!(editor.echo(SECOND), "");
+    }
+
+    #[test]
+    fn each_client_has_its_own_command_loop() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        attach(&mut editor, SECOND);
+        type_keys(&mut editor, FIRST, "C-u");
+        type_keys(&mut editor, SECOND, "a");
+        type_keys(&mut editor, FIRST, "b");
+        let buffer = editor.buffer(editor.selected_buffer(FIRST));
+        let mut text = Vec::new();
+        buffer
+            .text
+            .read(0..buffer.text.len(), &mut text)
+            .expect("memory read");
+        assert_eq!(text, b"bbbba");
+    }
+
+    #[test]
+    fn journal_outbox_records_every_change() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        type_keys(&mut editor, FIRST, "a C-u 2 b");
+        editor.handle(Event::Paste(FIRST, b"xy".to_vec()));
+        let changes = editor.take_journal_changes();
+        let inserted: Vec<(u64, Vec<u8>)> = changes
+            .into_iter()
+            .map(|(_, change)| match change {
+                Change::Insert { at, bytes } => (at, bytes),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            inserted,
+            vec![(0, b"a".to_vec()), (1, b"bb".to_vec()), (3, b"xy".to_vec())]
+        );
+        assert!(editor.take_journal_changes().is_empty());
+    }
+
+    #[test]
+    fn last_client_detaching_starts_the_grace_period() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        attach(&mut editor, SECOND);
+        editor.handle(Event::ClientDetached(FIRST));
+        assert!(timers(&editor.take_effects()).is_empty());
+        editor.handle(Event::ClientDetached(SECOND));
+        let pending = timers(&editor.take_effects());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, Duration::from_millis(3000));
+        editor.handle(Event::Timer(pending[0].0));
+        assert_eq!(editor.take_effects(), vec![Effect::Shutdown]);
+    }
+
+    #[test]
+    fn reattach_within_grace_keeps_the_server() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        editor.handle(Event::ClientDetached(FIRST));
+        let pending = timers(&editor.take_effects());
+        attach(&mut editor, SECOND);
+        editor.handle(Event::Timer(pending[0].0));
+        assert!(editor.take_effects().is_empty());
+    }
+
+    #[test]
+    fn unsaved_file_buffer_keeps_the_server() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        let scratch = editor.selected_buffer(FIRST);
+        editor.buffer_mut(scratch).file = Some(FileBinding {
+            path: "/tmp/file".into(),
+            identity: None,
+            saving: false,
+        });
+        type_keys(&mut editor, FIRST, "a");
+        assert!(editor.has_unsaved());
+        editor.handle(Event::ClientDetached(FIRST));
+        assert!(timers(&editor.take_effects()).is_empty());
+    }
+
+    #[test]
+    fn modified_buffer_without_file_is_not_unsaved() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        type_keys(&mut editor, FIRST, "a");
+        assert!(!editor.has_unsaved());
+    }
+
+    #[test]
+    fn detach_removes_window_markers() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        let window = *editor.window(FIRST, editor.selected_window_id(FIRST));
+        editor.handle(Event::ClientDetached(FIRST));
+        assert_eq!(
+            editor.buffer(window.buffer).marker_position(window.point),
+            None
+        );
+        assert_eq!(editor.client_count(), 0);
+    }
+
+    #[test]
+    fn resize_updates_client_geometry() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        editor.handle(Event::Resize(FIRST, 100, 40));
+        assert_eq!(editor.client_size(FIRST), (100, 40));
+    }
+
+    #[test]
+    fn echo_timer_for_detached_client_is_ignored() {
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        attach(&mut editor, SECOND);
+        type_keys(&mut editor, FIRST, "C-x");
+        let pending = timers(&editor.take_effects());
+        editor.handle(Event::ClientDetached(FIRST));
+        editor.handle(Event::Timer(pending[0].0));
+        assert!(editor.take_effects().is_empty());
+    }
+}

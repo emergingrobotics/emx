@@ -224,7 +224,9 @@ version = "0.0.1"
 name = "emx-core"
 version = "0.0.1"
 dependencies = [
+ "emx-proto",
  "emx-text",
+ "emx-types",
  "parking_lot",
  "serde",
  "slotmap",

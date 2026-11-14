@@ -249,10 +249,30 @@ impl Buffer {
 
     /// Positions past the end are clamped, as Emacs `set-marker` does.
     pub fn create_marker(&mut self, pos: u64, insertion_type: InsertionType) -> MarkerId {
+        self.insert_marker(pos, insertion_type, true)
+    }
+
+    /// A marker whose movement by deletions is never recorded in undo, for
+    /// window point and start (Emacs PT is not a marker).
+    pub fn create_marker_without_undo(
+        &mut self,
+        pos: u64,
+        insertion_type: InsertionType,
+    ) -> MarkerId {
+        self.insert_marker(pos, insertion_type, false)
+    }
+
+    fn insert_marker(
+        &mut self,
+        pos: u64,
+        insertion_type: InsertionType,
+        record_in_undo: bool,
+    ) -> MarkerId {
         let pos = pos.min(self.text.len());
         self.markers.insert(Marker {
             pos,
             insertion_type,
+            record_in_undo,
         })
     }
 

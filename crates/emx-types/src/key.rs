@@ -77,9 +77,22 @@ const ANGLE_KEYS: [(&str, KeyCode); 10] = [
     ("next", KeyCode::PageDown),
 ];
 
+/// Control characters Emacs reads as the same event as a named key.
+const CONTROL_ALIASES: [(char, KeyCode); 3] = [
+    ('i', KeyCode::Tab),
+    ('m', KeyCode::Enter),
+    ('[', KeyCode::Escape),
+];
+
 impl Key {
-    // Shift on a plain letter is folded into the character; with Ctrl the
-    // shift stays because Emacs distinguishes C-S-a from C-a.
+    /// The form Emacs sees: C-i is TAB, C-m is RET, C-[ is ESC, and shift on
+    /// a letter without Ctrl is folded into the character. With Ctrl the
+    /// shift stays, because Emacs distinguishes C-S-a from C-a. C-? stays
+    /// distinct from DEL.
+    pub fn canonical(self) -> Key {
+        Key::normalized(self.code, self.mods)
+    }
+
     fn normalized(code: KeyCode, mut mods: Mods) -> Key {
         let mut code = code;
         if let KeyCode::Char(character) = code {
@@ -88,12 +101,24 @@ impl Key {
                     code = KeyCode::Char(lower);
                     mods.shift = true;
                 }
-            } else if mods.shift
-                && let Some(upper) = single_case_mapping(character.to_uppercase(), character)
-            {
-                code = KeyCode::Char(upper);
-                mods.shift = false;
+            } else if mods.shift {
+                if let Some(upper) = single_case_mapping(character.to_uppercase(), character) {
+                    code = KeyCode::Char(upper);
+                    mods.shift = false;
+                } else if single_case_mapping(character.to_lowercase(), character).is_some() {
+                    mods.shift = false;
+                }
             }
+        }
+        if let KeyCode::Char(character) = code
+            && mods.ctrl
+            && !mods.shift
+            && let Some((_, alias)) = CONTROL_ALIASES
+                .iter()
+                .find(|(control, _)| *control == character)
+        {
+            code = *alias;
+            mods.ctrl = false;
         }
         Key { code, mods }
     }
@@ -107,6 +132,7 @@ fn single_case_mapping(mut mapped: impl Iterator<Item = char>, original: char) -
     Some(first)
 }
 
+/// Returns canonical keys (see `Key::canonical`).
 pub fn parse_kbd(s: &str) -> Result<Vec<Key>, KbdError> {
     let keys = s
         .split_whitespace()
@@ -297,6 +323,54 @@ mod tests {
     fn modifier_order_is_canonical() {
         let keys = parse_kbd("M-C-s").unwrap();
         assert_eq!(format_key(&keys[0]), "C-M-s");
+    }
+
+    #[test]
+    fn canonical_aliases_match_emacs() {
+        assert_eq!(parse_kbd("C-i").unwrap(), parse_kbd("TAB").unwrap());
+        assert_eq!(parse_kbd("C-m").unwrap(), parse_kbd("RET").unwrap());
+        assert_eq!(parse_kbd("C-[").unwrap(), parse_kbd("ESC").unwrap());
+        assert_eq!(parse_kbd("C-M-i").unwrap(), parse_kbd("M-TAB").unwrap());
+        assert_eq!(parse_kbd("S-A").unwrap(), parse_kbd("A").unwrap());
+        assert_eq!(parse_kbd("M-S-A").unwrap(), parse_kbd("M-A").unwrap());
+        assert_ne!(parse_kbd("C-?").unwrap(), parse_kbd("DEL").unwrap());
+        assert_eq!(format_key(&parse_kbd("C-?").unwrap()[0]), "C-?");
+        assert_ne!(parse_kbd("C-S-i").unwrap(), parse_kbd("TAB").unwrap());
+    }
+
+    #[test]
+    fn canonical_folds_raw_keys() {
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        let raw = |code, mods| Key { code, mods };
+        assert_eq!(
+            raw(KeyCode::Char('i'), ctrl).canonical(),
+            raw(KeyCode::Tab, Mods::default())
+        );
+        assert_eq!(
+            raw(KeyCode::Char('m'), ctrl).canonical(),
+            raw(KeyCode::Enter, Mods::default())
+        );
+        assert_eq!(
+            raw(KeyCode::Char('['), ctrl).canonical(),
+            raw(KeyCode::Escape, Mods::default())
+        );
+        assert_eq!(
+            raw(KeyCode::Char('A'), shift).canonical(),
+            raw(KeyCode::Char('A'), Mods::default())
+        );
+        assert_eq!(
+            raw(KeyCode::Char('a'), shift).canonical(),
+            raw(KeyCode::Char('A'), Mods::default())
+        );
+        let left = raw(KeyCode::Left, shift);
+        assert_eq!(left.canonical(), left);
     }
 
     #[test]

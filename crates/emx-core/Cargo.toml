@@ -7,7 +7,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+emx-proto = { path = "../emx-proto" }
 emx-text = { path = "../emx-text" }
+emx-types = { path = "../emx-types" }
 parking_lot.workspace = true
 serde.workspace = true
 slotmap.workspace = true

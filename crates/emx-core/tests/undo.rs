@@ -443,6 +443,37 @@ fn markers_shift_on_insert_and_delete() {
     ));
 }
 
+/// Window point and start are not undo-tracked markers: Emacs PT is not a
+/// marker, so a deletion around it records no `(MARKER . ADJUSTMENT)`.
+#[test]
+fn markers_without_undo_record_no_adjustment() {
+    let mut buffer = Buffer::new(
+        BufferId::default(),
+        "w".to_string(),
+        text_of("0123456789"),
+        UndoLimits::from(&Config::default()),
+    );
+    let mut log = Log::default();
+    buffer.undo.boundary(0);
+    let window_point = buffer.create_marker_without_undo(5, InsertionType::StayBefore);
+    let tracked = buffer.create_marker(6, InsertionType::StayBefore);
+    buffer.delete(3..8, &mut log).expect("delete");
+    assert_eq!(buffer.marker_pos(window_point), 3);
+    let adjustments: Vec<i64> = buffer
+        .undo
+        .entries()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            UndoEntry::MarkerAdjust { marker, adjustment } => {
+                assert_eq!(marker, tracked);
+                Some(adjustment)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(adjustments, vec![-3]);
+}
+
 #[test]
 fn undo_list_structure_matches_emacs() {
     // Emacs after "abc def" C-e, C-u 3 DEL, C-b C-b, C-/ (1-based):

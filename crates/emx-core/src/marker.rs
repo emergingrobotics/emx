@@ -16,6 +16,9 @@ pub enum InsertionType {
 pub(crate) struct Marker {
     pub(crate) pos: u64,
     pub(crate) insertion_type: InsertionType,
+    /// False for window point and start, which stand in for Emacs PT and
+    /// window-start: undo must not record adjustments for them.
+    pub(crate) record_in_undo: bool,
 }
 
 impl Marker {
@@ -40,7 +43,7 @@ impl Marker {
     /// the start and an AdvanceAfter marker at the end, and undo subtracts
     /// this offset to put the marker back where it was.
     pub(crate) fn deletion_adjustment(&self, range: &Range<u64>) -> Option<i64> {
-        if self.pos < range.start || self.pos > range.end {
+        if !self.record_in_undo || self.pos < range.start || self.pos > range.end {
             return None;
         }
         let adjustment = match self.insertion_type {
@@ -59,6 +62,7 @@ mod tests {
         Marker {
             pos,
             insertion_type,
+            record_in_undo: true,
         }
     }
 
