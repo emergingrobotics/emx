@@ -341,6 +341,7 @@ fn undo_truncates_beyond_strong_limit() {
         limit: 100,
         strong_limit: 150,
         outer_limit: 1_000_000,
+        amalgamation_limit: emx_core::config::AMALGAMATION_LIMIT,
     };
     // x, C-u 200 DEL from the end, y: the deletion group alone exceeds the
     // strong limit, so the boundary after it cuts the oldest group ("x").
@@ -381,6 +382,7 @@ fn undo_outer_limit_discards_and_warns() {
         limit: 100,
         strong_limit: 150,
         outer_limit: 200,
+        amalgamation_limit: emx_core::config::AMALGAMATION_LIMIT,
     };
     let mut session = Session::with_limits(&"d".repeat(300), 300, limits);
     session.delete_backward(300);
@@ -575,6 +577,7 @@ fn dropping_a_long_undo_list_does_not_overflow_the_stack() {
         limit: u64::MAX,
         strong_limit: u64::MAX,
         outer_limit: u64::MAX,
+        amalgamation_limit: emx_core::config::AMALGAMATION_LIMIT,
     };
     let mut session = Session::with_limits("", 0, limits);
     for _ in 0..300_000 {
@@ -593,4 +596,75 @@ fn outer_limit_warning_names_the_variable() {
         emx_core::outer_limit_warning("notes.txt"),
         "Buffer `notes.txt' undo info was discarded because it exceeded `undo-outer-limit'"
     );
+}
+
+#[test]
+fn reload_undo_survives_edit_and_undo() {
+    // Reload, type x, C-/ (removes x, leaving equal text under a new root),
+    // C-/ again: the pre-reload text comes back with point where it was.
+    let before_reload = emx_text::FileIdentity {
+        dev: 1,
+        ino: 2,
+        size: 8,
+        mtime_ns: 3,
+    };
+    let mut session = Session::new("old text", 4);
+    session.buffer.file = Some(emx_core::FileBinding {
+        path: "/tmp/reloaded".into(),
+        identity: Some(before_reload),
+        saving: false,
+    });
+    session
+        .buffer
+        .replace_all(text_of("brand new"), &mut session.log)
+        .expect("replace");
+    // The reload adopts the new disk version, as M2's reload will.
+    session.buffer.file.as_mut().expect("bound").identity = Some(emx_text::FileIdentity {
+        size: 9,
+        mtime_ns: 4,
+        ..before_reload
+    });
+    session.buffer.set_unmodified();
+    session.point = 0;
+    session.finish("revert-buffer");
+    session.goto(5);
+    session.self_insert("x");
+    assert_eq!(session.text(), "brandx new");
+    assert_eq!(session.undo(), Ok("Undo"));
+    assert_eq!((session.text().as_str(), session.point()), ("brand new", 5));
+    assert_eq!(session.undo(), Ok("Undo"));
+    assert_eq!((session.text().as_str(), session.point()), ("old text", 4));
+    // The pre-reload text no longer matches the disk.
+    assert!(session.buffer.is_modified());
+}
+
+#[test]
+fn reload_undo_refuses_when_text_differs() {
+    // Only a change that bypassed the undo list can make the text differ
+    // from the reloaded text; undo must refuse rather than discard it.
+    let mut session = Session::new("abc", 0);
+    session
+        .buffer
+        .replace_all(text_of("xyz"), &mut session.log)
+        .expect("replace");
+    session.finish("revert-buffer");
+    // Swap the text behind undo's back, keeping the length.
+    session.buffer.text = text_of("xyq");
+    assert_eq!(
+        session.undo(),
+        Err("Buffer text differs from the reloaded text; cannot undo the reload".to_string())
+    );
+    assert_eq!(session.text(), "xyq");
+}
+
+#[test]
+fn amalgamation_limit_comes_from_config() {
+    let config = Config {
+        amalgamation_limit: 2,
+        ..Config::default()
+    };
+    let mut session = Session::with_limits("", 0, UndoLimits::from(&config));
+    session.self_insert("xxxxx");
+    session.undo().expect("undo");
+    assert_eq!((session.text().as_str(), session.point()), ("xxx", 3));
 }

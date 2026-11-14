@@ -15,7 +15,7 @@ use emx_text::{FileIdentity, Text};
 use parking_lot::Mutex;
 
 use crate::buffer::{Buffer, ChangeRecorder, EditError};
-use crate::config::{AMALGAMATION_LIMIT, Config};
+use crate::config::Config;
 use crate::marker::MarkerId;
 
 /// `sizeof (struct Lisp_Cons)` on 64-bit Emacs, as truncate_undo_list counts.
@@ -34,6 +34,8 @@ pub struct UndoLimits {
     pub limit: u64,
     pub strong_limit: u64,
     pub outer_limit: u64,
+    /// Emacs `amalgamating-undo-limit`.
+    pub amalgamation_limit: u64,
 }
 
 impl From<&Config> for UndoLimits {
@@ -42,6 +44,7 @@ impl From<&Config> for UndoLimits {
             limit: config.undo_limit,
             strong_limit: config.undo_strong_limit,
             outer_limit: config.undo_outer_limit,
+            amalgamation_limit: config.amalgamation_limit,
         }
     }
 }
@@ -101,8 +104,43 @@ pub enum UndoError {
     NoUndoneChangesToRedo,
     #[error("Changes to be undone are outside visible portion of buffer")]
     OutsideBuffer,
+    #[error("Buffer text differs from the reloaded text; cannot undo the reload")]
+    ReloadMismatch,
     #[error("{0}")]
     Edit(#[from] EditError),
+}
+
+/// Compares two equal-length texts chunk by chunk without materializing
+/// either, since reloaded files may be far larger than memory.
+fn texts_equal(left: &Text, right: &Text) -> Result<bool, emx_text::ReadError> {
+    if left.same_root(right) {
+        return Ok(true);
+    }
+    let length = left.len();
+    let mut right_chunks = right.chunks(0..length);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut pending_start = 0;
+    for left_chunk in left.chunks(0..length) {
+        let left_chunk = left_chunk?;
+        let mut left_bytes = left_chunk.bytes();
+        while !left_bytes.is_empty() {
+            if pending_start == pending.len() {
+                let Some(right_chunk) = right_chunks.next() else {
+                    return Ok(false);
+                };
+                pending.clear();
+                pending.extend_from_slice(right_chunk?.bytes());
+                pending_start = 0;
+            }
+            let count = left_bytes.len().min(pending.len() - pending_start);
+            if left_bytes[..count] != pending[pending_start..pending_start + count] {
+                return Ok(false);
+            }
+            left_bytes = &left_bytes[count..];
+            pending_start += count;
+        }
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,7 +353,7 @@ impl UndoList {
     fn amalgamate(&mut self, repeated_command: bool) {
         self.this_command_amalgamating = true;
         if let BoundaryCause::Amalgamating(count) = self.last_boundary_cause {
-            if count < AMALGAMATION_LIMIT && repeated_command {
+            if count < self.limits.amalgamation_limit && repeated_command {
                 if is_boundary(&self.head) {
                     self.head = self.head.as_ref().and_then(next_of);
                 }
@@ -674,7 +712,7 @@ impl Buffer {
     /// `delete-char` and the commands built on them (`newline`,
     /// `delete-backward-char`), before their edit, when they act on a single
     /// character. `repeated_command` is Emacs's `(eq this-command
-    /// last-command)`. Up to `AMALGAMATION_LIMIT` consecutive such commands
+    /// last-command)`. Up to `amalgamation_limit` + 1 consecutive such commands
     /// then undo as one.
     pub fn amalgamate_last_change(&mut self, repeated_command: bool) {
         self.undo.amalgamate(repeated_command);
@@ -880,8 +918,12 @@ impl Buffer {
                         }
                     }
                     UndoEntry::ReplaceAll { before, after } => {
-                        if !self.text.same_root(after) {
-                            return Err(UndoError::OutsideBuffer);
+                        // Edits undone since the reload leave equal content
+                        // under a new root, so compare content, not identity.
+                        if after.len() != self.text.len()
+                            || !texts_equal(&self.text, after).map_err(EditError::from)?
+                        {
+                            return Err(UndoError::ReloadMismatch);
                         }
                         self.apply_replace_all(before.clone(), recorder);
                         if let Some(position) = point {

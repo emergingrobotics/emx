@@ -28,6 +28,8 @@ pub const KILL_RING_MAX: u64 = 120;
 pub const AUTO_SAVE_INTERVAL_KEYS: u64 = 300;
 pub const AUTO_SAVE_TIMEOUT_S: u64 = 30;
 pub const TAB_WIDTH: u64 = 8;
+/// Widest `tab_width` accepted from config.
+pub const TAB_WIDTH_MAX: u64 = 16;
 pub const NEXT_SCREEN_CONTEXT_LINES: u64 = 2;
 /// Emacs `amalgamating-undo-limit`.
 pub const AMALGAMATION_LIMIT: u64 = 20;
@@ -60,6 +62,16 @@ pub struct Config {
     pub undo_limit: u64,
     pub undo_strong_limit: u64,
     pub undo_outer_limit: u64,
+    pub append_tail_hash_bytes: u64,
+    pub kill_ring_max: u64,
+    pub auto_save_interval_keys: u64,
+    pub auto_save_timeout_s: u64,
+    pub tab_width: u64,
+    /// Zero is valid: Emacs allows paging with no overlap.
+    pub next_screen_context_lines: u64,
+    pub amalgamation_limit: u64,
+    pub column_checkpoint_interval: u64,
+    pub long_line_threshold: u64,
 }
 
 impl Default for Config {
@@ -79,6 +91,15 @@ impl Default for Config {
             undo_limit: UNDO_LIMIT,
             undo_strong_limit: UNDO_STRONG_LIMIT,
             undo_outer_limit: UNDO_OUTER_LIMIT,
+            append_tail_hash_bytes: APPEND_TAIL_HASH_BYTES,
+            kill_ring_max: KILL_RING_MAX,
+            auto_save_interval_keys: AUTO_SAVE_INTERVAL_KEYS,
+            auto_save_timeout_s: AUTO_SAVE_TIMEOUT_S,
+            tab_width: TAB_WIDTH,
+            next_screen_context_lines: NEXT_SCREEN_CONTEXT_LINES,
+            amalgamation_limit: AMALGAMATION_LIMIT,
+            column_checkpoint_interval: COLUMN_CHECKPOINT_INTERVAL,
+            long_line_threshold: LONG_LINE_THRESHOLD,
         }
     }
 }
@@ -92,6 +113,19 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("invalid config {path}: {key} {reason}")]
+    Invalid {
+        path: PathBuf,
+        key: &'static str,
+        reason: String,
+    },
+}
+
+/// A rejected setting: the key and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSetting {
+    pub key: &'static str,
+    pub reason: String,
 }
 
 impl Config {
@@ -105,10 +139,73 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        toml::from_str(&content).map_err(|source| ConfigError::Parse {
+        let config: Config = toml::from_str(&content).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        config.validate().map_err(|invalid| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            key: invalid.key,
+            reason: invalid.reason,
+        })?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), InvalidSetting> {
+        let nonzero = [
+            ("in_memory_max", self.in_memory_max),
+            ("block_cache_bytes", self.block_cache_bytes),
+            ("search_match_cap", self.search_match_cap),
+            ("append_tail_hash_bytes", self.append_tail_hash_bytes),
+            ("settle_window_ms", self.settle_window_ms),
+            ("poll_interval_ms", self.poll_interval_ms),
+            ("journal_fsync_ms", self.journal_fsync_ms),
+            ("journal_snapshot_max", self.journal_snapshot_max),
+            ("large_save_warn", self.large_save_warn),
+            ("daemon_grace_ms", self.daemon_grace_ms),
+            ("undo_limit", self.undo_limit),
+            ("undo_strong_limit", self.undo_strong_limit),
+            ("undo_outer_limit", self.undo_outer_limit),
+            ("kill_ring_max", self.kill_ring_max),
+            ("auto_save_interval_keys", self.auto_save_interval_keys),
+            ("auto_save_timeout_s", self.auto_save_timeout_s),
+            ("amalgamation_limit", self.amalgamation_limit),
+            (
+                "column_checkpoint_interval",
+                self.column_checkpoint_interval,
+            ),
+            ("long_line_threshold", self.long_line_threshold),
+        ];
+        for (key, value) in nonzero {
+            if value == 0 {
+                return Err(InvalidSetting {
+                    key,
+                    reason: "must be greater than 0".to_string(),
+                });
+            }
+        }
+        if !(1..=TAB_WIDTH_MAX).contains(&self.tab_width) {
+            return Err(InvalidSetting {
+                key: "tab_width",
+                reason: format!("must be between 1 and {TAB_WIDTH_MAX}"),
+            });
+        }
+        if self.undo_strong_limit < self.undo_limit {
+            return Err(InvalidSetting {
+                key: "undo_strong_limit",
+                reason: format!("must be at least undo_limit ({})", self.undo_limit),
+            });
+        }
+        if self.undo_outer_limit < self.undo_strong_limit {
+            return Err(InvalidSetting {
+                key: "undo_outer_limit",
+                reason: format!(
+                    "must be at least undo_strong_limit ({})",
+                    self.undo_strong_limit
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -168,5 +265,115 @@ mod tests {
         let error = Config::load(Some(&directory.path().join("absent.toml")))
             .expect_err("missing file rejected");
         assert!(matches!(error, ConfigError::Read { .. }));
+    }
+
+    #[test]
+    fn every_group_is_overridable() {
+        let config = load_str(
+            "in_memory_max = 1\nblock_cache_bytes = 2\nsearch_match_cap = 3\n\
+             append_tail_hash_bytes = 4\nsettle_window_ms = 5\npoll_interval_ms = 6\n\
+             journal_fsync_ms = 7\njournal_snapshot_max = 8\nlarge_save_warn = 9\n\
+             daemon_grace_ms = 10\nundo_limit = 11\nundo_strong_limit = 12\n\
+             undo_outer_limit = 13\nkill_ring_max = 14\nauto_save_interval_keys = 15\n\
+             auto_save_timeout_s = 16\ntab_width = 4\nnext_screen_context_lines = 0\n\
+             amalgamation_limit = 17\ncolumn_checkpoint_interval = 18\n\
+             long_line_threshold = 19\n",
+        )
+        .expect("valid config");
+        let expected = Config {
+            keys: BTreeMap::new(),
+            in_memory_max: 1,
+            block_cache_bytes: 2,
+            search_match_cap: 3,
+            append_tail_hash_bytes: 4,
+            settle_window_ms: 5,
+            poll_interval_ms: 6,
+            journal_fsync_ms: 7,
+            journal_snapshot_max: 8,
+            large_save_warn: 9,
+            keyboard_encoding: KeyboardEncoding::Kitty,
+            daemon_grace_ms: 10,
+            undo_limit: 11,
+            undo_strong_limit: 12,
+            undo_outer_limit: 13,
+            kill_ring_max: 14,
+            auto_save_interval_keys: 15,
+            auto_save_timeout_s: 16,
+            tab_width: 4,
+            next_screen_context_lines: 0,
+            amalgamation_limit: 17,
+            column_checkpoint_interval: 18,
+            long_line_threshold: 19,
+        };
+        assert_eq!(config, expected);
+    }
+
+    #[test]
+    fn defaults_cover_the_new_fields() {
+        let config = Config::default();
+        assert_eq!(config.kill_ring_max, 120);
+        assert_eq!(config.tab_width, 8);
+        assert_eq!(config.next_screen_context_lines, 2);
+        assert_eq!(config.amalgamation_limit, 20);
+        assert_eq!(config.auto_save_interval_keys, 300);
+        assert_eq!(config.auto_save_timeout_s, 30);
+        assert_eq!(config.column_checkpoint_interval, 4096);
+        assert_eq!(config.long_line_threshold, 4096);
+        assert_eq!(config.append_tail_hash_bytes, 64 * 1024);
+        assert!(config.validate().is_ok());
+    }
+
+    fn invalid_key(content: &str) -> &'static str {
+        match load_str(content).expect_err("config rejected") {
+            ConfigError::Invalid { key, .. } => key,
+            other => panic!("expected Invalid, got {other}"),
+        }
+    }
+
+    #[test]
+    fn zero_is_rejected_for_every_interval_size_and_limit() {
+        for key in [
+            "in_memory_max",
+            "block_cache_bytes",
+            "search_match_cap",
+            "append_tail_hash_bytes",
+            "settle_window_ms",
+            "poll_interval_ms",
+            "journal_fsync_ms",
+            "journal_snapshot_max",
+            "large_save_warn",
+            "daemon_grace_ms",
+            "undo_limit",
+            "undo_strong_limit",
+            "undo_outer_limit",
+            "kill_ring_max",
+            "auto_save_interval_keys",
+            "auto_save_timeout_s",
+            "amalgamation_limit",
+            "column_checkpoint_interval",
+            "long_line_threshold",
+        ] {
+            assert_eq!(invalid_key(&format!("{key} = 0\n")), key);
+        }
+        let error = load_str("poll_interval_ms = 0\n").expect_err("rejected");
+        assert!(error.to_string().contains("poll_interval_ms"), "{error}");
+    }
+
+    #[test]
+    fn undo_limits_must_be_ordered() {
+        assert_eq!(invalid_key("undo_limit = 300000\n"), "undo_strong_limit");
+        assert_eq!(
+            invalid_key("undo_strong_limit = 30000000\n"),
+            "undo_outer_limit"
+        );
+        assert!(load_str("undo_limit = 5\nundo_strong_limit = 5\nundo_outer_limit = 5\n").is_ok());
+    }
+
+    #[test]
+    fn tab_width_must_be_1_to_16() {
+        assert_eq!(invalid_key("tab_width = 0\n"), "tab_width");
+        assert_eq!(invalid_key("tab_width = 17\n"), "tab_width");
+        assert_eq!(load_str("tab_width = 16\n").expect("valid").tab_width, 16);
+        assert_eq!(load_str("tab_width = 1\n").expect("valid").tab_width, 1);
     }
 }
