@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use emx_proto::{ClientKind, Request, ServerMsg};
@@ -86,6 +86,8 @@ pub struct Harness {
     index_requests: Vec<BufferId>,
     hold_saves: bool,
     held_saves: Vec<(BufferId, SavePlan)>,
+    hold_loads: bool,
+    held_loads: Vec<(BufferId, PathBuf)>,
     sinks: Option<Sinks>,
     /// Auto-save files that could not be deleted.
     io_errors: Vec<String>,
@@ -127,6 +129,8 @@ impl Harness {
             index_requests: Vec::new(),
             hold_saves: false,
             held_saves: Vec::new(),
+            hold_loads: false,
+            held_loads: Vec::new(),
             sinks: None,
             io_errors: Vec::new(),
             journal_ops: Vec::new(),
@@ -353,11 +357,10 @@ impl Harness {
             Effect::Shutdown => self.shutdown = true,
             Effect::Journal(op) => self.journal_ops.push(op),
             Effect::StartIndex { buffer } => self.index_requests.push(buffer),
-            Effect::Load { buffer, path } => {
-                let result =
-                    io::load_file(&path, self.editor.config()).map_err(|error| error.to_string());
-                return Some(Event::FileLoaded { buffer, result });
+            Effect::Load { buffer, path } if self.hold_loads => {
+                self.held_loads.push((buffer, path));
             }
+            Effect::Load { buffer, path } => return Some(self.load(buffer, &path)),
             Effect::Save { buffer, plan } => {
                 if self.hold_saves {
                     self.held_saves.push((buffer, plan));
@@ -390,6 +393,11 @@ impl Harness {
             }
         }
         None
+    }
+
+    fn load(&self, buffer: BufferId, path: &Path) -> Event {
+        let result = io::load_file(path, self.editor.config()).map_err(|error| error.to_string());
+        Event::FileLoaded { buffer, result }
     }
 
     fn save(&mut self, buffer: BufferId, plan: &SavePlan) -> Event {
@@ -431,6 +439,21 @@ impl Harness {
         for (buffer, plan) in std::mem::take(&mut self.held_saves) {
             let finished = self.save(buffer, &plan);
             self.handle(finished);
+        }
+    }
+
+    /// Keeps file reads instead of running them, so the state while a file
+    /// is being read can be inspected.
+    pub fn hold_loads(&mut self) {
+        self.hold_loads = true;
+    }
+
+    /// Runs the held reads and stops holding.
+    pub fn release_loads(&mut self) {
+        self.hold_loads = false;
+        for (buffer, path) in std::mem::take(&mut self.held_loads) {
+            let loaded = self.load(buffer, &path);
+            self.handle(loaded);
         }
     }
 

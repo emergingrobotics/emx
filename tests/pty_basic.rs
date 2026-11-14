@@ -405,7 +405,9 @@ fn live_noserver_journals_are_left_alone() {
         journaled(&first_dir, &path, "mine base\n")
     });
     let second = Pty::spawn(&env, &["--no-server", "f.txt"]);
-    let modeline = second.wait_modeline(|modeline| modeline.contains("f.txt"));
+    // The modeline names the file while it is still being read.
+    let modeline = second
+        .wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     assert!(modeline.contains(":---  F1  f.txt"), "{modeline:?}");
     let screen = second.wait_text("base");
     assert!(

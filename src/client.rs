@@ -133,22 +133,16 @@ pub fn run(options: ClientOptions) -> anyhow::Result<ExitCode> {
     Ok(end.report())
 }
 
-fn socket_path() -> anyhow::Result<PathBuf> {
+pub(crate) fn socket_path() -> anyhow::Result<PathBuf> {
     let euid = rustix::process::geteuid().as_raw();
     Ok(paths::socket_path(&paths::socket_dir(euid)?))
 }
 
-/// Connects to the server, starting one when none listens. The server
-/// must run as this user (DESIGN section 2, privilege isolation).
+/// Connects to the server, starting one when none listens.
 fn connect_or_start(socket: &Path) -> anyhow::Result<UnixStream> {
     let stream = match UnixStream::connect(socket) {
         Ok(stream) => stream,
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
+        Err(error) if no_server_listens(&error) => {
             start_server()?;
             UnixStream::connect(socket)
                 .with_context(|| format!("connecting to {}", socket.display()))?
@@ -157,11 +151,26 @@ fn connect_or_start(socket: &Path) -> anyhow::Result<UnixStream> {
             return Err(error).with_context(|| format!("connecting to {}", socket.display()));
         }
     };
-    let euid = rustix::process::geteuid().as_raw();
-    let peer = peer_uid(&stream)
-        .with_context(|| format!("reading the credentials of {}", socket.display()))?;
-    check_server_uid(socket, peer, euid)?;
+    verify_server(socket, &stream)?;
     Ok(stream)
+}
+
+/// A connect error that means no server is running: no socket, or a
+/// socket left behind by a server that is gone.
+pub(crate) fn no_server_listens(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
+}
+
+/// The server must run as this user (DESIGN section 2, privilege
+/// isolation).
+pub(crate) fn verify_server(socket: &Path, stream: &UnixStream) -> anyhow::Result<()> {
+    let euid = rustix::process::geteuid().as_raw();
+    let peer = peer_uid(stream)
+        .with_context(|| format!("reading the credentials of {}", socket.display()))?;
+    check_server_uid(socket, peer, euid)
 }
 
 fn check_server_uid(socket: &Path, peer: u32, euid: u32) -> anyhow::Result<()> {

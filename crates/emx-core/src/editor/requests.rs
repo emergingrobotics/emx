@@ -22,6 +22,7 @@ const NO_CLIENT_MESSAGE: &str = "no emx client is attached; run 'emx FILE' in a 
 const BUFFER_MODIFIED_MESSAGE: &str = "buffer modified";
 const NO_EXTERNAL_CHANGE_MESSAGE: &str = "no external change recorded";
 const NO_SERVER_BUFFERS: &str = "No server editing buffers exist";
+const KILLED_WHILE_LOADING: &str = "the buffer was killed before its file was read";
 /// How far back from point a cursor event looks for the line start before
 /// it reports the column as unknown (0).
 const UNKNOWN_COLUMN: u64 = 0;
@@ -627,10 +628,20 @@ impl Editor {
     }
 
     /// The buffer is about to be killed: clients waiting for it are
-    /// released, as killing a server buffer does in Emacs.
+    /// released, as killing a server buffer does in Emacs. Opens still
+    /// waiting for its file are answered too, or they would never be: a
+    /// `--wait` is released, a plain open fails as its file was never shown.
     pub(super) fn buffer_killed(&mut self, buffer: BufferId) {
         for reply in self.waiting.remove(&buffer).unwrap_or_default() {
             self.reply(reply, Ok(Response::Ok));
+        }
+        for request in self.pending_opens.remove(&buffer).unwrap_or_default() {
+            let result = if request.wait {
+                Ok(Response::Ok)
+            } else {
+                Err(wire_error(error_code::OPEN_FAILED, KILLED_WHILE_LOADING))
+            };
+            self.reply(request.reply, result);
         }
         self.created_for_wait.remove(&buffer);
         // A buffer whose file could not be read was never opened.

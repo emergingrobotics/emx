@@ -57,11 +57,11 @@ emx-term = { path = "crates/emx-term" }
 emx-text = { path = "crates/emx-text" }
 emx-types = { path = "crates/emx-types" }
 rustix = { workspace = true, features = ["fs", "net", "process", "stdio"] }
+serde_json = { workspace = true }
 signal-hook = "0.3"
 thiserror = { workspace = true }
 
 [dev-dependencies]
 portable-pty = "0.9"
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 vt100 = "0.15"

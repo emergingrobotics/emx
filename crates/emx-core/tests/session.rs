@@ -427,6 +427,46 @@ fn open_wait_released_by_killing_the_buffer() {
     assert_eq!(answer(&mut harness, cli, id), Ok(Response::Ok));
 }
 
+/// Killing a buffer whose file is still being read answers the opens
+/// held for it: a `--wait` is released, as killing a server buffer does,
+/// and a plain open fails, since the file was never shown.
+#[test]
+fn opens_answered_when_the_buffer_is_killed_while_loading() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("slow.txt");
+    fs::write(&path, "slow").expect("fixture");
+    let mut harness = server();
+    let tui = harness.client();
+    let cli = harness.attach(ClientKind::Cli);
+    harness.hold_loads();
+    let waited = harness.request(
+        cli,
+        Request::Open {
+            path: wire(&path),
+            line: None,
+            col: None,
+            wait: true,
+        },
+    );
+    let plain = harness.request(cli, open(&path));
+    assert_eq!(
+        response(&harness.take_messages(cli), waited),
+        None,
+        "loading"
+    );
+    harness.keys_as(tui, "C-x k RET");
+    let messages = harness.take_messages(cli);
+    assert_eq!(response(&messages, waited), Some(Ok(Response::Ok)));
+    let Some(Err(error)) = response(&messages, plain) else {
+        panic!("the plain open is answered with an error: {messages:?}");
+    };
+    assert_eq!(error.code, error_code::OPEN_FAILED);
+    assert!(harness.buffer_text("slow.txt").is_none());
+    harness.release_loads();
+    assert_eq!(harness.take_messages(cli), Vec::new(), "answered once");
+    assert!(harness.buffer_text("slow.txt").is_none());
+}
+
 #[test]
 fn server_edit_without_waiting_clients_says_so() {
     let mut harness = server();
