@@ -138,6 +138,9 @@ pub(crate) struct SaveFlow {
     after: AfterSave,
     changed_confirmed: bool,
     newer_confirmed: bool,
+    /// The target was found to be only appended to since the buffer's
+    /// file-backed text was read from it.
+    disk_verified: bool,
     write_protected_confirmed: bool,
     method: Option<Method>,
     session: Option<SaveSession>,
@@ -159,6 +162,7 @@ impl SaveFlow {
             after,
             changed_confirmed: false,
             newer_confirmed: false,
+            disk_verified: false,
             write_protected_confirmed: false,
             method: None,
             session,
@@ -1087,6 +1091,28 @@ impl Editor {
             _ => {}
         }
         let text = self.buffers[buffer].text.clone();
+        // The text reads unchanged bytes from the target, which changed
+        // since: unless that change only appended, those bytes are gone.
+        // A worker looks before anything is planned.
+        if !flow.disk_verified
+            && let (Original::File(cache), Some(existing)) =
+                (&text.sources().original, &info.existing)
+        {
+            let opened = cache.identity();
+            let disk = existing.identity;
+            if opened.dev == disk.dev && opened.ino == disk.ino && opened != disk {
+                flow.refuse_unattended(&format!(
+                    "{name} changed on disk under its buffer and must be checked first"
+                ))?;
+                self.save_verify.insert(buffer, (client, flow));
+                self.effects.push(Effect::Observe {
+                    buffer,
+                    path: binding.path.clone(),
+                    old_len: Some(opened.size),
+                });
+                return Ok(());
+            }
+        }
         let euid = rustix::process::geteuid().as_raw();
         let planned = match flow.method {
             Some(Method::InPlace) => io::in_place_plan(&binding, &text, &info),
@@ -1414,6 +1440,93 @@ impl Editor {
         self.reload_after_busy(buffer);
     }
 
+    /// Retires every text reading the inode a save rewrote; other buffers
+    /// whose own text was retired look at their file again.
+    fn retire_and_recheck(
+        &mut self,
+        buffer: BufferId,
+        dev: u64,
+        ino: u64,
+        keep: Option<&std::sync::Arc<BlockCache>>,
+    ) {
+        let affected = self.retire_caches_on(dev, ino, keep);
+        for other in affected {
+            if other != buffer {
+                self.external_event(other);
+            }
+        }
+    }
+
+    /// The worker looked at a target the buffer's file-backed text reads,
+    /// which changed since it was read. An append left the bytes the text
+    /// reads intact, so the save goes on. Anything else rewrote them: the
+    /// save is refused, the old text retired, and the buffer conflicts
+    /// with what it still holds rescued.
+    pub(super) fn save_disk_checked(
+        &mut self,
+        buffer: BufferId,
+        result: Result<crate::reload::Observation, String>,
+    ) {
+        let Some((client, mut flow)) = self.save_verify.remove(&buffer) else {
+            return;
+        };
+        if !self.buffers.contains_key(buffer) {
+            return;
+        }
+        let name = self.buffers[buffer].name.clone();
+        let observation = match result {
+            Ok(observation) => observation,
+            Err(message) => {
+                self.fail(
+                    client,
+                    &user_error(format!(
+                        "Checking {name} on disk failed: {message}; not saved"
+                    )),
+                );
+                return;
+            }
+        };
+        let target = &self.buffers[buffer];
+        let binding = target.file.as_ref().expect("a saved buffer visits a file");
+        let Original::File(cache) = &target.text.sources().original else {
+            // The text no longer reads the file (a reload replaced it):
+            // the checks start over.
+            if let Err(error) = self.continue_save(client, flow) {
+                self.fail(client, &error);
+            }
+            return;
+        };
+        let old = cache.identity();
+        let appended = match observation.identity {
+            Some(identity) if binding.identity == Some(old) => matches!(
+                crate::reload::classify(binding, &old, &observation),
+                crate::reload::Classification::Appended { .. }
+            )
+            .then_some(identity),
+            _ => None,
+        };
+        if let Some(identity) = appended {
+            let cache = cache.clone();
+            cache.appended(identity);
+            target.text.sources().index.extend(identity.size);
+            flow.disk_verified = true;
+            if let Err(error) = self.continue_save(client, flow) {
+                self.fail(client, &error);
+            }
+            return;
+        }
+        self.retire_and_recheck(buffer, old.dev, old.ino, None);
+        if let Some(identity) = observation.identity {
+            self.conflict(buffer, identity);
+        }
+        self.fail(
+            client,
+            &user_error(format!(
+                "{name} was rewritten on disk under its buffer; not saved: retry the save"
+            )),
+        );
+    }
+
     /// A failed save abandons every pending exit; the exiting clients see
     /// why.
     fn abandon_exits(&mut self, message: &str) {
@@ -1486,12 +1599,15 @@ impl Editor {
             if request.rewrites_original {
                 let rescue = self.mark_damaged(buffer);
                 if let Some((dev, ino)) = request.rewritten_inode {
-                    self.retire_caches_on(dev, ino, None);
+                    self.retire_and_recheck(buffer, dev, ino, None);
                 }
                 return rescue;
             }
             let text = target.text.clone();
             self.journal_outbox.rebase(buffer, text);
+            if let Some((dev, ino)) = request.rewritten_inode {
+                self.retire_and_recheck(buffer, dev, ino, None);
+            }
             return None;
         }
         target.set_saved_at(request.tick);
@@ -1546,12 +1662,7 @@ impl Editor {
                     Original::File(cache) => Some(cache.clone()),
                     Original::Memory(_) => None,
                 });
-            let affected = self.retire_caches_on(dev, ino, keep.as_ref());
-            for other in affected {
-                if other != buffer {
-                    self.external_event(other);
-                }
-            }
+            self.retire_and_recheck(buffer, dev, ino, keep.as_ref());
         }
         let target = &mut self.buffers[buffer];
         if let Some((sources, needs_index)) = replacement {

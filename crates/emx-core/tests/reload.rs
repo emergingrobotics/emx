@@ -635,6 +635,231 @@ fn undo_of_reload_refused_after_in_place_rewrite() {
     assert_eq!(harness.text().as_bytes(), rewritten.as_slice());
 }
 
+fn big_content(prefix: &str) -> Vec<u8> {
+    (0..5000u32)
+        .flat_map(|line| format!("{prefix} {line:05}\n").into_bytes())
+        .collect()
+}
+
+const ORIGINAL_GONE: &str =
+    "Cannot undo the reload: the file was rewritten on disk and the text before it is gone";
+
+/// Fix 1: `emx reload` reads the file again without settling; an in-place
+/// rewrite it picks up must retire the old text all the same.
+#[test]
+fn emx_reload_after_in_place_rewrite_retires_old_text() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("big.log");
+    let content = big_content("old");
+    fs::write(&path, &content).expect("write");
+    let mut harness = harness_with(big_file_config(), directory.path());
+    visit(&mut harness, &path);
+    let rewritten = big_content("NEW");
+    rewrite_in_place(&path, &rewritten, 1);
+    let cli = harness.attach(ClientKind::Cli);
+    let id = harness.request(
+        cli,
+        Request::Reload {
+            path: Some(WirePath::from(path.as_path())),
+        },
+    );
+    assert_eq!(answer(&mut harness, cli, id), Ok(Response::Ok));
+    assert_eq!(harness.text().as_bytes(), rewritten.as_slice());
+    harness.keys("C-/");
+    assert_eq!(harness.echo(), ORIGINAL_GONE);
+    assert_eq!(harness.text().as_bytes(), rewritten.as_slice());
+}
+
+/// Makes the file unreadable, so looking at it fails, until `restore`.
+fn unreadable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        rustix::process::geteuid().as_raw(),
+        0,
+        "permission tests need a non-root user: root bypasses file modes"
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).expect("chmod");
+}
+
+fn make_readable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644)).expect("chmod");
+}
+
+/// Fix 2: a look that fails while the file settles is retried at the next
+/// settle window instead of leaving the buffer settling for ever.
+#[test]
+fn failed_observation_while_settling_is_retried() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    fs::write(&path, b"alpha\n").expect("write");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+    replace_by_rename(&path, b"beta\n", 1);
+    harness.handle(Event::FileChanged { path: path.clone() });
+    assert!(matches!(external(&harness), ExternalState::Settling { .. }));
+    unreadable(&path);
+    harness.fire_timers();
+    assert!(
+        harness.echo().starts_with("Checking a.txt on disk failed"),
+        "{}",
+        harness.echo()
+    );
+    make_readable(&path);
+    harness.fire_timers();
+    harness.fire_timers();
+    assert_eq!(harness.text(), "beta\n");
+    assert_eq!(external(&harness), ExternalState::Clean);
+}
+
+/// Fix 2: a confirmed revert whose look at the file fails is reported to
+/// whoever asked and forgotten, never carried out later by surprise.
+#[test]
+fn failed_observation_fails_a_pending_revert() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    fs::write(&path, b"alpha\n").expect("write");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+    harness.keys("x");
+    unreadable(&path);
+    harness.keys("C-c r");
+    harness.type_text("yes");
+    harness.keys("RET");
+    assert!(
+        harness.echo().starts_with("Checking a.txt on disk failed"),
+        "{}",
+        harness.echo()
+    );
+    make_readable(&path);
+    harness.handle(Event::FileChanged { path: path.clone() });
+    harness.fire_timers();
+    assert_eq!(harness.text(), "xalpha\n", "the failed revert stays undone");
+    assert!(harness.buffer().is_modified());
+}
+
+/// Fix 3: a file-backed buffer saved after an append it has not seen yet:
+/// the old bytes are intact, so the confirmed save goes ahead.
+#[test]
+fn save_after_unsettled_append_proceeds() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("big.log");
+    let content = big_content("old");
+    fs::write(&path, &content).expect("write");
+    let mut harness = harness_with(big_file_config(), directory.path());
+    visit(&mut harness, &path);
+    harness.keys("X");
+    append(&path, b"appended\n", 1);
+    harness.keys("C-x C-s");
+    assert_eq!(
+        harness.echo_line(),
+        "big.log has changed since visited or saved.  Save anyway? (yes or no) "
+    );
+    harness.type_text("yes");
+    harness.keys("RET");
+    assert_eq!(harness.echo(), format!("Wrote {}", path.display()));
+    let mut expected = b"X".to_vec();
+    expected.extend_from_slice(&content);
+    assert_eq!(fs::read(&path).expect("read"), expected);
+}
+
+/// Fix 3: after an unsettled in-place rewrite the old bytes are gone; the
+/// save is refused, the buffer conflicts, and its text is rescued.
+#[test]
+fn save_after_unsettled_rewrite_conflicts() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("big.log");
+    let content = big_content("old");
+    fs::write(&path, &content).expect("write");
+    let mut harness = harness_with(big_file_config(), directory.path());
+    visit(&mut harness, &path);
+    harness.type_text("MINE ");
+    let rewritten = big_content("NEW");
+    rewrite_in_place(&path, &rewritten, 1);
+    harness.keys("C-x C-s");
+    harness.type_text("yes");
+    harness.keys("RET");
+    assert_eq!(
+        harness.echo(),
+        "big.log was rewritten on disk under its buffer; not saved: retry the save"
+    );
+    assert_eq!(
+        fs::read(&path).expect("read"),
+        rewritten,
+        "the agent's file is intact"
+    );
+    let disk = FileIdentity::of_path(&path).expect("stat");
+    assert_eq!(external(&harness), ExternalState::Conflict { disk });
+    let rescued = harness
+        .buffer_text("*recovered: big.log*")
+        .expect("rescue buffer");
+    assert!(rescued.contains("MINE "), "{rescued}");
+}
+
+/// Fix 4: killing a buffer whose `emx reload` is reading answers the
+/// request instead of leaving the CLI waiting.
+#[test]
+fn killing_a_buffer_answers_its_pending_reload() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    fs::write(&path, b"alpha\n").expect("write");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+    let cli = harness.attach(ClientKind::Cli);
+    harness.hold_loads();
+    let id = harness.request(
+        cli,
+        Request::Reload {
+            path: Some(WirePath::from(path.as_path())),
+        },
+    );
+    harness.keys("C-x k RET");
+    assert_eq!(
+        answer(&mut harness, cli, id),
+        Err(WireError {
+            code: error_code::RELOAD_FAILED.to_string(),
+            message: "a.txt: the buffer was killed while it was read".to_string(),
+        })
+    );
+    harness.release_loads();
+    assert!(harness.take_messages(cli).is_empty());
+}
+
+/// Fix 5: an in-place save that another edit overtook still retires every
+/// text that read the rewritten inode.
+#[test]
+fn overtaken_in_place_write_retires_old_text() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("big.log");
+    let alias = directory.path().join("alias.log");
+    let small = directory.path().join("small.txt");
+    fs::write(&path, big_content("old")).expect("write");
+    fs::hard_link(&path, &alias).expect("hard link");
+    fs::hard_link(&path, directory.path().join("third.log")).expect("link");
+    fs::write(&small, b"small\n").expect("write");
+    let mut harness = harness_with(big_file_config(), directory.path());
+    visit(&mut harness, &alias);
+    let fresh: Vec<u8> = b"fresh\n".repeat(400);
+    replace_by_rename(&alias, &fresh, 1);
+    external_change(&mut harness, &alias);
+    visit(&mut harness, &small);
+    harness.keys("C-x C-w C-a C-k");
+    harness.type_text(path.to_str().expect("utf-8"));
+    harness.keys("RET");
+    harness.hold_saves();
+    harness.keys("y");
+    assert_eq!(harness.held_saves().len(), 1);
+    // An edit slips past the read-only guard while the save runs.
+    harness.buffer_mut().file.as_mut().expect("visiting").saving = false;
+    harness.keys("z");
+    harness.release_saves();
+    assert_eq!(fs::read(&path).expect("read"), b"small\n");
+    visit(&mut harness, &alias);
+    harness.keys("C-/");
+    assert_eq!(harness.echo(), ORIGINAL_GONE);
+    assert_eq!(harness.text().as_bytes(), fresh.as_slice());
+}
+
 #[test]
 fn own_in_place_save_retires_old_text_and_updates_identity() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -862,16 +1087,42 @@ fn confirm(harness: &mut Harness) {
     }
 }
 
+/// The bytes of `text` that can still be read: pieces whose file was
+/// rewritten on disk are skipped, the rest is kept.
+fn readable(text: &emx_text::Text) -> String {
+    let mut out = Vec::new();
+    for (offset, piece) in text.pieces() {
+        let mut bytes = Vec::new();
+        if text.read(offset..offset + piece.len, &mut bytes).is_ok() {
+            out.extend_from_slice(&bytes);
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn undo_list_holds(harness: &Harness, token: &str) -> bool {
     entries(harness).iter().any(|entry| match entry {
         UndoEntry::Deletion { text, .. } => String::from_utf8_lossy(text).contains(token),
-        UndoEntry::ReplaceAll { before, after } => [before, after].iter().any(|text| {
-            let mut bytes = Vec::new();
-            text.read(0..text.len(), &mut bytes).is_ok()
-                && String::from_utf8_lossy(&bytes).contains(token)
-        }),
+        UndoEntry::ReplaceAll { before, after } => [before, after]
+            .iter()
+            .any(|text| readable(text).contains(token)),
         _ => false,
     })
+}
+
+/// `*recovered: a.txt*` buffers hold text rescued from a buffer whose file
+/// was rewritten under it.
+fn rescued_holds(harness: &Harness, token: &str) -> bool {
+    harness
+        .editor()
+        .buffer_names()
+        .iter()
+        .filter(|name| name.starts_with("*recovered: a.txt*"))
+        .any(|name| {
+            harness
+                .buffer_text(name)
+                .is_some_and(|text| text.contains(token))
+        })
 }
 
 proptest! {
@@ -881,82 +1132,104 @@ proptest! {
     /// in the undo list, or was on disk at a save the user confirmed.
     #[test]
     fn no_content_lost(steps in proptest::collection::vec(step(), 1..24)) {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path: PathBuf = directory.path().join("a.txt");
-        fs::write(&path, b"base\n").expect("write");
-        let mut harness = harness_in(directory.path());
-        visit(&mut harness, &path);
-        let mut typed: Vec<String> = Vec::new();
-        let mut saved: Vec<Vec<u8>> = Vec::new();
-        for (serial, step) in steps.into_iter().enumerate() {
-            let serial = serial as u64 + 1;
-            match step {
-                Step::Type { at_end } => {
-                    let token = format!("<u{serial}>");
-                    harness.keys(if at_end { "C-g M->" } else { "C-g M-<" });
-                    harness.type_text(&token);
+        check_no_content_lost(reload_keys(), steps)?;
+    }
+
+    /// The same with every file read through the block cache, so in-place
+    /// rewrites retire caches, undo refuses lost text and buffers are
+    /// rescued into `*recovered: a.txt*`, which counts as a location too.
+    #[test]
+    fn no_content_lost_file_backed(steps in proptest::collection::vec(step(), 1..24)) {
+        let config = Config {
+            in_memory_max: 2,
+            ..reload_keys()
+        };
+        check_no_content_lost(config, steps)?;
+    }
+}
+
+fn check_no_content_lost(config: Config, steps: Vec<Step>) -> Result<(), TestCaseError> {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path: PathBuf = directory.path().join("a.txt");
+    fs::write(&path, b"base\n").expect("write");
+    let mut harness = harness_with(config, directory.path());
+    visit(&mut harness, &path);
+    let mut typed: Vec<String> = Vec::new();
+    let mut saved: Vec<Vec<u8>> = Vec::new();
+    for (serial, step) in steps.into_iter().enumerate() {
+        let serial = serial as u64 + 1;
+        match step {
+            Step::Type { at_end } => {
+                let token = format!("<u{serial}>");
+                harness.keys(if at_end { "C-g M->" } else { "C-g M-<" });
+                harness.type_text(&token);
+                // Typing into text whose file vanished may fail; only
+                // text the buffer took counts as typed.
+                if readable(&harness.buffer().text).contains(&token) {
                     typed.push(token);
                 }
-                Step::Rewrite(content) => {
-                    if path.exists() {
-                        rewrite_in_place(&path, &content, serial);
-                    } else {
-                        fs::write(&path, &content).expect("create");
-                        stamp(&path, serial);
-                    }
+            }
+            Step::Rewrite(content) => {
+                if path.exists() {
+                    rewrite_in_place(&path, &content, serial);
+                } else {
+                    fs::write(&path, &content).expect("create");
+                    stamp(&path, serial);
+                }
+                harness.handle(Event::FileChanged { path: path.clone() });
+            }
+            Step::Replace(content) => {
+                replace_by_rename(&path, &content, serial);
+                harness.handle(Event::FileChanged { path: path.clone() });
+            }
+            Step::Append(content) => {
+                if path.exists() {
+                    append(&path, &content, serial);
                     harness.handle(Event::FileChanged { path: path.clone() });
-                }
-                Step::Replace(content) => {
-                    replace_by_rename(&path, &content, serial);
-                    harness.handle(Event::FileChanged { path: path.clone() });
-                }
-                Step::Append(content) => {
-                    if path.exists() {
-                        append(&path, &content, serial);
-                        harness.handle(Event::FileChanged { path: path.clone() });
-                    }
-                }
-                Step::Truncate(length) => {
-                    if path.exists() {
-                        let file = OpenOptions::new().write(true).open(&path).expect("open");
-                        let size = file.metadata().expect("stat").len();
-                        file.set_len(u64::from(length).min(size)).expect("truncate");
-                        drop(file);
-                        stamp(&path, serial);
-                        harness.handle(Event::FileChanged { path: path.clone() });
-                    }
-                }
-                Step::Delete => {
-                    if path.exists() {
-                        fs::remove_file(&path).expect("delete");
-                        harness.handle(Event::FileChanged { path: path.clone() });
-                    }
-                }
-                Step::Settle => harness.fire_timers(),
-                Step::Undo => harness.keys("C-g C-/"),
-                Step::KeepMine => harness.keys("C-g C-c k"),
-                Step::Save => {
-                    harness.keys("C-g C-x C-s");
-                    confirm(&mut harness);
-                    if harness.echo() == format!("Wrote {}", path.display()) {
-                        saved.push(fs::read(&path).expect("read saved"));
-                    }
-                }
-                Step::Revert => {
-                    harness.keys("C-g C-c r");
-                    confirm(&mut harness);
-                    harness.fire_timers();
                 }
             }
-            let text = harness.text();
-            for token in &typed {
-                let kept = text.contains(token.as_str())
-                    || undo_list_holds(&harness, token)
-                    || saved
-                        .iter()
-                        .any(|content| String::from_utf8_lossy(content).contains(token.as_str()));
-                prop_assert!(kept, "{token} lost; buffer {text:?}");
+            Step::Truncate(length) => {
+                if path.exists() {
+                    let file = OpenOptions::new().write(true).open(&path).expect("open");
+                    let size = file.metadata().expect("stat").len();
+                    file.set_len(u64::from(length).min(size)).expect("truncate");
+                    drop(file);
+                    stamp(&path, serial);
+                    harness.handle(Event::FileChanged { path: path.clone() });
+                }
+            }
+            Step::Delete => {
+                if path.exists() {
+                    fs::remove_file(&path).expect("delete");
+                    harness.handle(Event::FileChanged { path: path.clone() });
+                }
+            }
+            Step::Settle => harness.fire_timers(),
+            Step::Undo => harness.keys("C-g C-/"),
+            Step::KeepMine => harness.keys("C-g C-c k"),
+            Step::Save => {
+                harness.keys("C-g C-x C-s");
+                confirm(&mut harness);
+                if harness.echo() == format!("Wrote {}", path.display()) {
+                    saved.push(fs::read(&path).expect("read saved"));
+                }
+            }
+            Step::Revert => {
+                harness.keys("C-g C-c r");
+                confirm(&mut harness);
+                harness.fire_timers();
             }
         }
+        let text = readable(&harness.buffer().text);
+        for token in &typed {
+            let kept = text.contains(token.as_str())
+                || undo_list_holds(&harness, token)
+                || rescued_holds(&harness, token)
+                || saved
+                    .iter()
+                    .any(|content| String::from_utf8_lossy(content).contains(token.as_str()));
+            prop_assert!(kept, "{token} lost; buffer {text:?}");
+        }
     }
+    Ok(())
 }

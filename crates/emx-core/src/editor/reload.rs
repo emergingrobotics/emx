@@ -166,6 +166,10 @@ impl Editor {
     }
 
     pub(super) fn observed(&mut self, buffer: BufferId, result: Result<Observation, String>) {
+        if self.save_verify.contains_key(&buffer) {
+            self.save_disk_checked(buffer, result);
+            return;
+        }
         let again = self.observing.remove(&buffer).unwrap_or(false);
         if !self.buffers.contains_key(buffer) || self.buffers[buffer].file.is_none() {
             return;
@@ -178,7 +182,23 @@ impl Editor {
             Ok(observation) => observation,
             Err(message) => {
                 let name = self.buffers[buffer].name.clone();
-                self.notify_all(format!("Checking {name} on disk failed: {message}"));
+                let message = format!("Checking {name} on disk failed: {message}");
+                // A confirmed revert is not carried out later by surprise:
+                // whoever asked learns it failed.
+                match self.revert_pending.remove(&buffer) {
+                    Some(Some(client)) if self.clients.contains_key(&client) => {
+                        self.fail(client, &CommandError::User(message));
+                    }
+                    _ => self.notify_all(message),
+                }
+                // A settling file is looked at again at the next window;
+                // the failure may be passing (a permission being changed).
+                if matches!(
+                    self.binding_mut(buffer).external,
+                    ExternalState::Settling { .. }
+                ) {
+                    self.arm_settle_timer(buffer);
+                }
                 return;
             }
         };
@@ -302,7 +322,7 @@ impl Editor {
     /// A modified buffer whose file changed: flagged, never reloaded. If
     /// the change rewrote the file it reads unchanged text from, what it
     /// still holds is put in a `*recovered: NAME*` buffer.
-    fn conflict(&mut self, buffer: BufferId, disk: FileIdentity) {
+    pub(super) fn conflict(&mut self, buffer: BufferId, disk: FileIdentity) {
         let binding = self.binding_mut(buffer);
         binding.external = ExternalState::Conflict { disk };
         binding.changed_since_viewed = true;
@@ -497,6 +517,9 @@ impl Editor {
         let needs_index = match source {
             AppendSource::Bytes(bytes) => {
                 if let Err(error) = target.apply_insert(at, &bytes, &mut Unjournaled) {
+                    // Nothing changed: no reload marker may be left to make
+                    // a later undo think a reload was undone.
+                    target.undo.discard_reload_mark();
                     let name = target.name.clone();
                     self.notify_all(format!("Following the append to {name} failed: {error}"));
                     return;
@@ -664,6 +687,7 @@ impl Editor {
                 _ => format!("File {path} no longer exists"),
             }));
         };
+        self.retire_if_rewritten(buffer, &request.previous, &reloaded, identity);
         match request.reason {
             ReloadReason::Automatic if changed_meanwhile || modified => {
                 // Typed into while it was read: never replace the edits.
@@ -684,6 +708,38 @@ impl Editor {
         }
         self.apply_reload(buffer, request, reloaded, identity);
         Ok(())
+    }
+
+    /// A reload that did not settle first (`emx reload`, a revert) may be
+    /// the first to see that the file was rewritten in place: the text it
+    /// replaces, and anything else reading the old version, is retired
+    /// before anyone can read new bytes at old offsets. A larger file on
+    /// the same inode may have been only appended to, but nothing here
+    /// proves it, so it is treated the same.
+    fn retire_if_rewritten(
+        &mut self,
+        buffer: BufferId,
+        previous: &Text,
+        reloaded: &Reloaded,
+        identity: FileIdentity,
+    ) {
+        let Original::File(cache) = &previous.sources().original else {
+            return;
+        };
+        let old = cache.identity();
+        if old.dev != identity.dev || old.ino != identity.ino || old == identity {
+            return;
+        }
+        let keep = match &reloaded.loaded.sources.original {
+            Original::File(cache) => Some(cache.clone()),
+            Original::Memory(_) => None,
+        };
+        let affected = self.retire_caches_on(identity.dev, identity.ino, keep.as_ref());
+        for other in affected {
+            if other != buffer {
+                self.external_event(other);
+            }
+        }
     }
 
     fn apply_reload(
@@ -936,6 +992,22 @@ impl Editor {
 
     /// Buffers with reload work in flight, which `kill_buffer` forgets.
     pub(super) fn forget_reload_state(&mut self, buffer: BufferId) {
+        if self.reverting.remove(&buffer) {
+            let name = self.buffers[buffer].name.clone();
+            self.reload_request_done(
+                buffer,
+                Err(ReloadFailure::Failed(format!(
+                    "{name}: the buffer was killed while it was read"
+                ))),
+            );
+        }
+        if let Some((client, _)) = self.save_verify.remove(&buffer) {
+            let name = self.buffers[buffer].name.clone();
+            self.fail(
+                client,
+                &CommandError::User(format!("{name} was killed; not saved")),
+            );
+        }
         self.observing.remove(&buffer);
         self.settle_timers.remove(&buffer);
         self.reload_recheck.remove(&buffer);

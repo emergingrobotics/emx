@@ -1237,9 +1237,11 @@ fn in_place_never_reads_a_file_changed_under_its_buffer() {
     harness.keys("C-x C-s");
     harness.type_text("yes");
     harness.keys("RET");
+    // Task 14: a worker looks first; the change was not an append, so the
+    // bytes the buffer reads are taken as gone and the save is refused.
     assert_eq!(
         harness.echo(),
-        "big.log changed on disk under its buffer; revert or write elsewhere"
+        "big.log was rewritten on disk under its buffer; not saved: retry the save"
     );
     assert_eq!(fs::read(&path).expect("read"), big_content());
     assert!(harness.buffer().is_modified());

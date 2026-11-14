@@ -468,6 +468,18 @@ impl UndoList {
         self.push(UndoEntry::Reload);
     }
 
+    /// Takes back the mark `record_reload` just pushed, for a reload that
+    /// then failed before changing anything. Panics when the newest entry
+    /// is not that mark.
+    pub(crate) fn discard_reload_mark(&mut self) {
+        let head = self.head.take().expect("a reload mark was just recorded");
+        assert!(
+            matches!(head.entry, UndoEntry::Reload),
+            "the newest undo entry is the reload mark"
+        );
+        self.head = next_of(&head);
+    }
+
     pub(crate) fn record_replace_all(
         &mut self,
         before: Text,
@@ -990,5 +1002,36 @@ impl Buffer {
             self.set_content_predates_disk(predates);
         }
         Ok(list)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> UndoLimits {
+        UndoLimits::from(&Config::default())
+    }
+
+    #[test]
+    fn a_discarded_reload_mark_leaves_no_trace() {
+        let mut list = UndoList::new(limits());
+        let context = ChangeContext {
+            unmodified: false,
+            visited: None,
+        };
+        list.record_insert(0, 1, &context);
+        list.boundary(1);
+        let before = format!("{:?}", list.entries());
+        list.boundary(1);
+        list.record_reload();
+        list.discard_reload_mark();
+        assert_eq!(format!("{:?}", list.entries()), before);
+        assert!(
+            !list
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, UndoEntry::Reload))
+        );
     }
 }

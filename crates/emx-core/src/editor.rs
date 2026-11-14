@@ -24,7 +24,7 @@ use crate::minibuffer::{Histories, Minibuffer};
 use crate::render::{PrefetchRequest, render};
 use crate::undo::{UndoLimits, outer_limit_warning};
 pub(crate) use files::Purpose;
-use files::{AutoSaveRequest, ExitWait, SaveRequest};
+use files::{AutoSaveRequest, ExitWait, SaveFlow, SaveRequest};
 use reload::ReloadRequest;
 use requests::{GroupReply, OpenRequest, Reply};
 
@@ -250,6 +250,9 @@ pub struct Editor {
     revert_pending: HashMap<BufferId, Option<ClientId>>,
     /// Follow-edit mode: a reload moves point to the first changed line.
     follow_edit: bool,
+    /// Saves waiting for a look at a target changed under the buffer's
+    /// file-backed text, and who asked.
+    save_verify: HashMap<BufferId, (ClientId, SaveFlow)>,
 }
 
 impl Editor {
@@ -305,6 +308,7 @@ impl Editor {
             appending: HashMap::new(),
             revert_pending: HashMap::new(),
             follow_edit: false,
+            save_verify: HashMap::new(),
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);

@@ -15,7 +15,7 @@ use crate::buffer::{Buffer, BufferId};
 use crate::config::Config;
 use crate::diff;
 use crate::editor::{Editor, Session};
-use crate::event::{ClientId, Effect, Event, TimerId};
+use crate::event::{ClientId, Effect, Event, ReloadJob, TimerId};
 use crate::io::{self, SaveFailure, SavePlan, SaveSink, SinkFactory};
 use crate::journal::{JournalError, JournalOp, JournalWriter, RecoveredBuffer, replay_dir};
 use crate::marker::InsertionType;
@@ -90,6 +90,7 @@ pub struct Harness {
     held_saves: Vec<(BufferId, SavePlan)>,
     hold_loads: bool,
     held_loads: Vec<(BufferId, PathBuf)>,
+    held_reloads: Vec<ReloadJob>,
     sinks: Option<Sinks>,
     /// Auto-save files that could not be deleted.
     io_errors: Vec<String>,
@@ -133,6 +134,7 @@ impl Harness {
             held_saves: Vec::new(),
             hold_loads: false,
             held_loads: Vec::new(),
+            held_reloads: Vec::new(),
             sinks: None,
             io_errors: Vec::new(),
             journal_ops: Vec::new(),
@@ -394,6 +396,7 @@ impl Harness {
                     result: reload::observe(&path, old_len, tail_bytes),
                 });
             }
+            Effect::Reload(job) if self.hold_loads => self.held_reloads.push(job),
             Effect::Reload(job) => {
                 let result = reload::reload_file(
                     &job.path,
@@ -488,8 +491,8 @@ impl Harness {
         }
     }
 
-    /// Keeps file reads instead of running them, so the state while a file
-    /// is being read can be inspected.
+    /// Keeps file reads (visits and reloads) instead of running them, so
+    /// the state while a file is being read can be inspected.
     pub fn hold_loads(&mut self) {
         self.hold_loads = true;
     }
@@ -500,6 +503,14 @@ impl Harness {
         for (buffer, path) in std::mem::take(&mut self.held_loads) {
             let loaded = self.load(buffer, &path);
             self.handle(loaded);
+        }
+        for job in std::mem::take(&mut self.held_reloads) {
+            let result =
+                reload::reload_file(&job.path, self.editor.config(), &job.previous, &job.anchors);
+            self.handle(Event::Reloaded {
+                buffer: job.buffer,
+                result,
+            });
         }
     }
 

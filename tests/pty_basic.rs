@@ -112,7 +112,7 @@ fn type_and_save_noserver() {
     let _reaper = SessionReaper::new(&env);
     let path = env.file("f.txt", "");
     let mut pty = Pty::spawn(&env, &["--no-server", "f.txt"]);
-    pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     pty.type_text("hello");
     pty.wait_text("hello");
     pty.keys("C-x C-s");
@@ -151,7 +151,8 @@ fn modeline_shows_modified() {
     let _reaper = SessionReaper::new(&env);
     env.file("f.txt", "text\n");
     let pty = Pty::spawn(&env, &["--no-server", "f.txt"]);
-    let clean = pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    let clean =
+        pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     assert!(clean.contains(":---  F1  f.txt"), "{clean:?}");
     pty.type_text("x");
     let modified = pty.wait_modeline(|modeline| modeline.contains("**"));
@@ -164,7 +165,8 @@ fn server_mode_tui_attach_type_save() {
     let _reaper = SessionReaper::new(&env);
     let path = env.file("f.txt", "");
     let mut pty = Pty::spawn(&env, &["f.txt"]);
-    let modeline = pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    let modeline =
+        pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     assert!(modeline.contains(":@---  F2  f.txt"), "{modeline:?}");
     assert_eq!(
         session_servers(&env).len(),
@@ -187,13 +189,14 @@ fn detach_reattach_tui_keeps_unsaved() {
     let _reaper = SessionReaper::new(&env);
     let path = env.file("f.txt", "base\n");
     let mut first = Pty::spawn(&env, &["f.txt"]);
-    first.wait_modeline(|modeline| modeline.contains("f.txt"));
+    first.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     first.type_text("unsaved ");
     first.wait_text("unsaved base");
     first.kill9();
     let second = Pty::spawn(&env, &["f.txt"]);
     second.wait_text("unsaved base");
-    let modeline = second.wait_modeline(|modeline| modeline.contains("f.txt"));
+    let modeline = second
+        .wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     assert!(modeline.contains(":@**-  F3  f.txt"), "{modeline:?}");
     assert_eq!(fs::read_to_string(&path).expect("file"), "base\n");
     assert_eq!(session_servers(&env).len(), 1, "one server throughout");
@@ -205,7 +208,7 @@ fn terminal_restored_on_exit() {
     let _reaper = SessionReaper::new(&env);
     env.file("f.txt", "text\n");
     let mut pty = Pty::spawn(&env, &["--no-server", "f.txt"]);
-    pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     assert!(pty.alternate_screen());
     assert!(pty.bracketed_paste());
     pty.keys("C-x C-c");
@@ -243,9 +246,10 @@ fn resize_redraws() {
     env.file("f.txt", "text\n");
     for args in [&["--no-server", "f.txt"][..], &["f.txt"][..]] {
         let mut pty = Pty::spawn(&env, args);
-        pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+        pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
         pty.resize(100, 30);
-        let modeline = pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+        let modeline = pty
+            .wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
         assert!(
             modeline.trim_end().len() > 80,
             "{args:?}: the modeline fills the wider terminal: {modeline:?}"
@@ -256,7 +260,7 @@ fn resize_redraws() {
             "{args:?}: the old modeline row is redrawn: {screen:?}"
         );
         pty.resize(60, 10);
-        pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+        pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
         pty.type_text("z");
         pty.wait_text("ztext");
     }
@@ -269,7 +273,7 @@ fn bracketed_paste_inserts_and_yanks() {
     for args in [&["--no-server", "f.txt"][..], &["f.txt"][..]] {
         let path = env.file("f.txt", "");
         let mut pty = Pty::spawn(&env, args);
-        pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+        pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
         pty.paste("one\r\ntwo");
         pty.wait_text("two");
         pty.keys("RET C-y");
@@ -322,7 +326,8 @@ fn autostart_race_single_server() {
         assert!(status.success(), "every starter finds a server: {status}");
     }
     for client in &clients {
-        client.wait_modeline(|modeline| modeline.contains("f.txt"));
+        client
+            .wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     }
     let server = server_pid(&env.socket_path(), &env.work).expect("a server");
     // Losers give up once they have waited for the lock.
@@ -352,7 +357,7 @@ fn noserver_crash_recovered_by_next_noserver() {
     let _reaper = SessionReaper::new(&env);
     let path = env.file("f.txt", "base\n");
     let mut first = Pty::spawn(&env, &["--no-server", "f.txt"]);
-    first.wait_modeline(|modeline| modeline.contains("f.txt"));
+    first.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     first.type_text("unsaved ");
     first.wait_text("unsaved base");
     let crashed_dir = env
@@ -365,7 +370,8 @@ fn noserver_crash_recovered_by_next_noserver() {
     first.kill9();
     let mut second = Pty::spawn(&env, &["--no-server", "f.txt"]);
     second.wait_text("unsaved base");
-    let modeline = second.wait_modeline(|modeline| modeline.contains("f.txt"));
+    let modeline = second
+        .wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     assert!(modeline.contains(":**-  F1  f.txt"), "{modeline:?}");
     assert_eq!(fs::read_to_string(&path).expect("file"), "base\n");
     let own_dir = env
@@ -395,7 +401,7 @@ fn live_noserver_journals_are_left_alone() {
     let _reaper = SessionReaper::new(&env);
     let path = env.file("f.txt", "base\n");
     let first = Pty::spawn(&env, &["--no-server", "f.txt"]);
-    first.wait_modeline(|modeline| modeline.contains("f.txt"));
+    first.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     first.type_text("mine ");
     let first_dir = env
         .state_home
@@ -427,7 +433,7 @@ fn server_lost_restores_and_reports() {
     let _reaper = SessionReaper::new(&env);
     env.file("f.txt", "text\n");
     let mut pty = Pty::spawn(&env, &["f.txt"]);
-    pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     let server = server_pid(&env.socket_path(), &env.work).expect("a server");
     common::pty::kill9(server);
     let status = pty.wait_exit();
@@ -510,7 +516,7 @@ fn noserver_hangup_keeps_unsaved_for_the_next() {
     let _reaper = SessionReaper::new(&env);
     let path = env.file("f.txt", "base\n");
     let mut first = Pty::spawn(&env, &["--no-server", "f.txt"]);
-    first.wait_modeline(|modeline| modeline.contains("f.txt"));
+    first.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     first.type_text("kept ");
     first.wait_text("kept base");
     let pid = rustix::process::Pid::from_raw(first.pid() as i32).expect("a pid");
@@ -528,7 +534,8 @@ fn noserver_hangup_keeps_unsaved_for_the_next() {
     );
     let second = Pty::spawn(&env, &["--no-server", "f.txt"]);
     second.wait_text("kept base");
-    let modeline = second.wait_modeline(|modeline| modeline.contains("f.txt"));
+    let modeline = second
+        .wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     assert!(modeline.contains(":**-  F1  f.txt"), "{modeline:?}");
     assert!(!first_dir.exists(), "adopted and removed");
 }
@@ -666,7 +673,7 @@ fn sigterm_restores_an_attached_client() {
     let _reaper = SessionReaper::new(&env);
     env.file("f.txt", "text\n");
     let mut pty = Pty::spawn(&env, &["f.txt"]);
-    pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     terminate(&pty);
     let status = pty.wait_exit();
     assert_eq!(status.exit_code(), 1, "{status}");
@@ -688,7 +695,7 @@ fn noserver_diagnostics_go_to_the_log() {
         Probe::Answer,
         &[("EMX_TEST_DIAGNOSTIC", "1")],
     );
-    pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     pty.type_text("x");
     pty.wait_text("xtext");
     let log = env.state_home.join("emx").join("noserver.log");
