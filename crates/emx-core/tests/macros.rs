@@ -5,6 +5,16 @@
 //! semantics of define-and-call and the `e` repeat.
 
 use emx_core::testing::Harness;
+use emx_proto::ServerMsg;
+
+/// How many terminal bells the client was sent since the last check.
+fn bells(harness: &mut Harness) -> usize {
+    harness
+        .take_sent()
+        .into_iter()
+        .filter(|message| matches!(message, ServerMsg::Bell))
+        .count()
+}
 
 #[test]
 fn define_and_call_inserts_again() {
@@ -73,6 +83,48 @@ fn call_without_definition_signals() {
     harness.keys("C-x e");
     assert!(harness.signaled());
     assert_eq!(harness.echo(), "No kbd macro has been defined");
+}
+
+#[test]
+fn keyboard_quit_aborts_a_pending_multi_key_prefix() {
+    // The brief requires C-g to abort EVERYTHING in progress, including a
+    // half-entered multi-key sequence. Batch Emacs under execute-kbd-macro
+    // cannot reproduce this (the `C-x C-g` difftest case was dropped), so it
+    // is pinned here.
+    let mut harness = Harness::with_text("|");
+    harness.keys("C-x");
+    harness.take_sent();
+    harness.keys("C-g");
+    // A quiet abort consistent with the other C-g facets: "Quit" is echoed
+    // and the bell rings once.
+    assert_eq!(harness.echo(), "Quit");
+    assert!(harness.signaled());
+    assert_eq!(bells(&mut harness), 1);
+    // The pending `C-x` was discarded: the next key is read fresh and
+    // self-inserts, rather than completing `C-x b` (switch-to-buffer).
+    harness.keys("b");
+    assert_eq!(harness.text(), "b");
+    assert!(!harness.signaled());
+}
+
+#[test]
+fn keyboard_quit_aborts_a_register_read() {
+    // C-g during the register-name read of `C-x r s` aborts it, so the next
+    // key is read fresh. (This abort was also dropped from difftest.)
+    let mut harness = Harness::with_text("|abc");
+    harness.keys("C-x r s");
+    harness.take_sent();
+    harness.keys("C-g");
+    assert_eq!(harness.echo(), "Quit");
+    assert!(harness.signaled());
+    assert_eq!(bells(&mut harness), 1);
+    // `x` is not consumed as a register name; it self-inserts.
+    harness.keys("x");
+    assert_eq!(harness.text(), "xabc");
+    // Nothing was stored in register `a`: inserting it errors.
+    harness.keys("C-x r i a");
+    assert!(harness.signaled());
+    assert_eq!(harness.echo(), "Register does not contain text");
 }
 
 #[test]
