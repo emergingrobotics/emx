@@ -131,7 +131,10 @@ fn probe_returns_typed_bytes_as_leftover() {
     assert!(matches!(events[3], InputEvent::Key(_)));
     assert_eq!(
         decoder.feed(b"[201~"),
-        vec![InputEvent::Paste(b"p".to_vec())]
+        vec![InputEvent::Paste {
+            data: b"p".to_vec(),
+            last: true
+        }]
     );
 }
 
@@ -152,7 +155,7 @@ fn probe_end_of_input_is_an_error() {
 
 #[test]
 fn setup_and_restore_sequences() {
-    assert_eq!(setup_sequence(), b"\x1b[?1049h\x1b[?2004h\x1b[>1u");
+    assert_eq!(setup_sequence(), b"\x1b[?1049h\x1b[?2004h\x1b[>5u");
     assert_eq!(
         restore_sequence(),
         b"\x1b[<u\x1b[?2004l\x1b[0m\x1b[?25h\x1b[?1049l"

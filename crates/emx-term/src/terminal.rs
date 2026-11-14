@@ -14,9 +14,10 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 
 use crate::kitty::{InputEvent, KittyDecoder};
 
-/// Progressive enhancement flags pushed on entry: 1 is "disambiguate escape
-/// codes".
-pub const KITTY_FLAGS: u32 = 1;
+/// Progressive enhancement flags pushed on entry: 1 "disambiguate escape
+/// codes" | 4 "report alternate keys", so alt+shift+5 arrives with its
+/// shifted key and decodes as M-% rather than M-S-5.
+pub const KITTY_FLAGS: u32 = 5;
 
 pub const UNSUPPORTED_TERMINAL_MESSAGE: &str = "emx: this terminal does not support the Kitty keyboard protocol. Supported in this release: kitty, WezTerm, Ghostty, foot.";
 
@@ -103,6 +104,9 @@ pub struct ProbeResult {
 /// attributes, which every terminal answers. A flags reply before the
 /// attributes reply means the protocol is supported. A terminal that stays
 /// silent until `timeout` is unsupported unless it already sent flags.
+///
+/// Requires raw mode, so call it after `Terminal::enter`: in cooked mode the
+/// replies are echoed and line-buffered and may never reach `input`.
 pub fn probe_kitty(
     input: &mut impl InputSource,
     output: &mut impl Write,

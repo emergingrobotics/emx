@@ -1,9 +1,16 @@
-use emx_term::{InputEvent, KittyDecoder, MAX_PENDING_SEQUENCE};
+use emx_term::{InputEvent, KittyDecoder, MAX_PENDING_SEQUENCE, PASTE_CHUNK_MAX};
 use emx_types::{Key, KeyCode, Mods, parse_kbd};
 use proptest::prelude::*;
 
 fn decode(bytes: &[u8]) -> Vec<InputEvent> {
     KittyDecoder::new().feed(bytes)
+}
+
+fn paste(data: &[u8]) -> InputEvent {
+    InputEvent::Paste {
+        data: data.to_vec(),
+        last: true,
+    }
 }
 
 fn kbd(text: &str) -> InputEvent {
@@ -97,8 +104,12 @@ fn decode_plain_utf8_text() {
 }
 
 #[test]
-fn decode_lone_escape_byte_before_text_is_escape_key() {
-    assert_keys(b"\x1bx", &["ESC", "x"]);
+fn decode_raw_escape_before_other_byte_is_unknown() {
+    let unknown = |bytes: &[u8]| InputEvent::Unknown(bytes.to_vec());
+    assert_eq!(decode(b"\x1bx"), vec![unknown(b"\x1bx")]);
+    assert_eq!(decode(b"\x1b\r"), vec![unknown(b"\x1b\r")]);
+    assert_eq!(decode(b"\x1b\x1b[A"), vec![unknown(b"\x1b"), kbd("<up>")]);
+    assert_eq!(decode("\x1bé".as_bytes()), vec![unknown(b"\x1b"), kbd("é")]);
 }
 
 #[test]
@@ -209,18 +220,12 @@ fn decode_split_sequence_across_feeds() {
 fn decode_bracketed_paste() {
     assert_eq!(
         decode(b"\x1b[200~line one\r\nline two\rline three\nend\x1b[201~x"),
-        vec![
-            InputEvent::Paste(b"line one\nline two\nline three\nend".to_vec()),
-            kbd("x")
-        ]
+        vec![paste(b"line one\nline two\nline three\nend"), kbd("x")]
     );
-    assert_eq!(
-        decode(b"\x1b[200~\x1b[201~"),
-        vec![InputEvent::Paste(Vec::new())]
-    );
+    assert_eq!(decode(b"\x1b[200~\x1b[201~"), vec![paste(b"")]);
     assert_eq!(
         decode(b"\x1b[200~\r\r\n\r\x1b[201~"),
-        vec![InputEvent::Paste(b"\n\n\n".to_vec())]
+        vec![paste(b"\n\n\n")]
     );
 }
 
@@ -228,17 +233,13 @@ fn decode_bracketed_paste() {
 fn decode_paste_content_is_never_keys() {
     let content = b"\x1b[120;5u\x03\x1b[?1u\x1b[?62c\x1b\xff\x1b[200~nested";
     let input = [b"\x1b[200~".as_slice(), content, b"\x1b[201~"].concat();
-    assert_eq!(decode(&input), vec![InputEvent::Paste(content.to_vec())]);
+    assert_eq!(decode(&input), vec![paste(content)]);
 }
 
 #[test]
 fn decode_paste_split_across_feeds_is_reassembled() {
     let input = b"a\x1b[200~one\r\ntwo\r\x1b[201~b";
-    let expected = vec![
-        kbd("a"),
-        InputEvent::Paste(b"one\ntwo\n".to_vec()),
-        kbd("b"),
-    ];
+    let expected = vec![kbd("a"), paste(b"one\ntwo\n"), kbd("b")];
     for split in 0..=input.len() {
         let mut decoder = KittyDecoder::new();
         let mut events = decoder.feed(&input[..split]);
@@ -258,7 +259,7 @@ fn decode_paste_crlf_split_across_feeds() {
     let mut decoder = KittyDecoder::new();
     let mut events = decoder.feed(b"\x1b[200~a\r");
     events.extend(decoder.feed(b"\nb\x1b[201~"));
-    assert_eq!(events, vec![InputEvent::Paste(b"a\nb".to_vec())]);
+    assert_eq!(events, vec![paste(b"a\nb")]);
 }
 
 #[test]
@@ -295,20 +296,18 @@ fn decode_unknown_and_garbled_sequences() {
 }
 
 #[test]
-fn decode_pending_sequence_is_capped() {
+fn decode_pending_sequence_is_capped_and_its_tail_discarded() {
     let mut decoder = KittyDecoder::new();
     let mut input = b"\x1b[".to_vec();
-    input.extend(std::iter::repeat_n(b'1', MAX_PENDING_SEQUENCE));
+    input.extend(std::iter::repeat_n(b'1', MAX_PENDING_SEQUENCE + 100));
     let events = decoder.feed(&input);
     assert_eq!(
         events,
-        vec![
-            InputEvent::Unknown(input[..MAX_PENDING_SEQUENCE].to_vec()),
-            kbd("1"),
-            kbd("1")
-        ]
+        vec![InputEvent::Unknown(input[..MAX_PENDING_SEQUENCE].to_vec())]
     );
     assert_eq!(decoder.buffered_len(), 0);
+    assert_eq!(decoder.feed(b"22;5u"), Vec::new());
+    assert_eq!(decoder.feed(b"x"), vec![kbd("x")]);
 
     let mut decoder = KittyDecoder::new();
     let mut events = Vec::new();
@@ -321,10 +320,196 @@ fn decode_pending_sequence_is_capped() {
     ));
 }
 
+#[test]
+fn decode_overflow_tail_is_feed_boundary_independent() {
+    let mut input = b"a\x1b[".to_vec();
+    input.extend(std::iter::repeat_n(b'1', MAX_PENDING_SEQUENCE * 2));
+    input.extend_from_slice(b"~b\x1b]");
+    input.extend(std::iter::repeat_n(b'z', MAX_PENDING_SEQUENCE * 2));
+    input.extend_from_slice(b"\x1b\\c");
+    let whole = decode(&input);
+    assert_eq!(
+        whole,
+        vec![
+            kbd("a"),
+            InputEvent::Unknown(input[1..1 + MAX_PENDING_SEQUENCE].to_vec()),
+            kbd("b"),
+            InputEvent::Unknown([b"\x1b]".as_slice(), &[b'z'; MAX_PENDING_SEQUENCE - 2]].concat()),
+            kbd("c"),
+        ]
+    );
+    let mut decoder = KittyDecoder::new();
+    let mut events = Vec::new();
+    for byte in &input {
+        events.extend(decoder.feed(std::slice::from_ref(byte)));
+    }
+    assert_eq!(events, whole);
+}
+
+#[test]
+fn decode_string_sequences_are_unknown_through_their_terminator() {
+    let unknown = |bytes: &[u8]| InputEvent::Unknown(bytes.to_vec());
+    assert_eq!(
+        decode(b"\x1b]0;title\x07a"),
+        vec![unknown(b"\x1b]0;title\x07"), kbd("a")]
+    );
+    assert_eq!(
+        decode(b"\x1b]52;c;?\x1b\\a"),
+        vec![unknown(b"\x1b]52;c;?\x1b\\"), kbd("a")]
+    );
+    assert_eq!(
+        decode(b"\x1bP>|kitty(0.30)\x1b\\"),
+        vec![unknown(b"\x1bP>|kitty(0.30)\x1b\\")]
+    );
+    assert_eq!(
+        decode(b"\x1b_Gi=1;OK\x1b\\"),
+        vec![unknown(b"\x1b_Gi=1;OK\x1b\\")]
+    );
+    assert_eq!(decode(b"\x1b^pm\x07"), vec![unknown(b"\x1b^pm\x07")]);
+    assert_eq!(decode(b"\x1bXsos\x07"), vec![unknown(b"\x1bXsos\x07")]);
+    assert_eq!(
+        decode(b"\x1b]0;t\x1b[A"),
+        vec![unknown(b"\x1b]0;t"), kbd("<up>")]
+    );
+    let mut decoder = KittyDecoder::new();
+    assert_eq!(decoder.feed(b"\x1b]0;abc\x1b"), Vec::new());
+    assert_eq!(
+        decoder.feed(b"\\d"),
+        vec![unknown(b"\x1b]0;abc\x1b\\"), kbd("d")]
+    );
+}
+
+#[test]
+fn decode_string_overflow_with_split_terminator() {
+    let mut input = b"\x1b]".to_vec();
+    input.extend(std::iter::repeat_n(b'a', MAX_PENDING_SEQUENCE - 3));
+    input.extend_from_slice(b"\x1b\\b");
+    assert_eq!(input[MAX_PENDING_SEQUENCE - 1], 0x1b);
+    assert_eq!(
+        decode(&input),
+        vec![
+            InputEvent::Unknown(input[..MAX_PENDING_SEQUENCE - 1].to_vec()),
+            kbd("b")
+        ]
+    );
+    let mut long = b"\x1b]".to_vec();
+    long.extend(std::iter::repeat_n(b'a', MAX_PENDING_SEQUENCE * 3));
+    long.extend_from_slice(b"\x07b");
+    assert_eq!(
+        decode(&long),
+        vec![
+            InputEvent::Unknown(long[..MAX_PENDING_SEQUENCE].to_vec()),
+            kbd("b")
+        ]
+    );
+}
+
+#[test]
+fn decode_ss3_garbage_is_unknown_through_its_final_byte() {
+    let unknown = |bytes: &[u8]| InputEvent::Unknown(bytes.to_vec());
+    assert_eq!(decode(b"\x1bO5P"), vec![unknown(b"\x1bO5P")]);
+    assert_eq!(decode(b"\x1bO1;5Px"), vec![unknown(b"\x1bO1;5P"), kbd("x")]);
+    assert_eq!(decode(b"\x1bO\x01"), vec![unknown(b"\x1bO"), kbd("C-a")]);
+    assert_eq!(decode(b"\x1b[1 1u"), vec![unknown(b"\x1b[1 1u")]);
+}
+
+fn paste_data(events: &[InputEvent]) -> (Vec<u8>, Vec<bool>) {
+    let mut data = Vec::new();
+    let mut lasts = Vec::new();
+    for event in events {
+        match event {
+            InputEvent::Paste { data: chunk, last } => {
+                assert!(chunk.len() <= PASTE_CHUNK_MAX);
+                data.extend_from_slice(chunk);
+                lasts.push(*last);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    (data, lasts)
+}
+
+#[test]
+fn decode_large_paste_is_chunked_across_feeds() {
+    let size = 3 * PASTE_CHUNK_MAX + PASTE_CHUNK_MAX / 2;
+    let mut content = Vec::with_capacity(size);
+    let mut expected = Vec::with_capacity(size);
+    let mut index = 0usize;
+    while content.len() < size {
+        match index % 7 {
+            0 => {
+                content.extend_from_slice(b"\r\n");
+                expected.push(b'\n');
+            }
+            3 => {
+                content.push(b'\r');
+                expected.push(b'\n');
+            }
+            _ => {
+                let byte = b'a' + (index % 26) as u8;
+                content.push(byte);
+                expected.push(byte);
+            }
+        }
+        index += 1;
+    }
+    let input = [b"\x1b[200~".as_slice(), &content, b"\x1b[201~x"].concat();
+    let mut decoder = KittyDecoder::new();
+    let mut events = Vec::new();
+    for piece in input.chunks(100_003) {
+        events.extend(decoder.feed(piece));
+        assert!(decoder.buffered_len() < PASTE_CHUNK_MAX + b"\x1b[201~".len());
+    }
+    assert_eq!(events.pop(), Some(kbd("x")));
+    let (data, lasts) = paste_data(&events);
+    assert_eq!(data, expected);
+    assert_eq!(lasts.len(), 4);
+    assert_eq!(lasts, vec![false, false, false, true]);
+    assert_eq!(events, decode(&input)[..4].to_vec());
+}
+
+#[test]
+fn decode_unterminated_paste_emits_chunks_as_data_arrives() {
+    let mut decoder = KittyDecoder::new();
+    assert_eq!(decoder.feed(b"\x1b[200~"), Vec::new());
+    let mut events = Vec::new();
+    for _ in 0..5 {
+        events.extend(decoder.feed(&vec![b'q'; PASTE_CHUNK_MAX / 2]));
+        assert!(decoder.buffered_len() < PASTE_CHUNK_MAX + b"\x1b[201~".len());
+    }
+    let (data, lasts) = paste_data(&events);
+    assert_eq!(lasts, vec![false, false]);
+    assert_eq!(data.len(), 2 * PASTE_CHUNK_MAX);
+}
+
+#[test]
+fn decode_paste_crlf_split_at_chunk_boundary() {
+    let mut content = vec![b'a'; PASTE_CHUNK_MAX - 1];
+    content.extend_from_slice(b"\r\nb");
+    let input = [b"\x1b[200~".as_slice(), &content, b"\x1b[201~"].concat();
+    let events = decode(&input);
+    let mut first = vec![b'a'; PASTE_CHUNK_MAX - 1];
+    first.push(b'\n');
+    assert_eq!(
+        events,
+        vec![
+            InputEvent::Paste {
+                data: first,
+                last: false
+            },
+            InputEvent::Paste {
+                data: b"b".to_vec(),
+                last: true
+            },
+        ]
+    );
+}
+
 fn byte_stream() -> impl Strategy<Value = Vec<u8>> {
     let interesting = prop::sample::select(vec![
         0x1b_u8, b'[', b'O', b'?', b';', b':', b'u', b'~', b'c', b'A', b'P', b'0', b'1', b'2',
-        b'5', b'9', b'\r', b'\n', 0x7f, 0xc3, 0xa9, 0xe2, 0x82, 0xac, 0xf0, 0x9f,
+        b'5', b'9', b'\r', b'\n', b']', b'\\', b'_', 0x07, 0x7f, 0xc3, 0xa9, 0xe2, 0x82, 0xac,
+        0xf0, 0x9f,
     ]);
     prop::collection::vec(prop_oneof![3 => interesting, 1 => any::<u8>()], 0..400)
 }

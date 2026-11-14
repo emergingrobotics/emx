@@ -1,10 +1,11 @@
-//! Decoder for terminal input with Kitty keyboard protocol flag 1
-//! ("disambiguate escape codes") pushed.
+//! Decoder for terminal input with Kitty keyboard protocol flags 5
+//! ("disambiguate escape codes" | "report alternate keys") pushed.
 //!
-//! Under that flag Escape never arrives as a bare 0x1b (it is `CSI 27 u`), so
-//! a trailing 0x1b is always the start of a sequence and the decoder can wait
-//! for more bytes without a timeout. Decoding never depends on where `feed`
-//! boundaries fall.
+//! Under those flags Escape never arrives as a bare 0x1b (it is `CSI 27 u`),
+//! so a trailing 0x1b is always the start of a sequence and the decoder can
+//! wait for more bytes without a timeout. Decoding never depends on where
+//! `feed` boundaries fall, and no escape-introduced byte is ever turned into
+//! a key unless it forms a recognized key sequence.
 
 use emx_types::{Key, KeyCode, Mods};
 
@@ -12,8 +13,17 @@ use emx_types::{Key, KeyCode, Mods};
 /// byte within this many bytes is reported as `Unknown` and decoding resyncs.
 pub const MAX_PENDING_SEQUENCE: usize = 4096;
 
+/// Largest raw paste chunk delivered as one `Paste` event; a paste is
+/// delivered in chunks as its bytes arrive instead of being held whole.
+pub const PASTE_CHUNK_MAX: usize = 1024 * 1024;
+
 const ESCAPE: u8 = 0x1b;
-const CSI_PREFIX: &[u8] = b"\x1b[";
+const BELL: u8 = 0x07;
+const STRING_TERMINATOR_FINAL: u8 = b'\\';
+/// Bytes after ESC that open a control string (DCS, SOS, OSC, PM, APC),
+/// which runs to ST (`ESC \`) or BEL.
+const STRING_INTRODUCERS: [u8; 5] = [b'P', b'X', b']', b'^', b'_'];
+const SEQUENCE_BODY_START: usize = 2;
 const PASTE_END: &[u8] = b"\x1b[201~";
 const PASTE_START_NUMBER: u32 = 200;
 
@@ -119,16 +129,21 @@ const LETTER_KEYS: [(u8, KeyCode); 10] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputEvent {
     Key(Key),
-    /// Pasted bytes with CR LF and lone CR turned into LF, as Emacs
-    /// `xterm--pasted-text` does.
-    Paste(Vec<u8>),
+    /// One chunk of pasted bytes with CR LF and lone CR turned into LF, as
+    /// Emacs `xterm--pasted-text` does. A paste arrives as one or more
+    /// chunks of at most `PASTE_CHUNK_MAX` raw bytes; `last` marks the end.
+    Paste {
+        data: Vec<u8>,
+        last: bool,
+    },
     KittyFlags(u32),
     PrimaryDeviceAttributes,
     Unknown(Vec<u8>),
 }
 
 /// One decoding result and how many input bytes it consumed. A paste start
-/// consumes its marker without producing an event yet.
+/// and the discarded tail of an oversized sequence consume bytes without
+/// producing an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Decoded {
     pub(crate) event: Option<InputEvent>,
@@ -137,19 +152,46 @@ pub(crate) struct Decoded {
 
 #[derive(Debug, Default)]
 struct PasteInProgress {
+    /// Raw bytes not yet delivered; never longer than one chunk plus a
+    /// partial end marker.
     raw: Vec<u8>,
     searched: usize,
+    /// The last delivered chunk ended in CR, so a leading LF completes a
+    /// CR LF pair already delivered as LF.
+    after_carriage_return: bool,
+}
+
+/// How an escape sequence body runs: a control sequence (CSI, SS3) ends at a
+/// final byte, a control string at ST or BEL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Body {
+    Control,
+    String,
+}
+
+enum Scan {
+    /// The sequence ends just before this index.
+    Complete(usize),
+    /// A byte that cannot belong to the sequence is at this index.
+    Invalid(usize),
+    /// More input is needed; bytes before this index are certainly inside
+    /// the sequence.
+    NeedMore(usize),
 }
 
 #[derive(Debug, Default)]
 pub struct KittyDecoder {
     pending: Vec<u8>,
     paste: Option<PasteInProgress>,
+    /// Set after an oversized sequence was reported, until its end.
+    discarding: Option<Body>,
 }
 
 enum Step {
     Event(InputEvent, usize),
     PasteStart(usize),
+    /// Report this many bytes as `Unknown`, then discard to the body's end.
+    Overflow(usize, Body),
     Incomplete,
 }
 
@@ -158,7 +200,8 @@ impl KittyDecoder {
         KittyDecoder::default()
     }
 
-    /// Bytes held for a sequence, character or paste that has not finished.
+    /// Bytes held for a sequence, character or paste chunk that has not
+    /// finished.
     pub fn buffered_len(&self) -> usize {
         self.pending.len() + self.paste.as_ref().map_or(0, |paste| paste.raw.len())
     }
@@ -178,8 +221,8 @@ impl KittyDecoder {
         let mut decoded = Vec::new();
         loop {
             if self.paste.is_some() {
-                match self.finish_paste() {
-                    Some(paste) => decoded.push(paste),
+                match self.next_paste_chunk() {
+                    Some(chunk) => decoded.push(chunk),
                     None => break,
                 }
                 continue;
@@ -196,6 +239,25 @@ impl KittyDecoder {
         let mut offset = 0;
         let mut outcome = PendingOutcome::Stalled;
         while offset < self.pending.len() {
+            if let Some(body) = self.discarding {
+                let (consumed, finished) = match scan(body, &self.pending[offset..], 0) {
+                    Scan::Complete(end) => (end, true),
+                    Scan::Invalid(index) => (index, true),
+                    Scan::NeedMore(safe) => (safe, false),
+                };
+                if consumed > 0 {
+                    decoded.push(Decoded {
+                        event: None,
+                        consumed,
+                    });
+                    offset += consumed;
+                }
+                if !finished {
+                    break;
+                }
+                self.discarding = None;
+                continue;
+            }
             match decode_step(&self.pending[offset..]) {
                 Step::Event(event, consumed) => {
                     decoded.push(Decoded {
@@ -203,6 +265,15 @@ impl KittyDecoder {
                         consumed,
                     });
                     offset += consumed;
+                }
+                Step::Overflow(reported, body) => {
+                    let bytes = self.pending[offset..offset + reported].to_vec();
+                    decoded.push(Decoded {
+                        event: Some(InputEvent::Unknown(bytes)),
+                        consumed: reported,
+                    });
+                    offset += reported;
+                    self.discarding = Some(body);
                 }
                 Step::PasteStart(consumed) => {
                     decoded.push(Decoded {
@@ -212,7 +283,7 @@ impl KittyDecoder {
                     offset += consumed;
                     self.paste = Some(PasteInProgress {
                         raw: self.pending.split_off(offset),
-                        searched: 0,
+                        ..PasteInProgress::default()
                     });
                     outcome = PendingOutcome::PasteStarted;
                     break;
@@ -224,26 +295,43 @@ impl KittyDecoder {
         outcome
     }
 
-    fn finish_paste(&mut self) -> Option<Decoded> {
+    /// Chunk boundaries fall every `PASTE_CHUNK_MAX` raw bytes from the
+    /// start of the paste, whatever the feed boundaries. A full chunk is
+    /// delivered once the bytes after it show the end marker cannot start
+    /// inside it.
+    fn next_paste_chunk(&mut self) -> Option<Decoded> {
         let paste = self
             .paste
             .as_mut()
-            .expect("finish_paste is only called during a paste");
-        let found = paste.raw[paste.searched..]
+            .expect("next_paste_chunk is only called during a paste");
+        let window = paste.raw.len().min(PASTE_CHUNK_MAX + PASTE_END.len() - 1);
+        let found = paste.raw[paste.searched.min(window)..window]
             .windows(PASTE_END.len())
-            .position(|window| window == PASTE_END)
+            .position(|candidate| candidate == PASTE_END)
             .map(|position| paste.searched + position);
-        let Some(end) = found else {
-            paste.searched = paste.raw.len().saturating_sub(PASTE_END.len() - 1);
+        if let Some(end) = found {
+            let mut raw = std::mem::take(&mut paste.raw);
+            let data = normalize_line_ends(&raw[..end], &mut paste.after_carriage_return);
+            self.pending = raw.split_off(end + PASTE_END.len());
+            self.paste = None;
+            return Some(Decoded {
+                event: Some(InputEvent::Paste { data, last: true }),
+                consumed: end + PASTE_END.len(),
+            });
+        }
+        if window < PASTE_CHUNK_MAX + PASTE_END.len() - 1 {
+            paste.searched = window.saturating_sub(PASTE_END.len() - 1);
             return None;
-        };
-        let mut raw = std::mem::take(&mut paste.raw);
-        self.paste = None;
-        self.pending = raw.split_off(end + PASTE_END.len());
-        raw.truncate(end);
+        }
+        let data = normalize_line_ends(
+            &paste.raw[..PASTE_CHUNK_MAX],
+            &mut paste.after_carriage_return,
+        );
+        paste.raw.drain(..PASTE_CHUNK_MAX);
+        paste.searched = 0;
         Some(Decoded {
-            event: Some(InputEvent::Paste(normalize_line_ends(&raw))),
-            consumed: end + PASTE_END.len(),
+            event: Some(InputEvent::Paste { data, last: false }),
+            consumed: PASTE_CHUNK_MAX,
         })
     }
 }
@@ -253,18 +341,15 @@ enum PendingOutcome {
     Stalled,
 }
 
-fn normalize_line_ends(raw: &[u8]) -> Vec<u8> {
+fn normalize_line_ends(raw: &[u8], after_carriage_return: &mut bool) -> Vec<u8> {
     let mut text = Vec::with_capacity(raw.len());
-    let mut bytes = raw.iter().peekable();
-    while let Some(&byte) = bytes.next() {
-        if byte == b'\r' {
-            text.push(b'\n');
-            if bytes.peek() == Some(&&b'\n') {
-                bytes.next();
-            }
-        } else {
-            text.push(byte);
+    for &byte in raw {
+        match byte {
+            b'\r' => text.push(b'\n'),
+            b'\n' if *after_carriage_return => {}
+            other => text.push(other),
         }
+        *after_carriage_return = byte == b'\r';
     }
     text
 }
@@ -333,26 +418,22 @@ fn decode_utf8(bytes: &[u8]) -> Step {
     Step::Event(key_event(KeyCode::Char(character), Mods::default()), length)
 }
 
+/// Raw ESC followed by anything that does not open a sequence is reported
+/// as unknown: legacy alt+key (`ESC x`) is not supported in this release. A
+/// following ESC or non-ASCII byte is left to decode on its own.
 fn decode_escape(bytes: &[u8]) -> Step {
-    const SS3_LENGTH: usize = 3;
     let Some(&second) = bytes.get(1) else {
         return Step::Incomplete;
     };
     match second {
-        b'[' => decode_csi(bytes),
-        b'O' => {
-            let Some(&final_byte) = bytes.get(2) else {
-                return Step::Incomplete;
-            };
-            if !is_final_byte(final_byte) {
-                return unknown(bytes, 2);
-            }
-            match letter_key(final_byte) {
-                Some(code) => Step::Event(key_event(code, Mods::default()), SS3_LENGTH),
-                None => unknown(bytes, SS3_LENGTH),
-            }
+        b'[' => decode_sequence(bytes, Body::Control, interpret_csi_sequence),
+        b'O' => decode_sequence(bytes, Body::Control, interpret_ss3_sequence),
+        introducer if STRING_INTRODUCERS.contains(&introducer) => {
+            decode_sequence(bytes, Body::String, |_| None)
         }
-        _ => Step::Event(key_event(KeyCode::Escape, Mods::default()), 1),
+        ESCAPE => unknown(bytes, 1),
+        ascii if ascii.is_ascii() => unknown(bytes, SEQUENCE_BODY_START),
+        _ => unknown(bytes, 1),
     }
 }
 
@@ -368,39 +449,64 @@ fn is_intermediate_byte(byte: u8) -> bool {
     (0x20..=0x2f).contains(&byte)
 }
 
-fn decode_csi(bytes: &[u8]) -> Step {
-    let mut index = CSI_PREFIX.len();
-    let mut intermediate_start = None;
-    let final_index = loop {
-        if index == MAX_PENDING_SEQUENCE {
-            return unknown(bytes, MAX_PENDING_SEQUENCE);
+fn scan(body: Body, bytes: &[u8], start: usize) -> Scan {
+    for (index, &byte) in bytes.iter().enumerate().skip(start) {
+        match body {
+            Body::Control if is_final_byte(byte) => return Scan::Complete(index + 1),
+            Body::Control if is_parameter_byte(byte) || is_intermediate_byte(byte) => {}
+            Body::Control => return Scan::Invalid(index),
+            Body::String if byte == BELL => return Scan::Complete(index + 1),
+            Body::String if byte == ESCAPE => {
+                return match bytes.get(index + 1) {
+                    Some(&STRING_TERMINATOR_FINAL) => Scan::Complete(index + 2),
+                    Some(_) => Scan::Invalid(index),
+                    None => Scan::NeedMore(index),
+                };
+            }
+            Body::String => {}
         }
-        let Some(&byte) = bytes.get(index) else {
-            return Step::Incomplete;
-        };
-        if is_final_byte(byte) {
-            break index;
-        }
-        if is_parameter_byte(byte) && intermediate_start.is_none() {
-            index += 1;
-            continue;
-        }
-        if is_intermediate_byte(byte) {
-            intermediate_start.get_or_insert(index);
-            index += 1;
-            continue;
-        }
-        return unknown(bytes, index);
-    };
-    let length = final_index + 1;
-    if intermediate_start.is_some() {
-        return unknown(bytes, length);
     }
-    let parameters = &bytes[CSI_PREFIX.len()..final_index];
-    match interpret_csi(parameters, bytes[final_index]) {
-        Some(Interpretation::Event(event)) => Step::Event(event, length),
-        Some(Interpretation::PasteStart) => Step::PasteStart(length),
-        None => unknown(bytes, length),
+    Scan::NeedMore(bytes.len())
+}
+
+/// Scans an escape sequence of at most `MAX_PENDING_SEQUENCE` bytes and
+/// hands the complete sequence to `interpret`; anything it rejects, and any
+/// sequence cut short by an invalid byte, is `Unknown`.
+fn decode_sequence(
+    bytes: &[u8],
+    body: Body,
+    interpret: impl Fn(&[u8]) -> Option<Interpretation>,
+) -> Step {
+    let limited = &bytes[..bytes.len().min(MAX_PENDING_SEQUENCE)];
+    match scan(body, limited, SEQUENCE_BODY_START) {
+        Scan::Complete(length) => match interpret(&bytes[..length]) {
+            Some(Interpretation::Event(event)) => Step::Event(event, length),
+            Some(Interpretation::PasteStart) => Step::PasteStart(length),
+            None => unknown(bytes, length),
+        },
+        Scan::Invalid(index) => unknown(bytes, index),
+        Scan::NeedMore(safe) if bytes.len() >= MAX_PENDING_SEQUENCE => Step::Overflow(safe, body),
+        Scan::NeedMore(_) => Step::Incomplete,
+    }
+}
+
+/// `sequence` is a complete `ESC [ ... final`.
+fn interpret_csi_sequence(sequence: &[u8]) -> Option<Interpretation> {
+    let (final_byte, parameters) = sequence[SEQUENCE_BODY_START..]
+        .split_last()
+        .expect("a complete sequence has a final byte");
+    if parameters.iter().any(|byte| is_intermediate_byte(*byte)) {
+        return None;
+    }
+    interpret_csi(parameters, *final_byte)
+}
+
+/// `sequence` is a complete `ESC O ... final`; only the bare form is a key.
+fn interpret_ss3_sequence(sequence: &[u8]) -> Option<Interpretation> {
+    match &sequence[SEQUENCE_BODY_START..] {
+        [final_byte] => letter_key(*final_byte)
+            .map(|code| Interpretation::Event(key_event(code, Mods::default()))),
+        _ => None,
     }
 }
 
@@ -603,7 +709,7 @@ mod tests {
         fn every_byte_is_accounted_for(
             input in prop::collection::vec(
                 prop_oneof![
-                    3 => prop::sample::select(vec![ESCAPE, b'[', b'O', b'?', b';', b':', b'u', b'~', b'c', b'2', b'0', b'1', b'\r', 0xc3, 0xa9]),
+                    3 => prop::sample::select(vec![ESCAPE, b'[', b'O', b'?', b';', b':', b'u', b'~', b'c', b'2', b'0', b'1', b'\r', b']', b'\\', b'P', 0x07, 0xc3, 0xa9]),
                     1 => any::<u8>(),
                 ],
                 0..400,
@@ -615,10 +721,10 @@ mod tests {
             for piece in input.chunks(chunk) {
                 for decoded in decoder.feed_accounted(piece) {
                     prop_assert!(decoded.consumed > 0);
-                    prop_assert!(decoded.event.is_some() || decoded.consumed == b"\x1b[200~".len());
                     consumed += decoded.consumed;
                 }
                 prop_assert!(decoder.pending.len() < MAX_PENDING_SEQUENCE);
+                prop_assert!(decoder.buffered_len() < MAX_PENDING_SEQUENCE + PASTE_CHUNK_MAX + PASTE_END.len());
             }
             prop_assert_eq!(consumed + decoder.buffered_len(), input.len());
         }
