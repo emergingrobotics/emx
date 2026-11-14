@@ -1,8 +1,12 @@
 mod buffer_menu;
 mod completing;
 mod files;
+mod goto;
+mod kmacro;
 mod messages;
 mod occurring;
+mod rectangles;
+mod registers;
 mod reload;
 mod replacing;
 mod requests;
@@ -20,7 +24,9 @@ use emx_types::{Grid, Key, KeyCode, Mods};
 use slotmap::SlotMap;
 
 use crate::buffer::{Buffer, BufferId, ChangeRecorder};
-use crate::command::{self, CommandContext, CommandError, PrefixArg, RecenterPosition};
+use crate::command::{
+    self, CommandContext, CommandError, DabbrevState, PrefixArg, RecenterPosition,
+};
 use crate::config::{Config, ConfigError};
 use crate::event::{ClientId, Effect, Event, TimerId};
 use crate::isearch::{CaseFold, Isearch, QueuedInput};
@@ -33,6 +39,7 @@ use crate::render::{PrefetchRequest, render};
 use crate::undo::{UndoLimits, outer_limit_warning};
 pub(crate) use files::Purpose;
 use files::{AutoSaveRequest, ExitWait, SaveFlow, SaveRequest};
+use registers::{RegisterRead, RegisterValue};
 use reload::ReloadRequest;
 use replacing::QueryReplace;
 use requests::{GroupReply, OpenRequest, Reply};
@@ -147,6 +154,19 @@ struct Client {
     query_replace: Option<QueryReplace>,
     /// A search running on a worker for this client.
     search_wait: Option<SearchWait>,
+    /// The keyboard macro being defined, as the input keys read so far
+    /// (Emacs `defining-kbd-macro`).
+    macro_defining: Option<Vec<Key>>,
+    /// Depth of keyboard-macro execution; recording and the repeat key pause
+    /// while it is above zero (Emacs `executing-kbd-macro`).
+    macro_executing: u32,
+    /// The key that repeats the last macro after `C-x e`, as Emacs installs
+    /// a transient map on the last event of `kmacro-end-and-call-macro`.
+    macro_repeat: Option<Key>,
+    /// A register name being read for `C-x r ...`.
+    register_read: Option<RegisterRead>,
+    /// Cycling state for successive `dabbrev-expand` (`M-/`) presses.
+    dabbrev: Option<DabbrevState>,
 }
 
 #[derive(Debug, Default)]
@@ -298,6 +318,12 @@ pub struct Editor {
     /// The settle round of automatic reloads being summarized: the names
     /// reloaded so far, its timer, and how often it was extended.
     reload_round: Option<reload::ReloadRound>,
+    /// Emacs registers, keyed by their name character.
+    registers: HashMap<char, RegisterValue>,
+    /// Emacs `last-kbd-macro`, the keys of the most recent macro.
+    last_kbd_macro: Option<Vec<Key>>,
+    /// Emacs `killed-rectangle`, one line of the rectangle per entry.
+    killed_rectangle: Option<Vec<Vec<u8>>>,
 }
 
 impl Editor {
@@ -373,6 +399,9 @@ impl Editor {
             watched: BTreeSet::new(),
             polled_paths: BTreeSet::new(),
             reload_round: None,
+            registers: HashMap::new(),
+            last_kbd_macro: None,
+            killed_rectangle: None,
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -652,6 +681,11 @@ impl Editor {
                 isearch: None,
                 query_replace: None,
                 search_wait: None,
+                macro_defining: None,
+                macro_executing: 0,
+                macro_repeat: None,
+                register_read: None,
+                dabbrev: None,
             },
         );
         if kind == ClientKind::Tui {
@@ -752,7 +786,19 @@ impl Editor {
         // Reading an input event wipes the echo area.
         client.echo.clear();
         client.signaled = false;
-        if client.minibuffer.is_some() {
+        // Every key read while a macro is being defined joins it, as Emacs
+        // records them; the start and end commands trim their own keys.
+        if client.macro_executing == 0
+            && let Some(recording) = client.macro_defining.as_mut()
+        {
+            recording.push(key);
+        }
+        // A pending register-name read (`C-x r ...`) takes this key.
+        if self.client(client_id).register_read.is_some() {
+            self.read_register_key(client_id, key);
+            return;
+        }
+        if self.client(client_id).minibuffer.is_some() {
             self.minibuffer_key(client_id, key);
             return;
         }
@@ -760,9 +806,25 @@ impl Editor {
             self.query_replace_key(client_id, key);
             return;
         }
+        // The transient map `C-x e` installs: its last event repeats the
+        // macro until some other key is read.
+        if self.client(client_id).macro_executing == 0
+            && let Some(repeat_key) = self.client(client_id).macro_repeat
+        {
+            let ready = {
+                let state = &self.client(client_id).command_loop;
+                state.pending.is_empty() && !state.universal_argument_map
+            };
+            if key == repeat_key && ready {
+                self.repeat_last_macro(client_id, key);
+                return;
+            }
+            self.client_mut(client_id).macro_repeat = None;
+        }
         let client = self.client_mut(client_id);
         let state = &mut client.command_loop;
         if !state.pending.is_empty() && key == QUIT_KEY {
+            self.abort_input(client_id);
             self.signal(client_id, None, &CommandError::Quit);
             return;
         }
@@ -937,6 +999,7 @@ impl Editor {
         // `this-command` (a kill becomes `kill-region`).
         let this_command = context.this_command;
         let deactivate_mark = context.deactivate_mark;
+        let macro_call = context.macro_call;
         let completion = if context.keep_prefix_state {
             Completion::KeepPrefixState(context.next_prefix_arg)
         } else {
@@ -958,6 +1021,26 @@ impl Editor {
             Err(error) => self.signal(client_id, Some(this_command), &error),
         }
         self.finish_command(client_id, journal_start);
+        // `kmacro-end-and-call-macro` runs the macro only once its own
+        // command loop bookkeeping is done, so the replayed keys start from
+        // a clean command state.
+        if let Some(count) = macro_call
+            && !self.client(client_id).signaled
+        {
+            self.call_last_macro(client_id, count, key);
+        }
+    }
+
+    /// Emacs `keyboard-quit` and a `C-g` that aborts a partial key sequence:
+    /// deactivate the mark and discard any macro definition, repeat key and
+    /// register read in progress.
+    fn abort_input(&mut self, client_id: ClientId) {
+        let buffer = self.selected_buffer(client_id);
+        self.buffers[buffer].mark_active = false;
+        let client = self.client_mut(client_id);
+        client.macro_defining = None;
+        client.macro_repeat = None;
+        client.register_read = None;
     }
 
     fn complete(&mut self, client_id: ClientId, completion: Completion) {
@@ -1256,6 +1339,15 @@ impl Editor {
 
     pub(crate) fn selected_buffer(&self, client_id: ClientId) -> BufferId {
         self.client(client_id).frame.selected_window().buffer
+    }
+
+    /// Removes and returns the client's `dabbrev-expand` cycling state.
+    pub(crate) fn take_dabbrev(&mut self, client_id: ClientId) -> Option<DabbrevState> {
+        self.client_mut(client_id).dabbrev.take()
+    }
+
+    pub(crate) fn set_dabbrev(&mut self, client_id: ClientId, state: DabbrevState) {
+        self.client_mut(client_id).dabbrev = Some(state);
     }
 }
 

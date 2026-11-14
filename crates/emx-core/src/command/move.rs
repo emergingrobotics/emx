@@ -329,6 +329,246 @@ pub(crate) fn move_to_column(
     Ok(end)
 }
 
+/// `M-e`: Emacs `forward-sentence`, with `sentence-end-double-space` t (the
+/// default): a sentence ends at `.`, `?` or `!` (and any closing quotes or
+/// brackets) when followed by end of line, a tab, or two spaces.
+pub(super) fn forward_sentence(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let count = ctx.prefix_arg.numeric_value();
+    move_by_sentences(ctx, count)
+}
+
+/// `M-a`: Emacs `backward-sentence`.
+pub(super) fn backward_sentence(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let count = ctx.prefix_arg.numeric_value();
+    move_by_sentences(ctx, count.saturating_neg())
+}
+
+fn move_by_sentences(ctx: &mut CommandContext, count: i64) -> Result<(), CommandError> {
+    let text = ctx.buffer().text.clone();
+    let mut point = ctx.point();
+    for _ in 0..count.unsigned_abs() {
+        if count > 0 {
+            // `end-of-paragraph-text` steps a character forward at the buffer
+            // end, which signals, as Emacs's `forward-sentence` does there.
+            if point == text.len() {
+                ctx.set_point(point);
+                return Err(CommandError::EndOfBuffer);
+            }
+            point = forward_one_sentence(&text, point)?;
+        } else {
+            point = backward_one_sentence(&text, point)?;
+        }
+    }
+    ctx.set_point(point);
+    Ok(())
+}
+
+const SENTENCE_PUNCTUATION: [u8; 3] = [b'.', b'?', b'!'];
+/// The ASCII closing quotes and brackets of Emacs's `sentence-end`.
+const SENTENCE_CLOSERS: [u8; 5] = [b']', b'"', b'\'', b')', b'}'];
+
+fn is_sentence_punctuation(byte: u8) -> bool {
+    SENTENCE_PUNCTUATION.contains(&byte)
+}
+
+fn is_sentence_closer(byte: u8) -> bool {
+    SENTENCE_CLOSERS.contains(&byte)
+}
+
+/// A sentence-end match starting at `pos`: its landing position (right after
+/// the punctuation and closers, where `forward-sentence` stops) and the end
+/// of the whole match including the trailing whitespace.
+fn sentence_end_at(text: &Text, pos: u64, len: u64) -> Result<Option<(u64, u64)>, ReadError> {
+    if !is_sentence_punctuation(text.byte_at(pos)?) {
+        return Ok(None);
+    }
+    let mut landing = pos + 1;
+    while landing < len && is_sentence_closer(text.byte_at(landing)?) {
+        landing += 1;
+    }
+    if !sentence_separator(text, landing, len)? {
+        return Ok(None);
+    }
+    let mut end = landing;
+    while end < len && matches!(text.byte_at(end)?, b' ' | b'\t' | b'\n') {
+        end += 1;
+    }
+    Ok(Some((landing, end)))
+}
+
+/// The `\($\| $\|\t\|  \)` separator of `sentence-end`: end of line, a tab,
+/// a space before end of line, or two spaces.
+fn sentence_separator(text: &Text, pos: u64, len: u64) -> Result<bool, ReadError> {
+    if pos >= len {
+        return Ok(true);
+    }
+    match text.byte_at(pos)? {
+        b'\n' | b'\t' => Ok(true),
+        b' ' => Ok(pos + 1 >= len || matches!(text.byte_at(pos + 1)?, b' ' | b'\n')),
+        _ => Ok(false),
+    }
+}
+
+fn forward_one_sentence(text: &Text, point: u64) -> Result<u64, ReadError> {
+    let bound = end_of_paragraph_text(text, point)?;
+    let mut pos = point;
+    while pos < bound {
+        if let Some((landing, _)) = sentence_end_at(text, pos, text.len())? {
+            return Ok(landing.min(bound));
+        }
+        pos += 1;
+    }
+    Ok(bound)
+}
+
+fn backward_one_sentence(text: &Text, point: u64) -> Result<u64, ReadError> {
+    let floor = start_of_paragraph_text(text, point)?;
+    let mut matches = Vec::new();
+    let mut pos = floor;
+    while pos < point {
+        if let Some((_, end)) = sentence_end_at(text, pos, text.len())? {
+            matches.push((pos, end));
+        }
+        pos += 1;
+    }
+    // Emacs's `re-search-backward` twice: the nearest match before point, and
+    // when that one straddles point, the one before it.
+    let Some(&(first_pos, first_end)) = matches.last() else {
+        return Ok(floor);
+    };
+    if first_end < point {
+        return Ok(first_end);
+    }
+    match matches.iter().rev().find(|(pos, _)| *pos < first_pos) {
+        Some(&(_, end)) => Ok(end),
+        None => Ok(floor),
+    }
+}
+
+/// Emacs `end-of-paragraph-text`: the end of the current paragraph's text,
+/// before any trailing newline.
+fn end_of_paragraph_text(text: &Text, start: u64) -> Result<u64, ReadError> {
+    let mut opoint = start;
+    loop {
+        let mut pos = forward_paragraph(text, opoint)?;
+        if pos > 0 && text.byte_at(pos - 1)? == b'\n' {
+            pos -= 1;
+        }
+        if pos <= opoint {
+            let next = (pos + 1).min(text.len());
+            if next < text.len() {
+                opoint = next;
+                continue;
+            }
+            return Ok(next);
+        }
+        return Ok(pos);
+    }
+}
+
+/// Emacs `start-of-paragraph-text`: the first non-blank position of the
+/// current paragraph.
+fn start_of_paragraph_text(text: &Text, start: u64) -> Result<u64, ReadError> {
+    let mut opoint = start;
+    loop {
+        let npoint = backward_paragraph(text, opoint)?;
+        let mut pos = npoint;
+        while pos < text.len() && matches!(text.byte_at(pos)?, b' ' | b'\t' | b'\n') {
+            pos += 1;
+        }
+        if pos >= opoint && npoint < opoint && npoint > 0 {
+            opoint = npoint;
+            continue;
+        }
+        return Ok(pos);
+    }
+}
+
+/// Emacs `forward-paragraph` by one: to the start of the blank-line run that
+/// follows the current paragraph, or the buffer end.
+fn forward_paragraph(text: &Text, pos: u64) -> Result<u64, ReadError> {
+    let mut line = line_start(text, pos)?;
+    while line < text.len() && line_is_blank(text, line)? {
+        line = next_line_start(text, line)?;
+    }
+    while line < text.len() && !line_is_blank(text, line)? {
+        line = next_line_start(text, line)?;
+    }
+    Ok(line)
+}
+
+/// Emacs `forward-paragraph` with a negative argument: to the start of the
+/// current paragraph's block, skipping the blank lines above it.
+fn backward_paragraph(text: &Text, pos: u64) -> Result<u64, ReadError> {
+    let mut line = line_start(text, pos)?;
+    while line > 0 {
+        let previous = line_start(text, line - 1)?;
+        if line_is_blank(text, previous)? {
+            line = previous;
+        } else {
+            break;
+        }
+    }
+    while line > 0 {
+        let previous = line_start(text, line - 1)?;
+        if line_is_blank(text, previous)? {
+            break;
+        }
+        line = previous;
+    }
+    Ok(line)
+}
+
+/// The start of the line after the one containing `line`, or the buffer end.
+fn next_line_start(text: &Text, line: u64) -> Result<u64, ReadError> {
+    Ok(match text.find_newline_forward(line)? {
+        Some(newline) => newline + 1,
+        None => text.len(),
+    })
+}
+
+/// Whether the line starting at `line` holds only spaces and tabs, matching
+/// Emacs `paragraph-separate` `"[ \t]*$"`.
+pub(crate) fn line_is_blank(text: &Text, line: u64) -> Result<bool, ReadError> {
+    let end = line_end(text, line)?;
+    for chunk in text.chunks(line..end) {
+        if !chunk?
+            .bytes()
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `M-g g` / `M-g M-g`: Emacs `goto-line`. A bare command reads the line
+/// number in the minibuffer; a numeric prefix argument goes there directly.
+pub(super) fn goto_line(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    match ctx.prefix_arg {
+        PrefixArg::Numeric(line) => {
+            let point = ctx.point();
+            super::mark::push_mark(ctx, point, true, false);
+            let text = ctx.buffer().text.clone();
+            ctx.set_point(line_number_position(&text, line)?);
+            Ok(())
+        }
+        _ => {
+            let client = ctx.client;
+            ctx.editor().read_goto_line(client);
+            Ok(())
+        }
+    }
+}
+
+/// The position of the start of line `line` (1-based), as Emacs `goto-line`
+/// reaches it: `(goto-char (point-min)) (forward-line (1- line))`.
+pub(crate) fn line_number_position(text: &Text, line: i64) -> Result<u64, ReadError> {
+    let steps = line.saturating_sub(1);
+    Ok(forward_line(text, 0, steps)?.1)
+}
+
 /// Emacs `scan_words`: the position after COUNT words (before, when
 /// negative), or `None` when the buffer edge comes first.
 pub(crate) fn scan_words(text: &Text, from: u64, count: i64) -> Result<Option<u64>, ReadError> {

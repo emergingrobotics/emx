@@ -1,0 +1,155 @@
+{"name": "forward-sentence-two-spaces", "text": "|One two.  Three four.", "keys": "M-e", "tier": 1}
+{"name": "forward-sentence-second", "text": "One two.|  Three four.", "keys": "M-e", "tier": 1}
+{"name": "forward-sentence-newline", "text": "|One two.\nThree.", "keys": "M-e", "tier": 1}
+{"name": "forward-sentence-none", "text": "|hello world", "keys": "M-e", "tier": 1}
+{"name": "forward-sentence-twice", "text": "|A b.  C d.  E f.", "keys": "M-e M-e", "tier": 1}
+{"name": "forward-sentence-count", "text": "|A b.  C d.  E f.", "keys": "C-u 2 M-e", "tier": 1}
+{"name": "forward-sentence-at-end", "text": "One two.|", "keys": "M-e", "tier": 1}
+{"name": "forward-sentence-closer", "text": "|He said \"hi.\"  Bye.", "keys": "M-e", "tier": 1}
+{"name": "backward-sentence-end", "text": "One two.  Three four.|", "keys": "M-a", "tier": 1}
+{"name": "backward-sentence-mid", "text": "One two.  Three fo|ur.", "keys": "M-a", "tier": 1}
+{"name": "backward-sentence-twice", "text": "A b.  C d.  E f.|", "keys": "M-a M-a", "tier": 1}
+{"name": "backward-sentence-start", "text": "|One two.  Three.", "keys": "M-a", "tier": 1}
+{"name": "backward-sentence-first", "text": "One tw|o.  Three.", "keys": "M-a", "tier": 1}
+{"name": "forward-sentence-neg", "text": "One two.  Three fo|ur.", "keys": "M-- M-e", "tier": 1}
+{"name": "backward-sentence-neg", "text": "|One two.  Three.", "keys": "M-- M-a", "tier": 1}
+{"name": "kill-word-basic", "text": "|foo bar", "keys": "M-d", "tier": 1}
+{"name": "kill-word-mid", "text": "fo|o bar", "keys": "M-d", "tier": 1}
+{"name": "kill-word-count", "text": "|foo bar baz", "keys": "C-u 2 M-d", "tier": 1}
+{"name": "kill-word-space", "text": "|   foo bar", "keys": "M-d", "tier": 1}
+{"name": "kill-word-end", "text": "foo bar|", "keys": "M-d", "tier": 1}
+{"name": "kill-word-neg", "text": "foo bar|", "keys": "M-- M-d", "tier": 1}
+{"name": "backward-kill-word-basic", "text": "foo bar|", "keys": "M-DEL", "tier": 1}
+{"name": "backward-kill-word-count", "text": "foo bar baz|", "keys": "C-u 2 M-DEL", "tier": 1}
+{"name": "backward-kill-word-mid", "text": "foo ba|r", "keys": "M-DEL", "tier": 1}
+{"name": "backward-kill-word-start", "text": "|foo bar", "keys": "M-DEL", "tier": 1}
+{"name": "backward-kill-word-space", "text": "foo bar   |", "keys": "M-DEL", "tier": 1}
+{"name": "kill-word-then-append", "text": "|foo bar baz", "keys": "M-d M-d", "tier": 1}
+{"name": "upcase-word-basic", "text": "|hello world", "keys": "M-u", "tier": 1}
+{"name": "upcase-word-count", "text": "|hello world foo", "keys": "C-u 2 M-u", "tier": 1}
+{"name": "upcase-word-mid", "text": "he|llo world", "keys": "M-u", "tier": 1}
+{"name": "upcase-word-neg", "text": "hello wo|rld", "keys": "M-- M-u", "tier": 1}
+{"name": "upcase-word-space", "text": "|   hello", "keys": "M-u", "tier": 1}
+{"name": "downcase-word-basic", "text": "|HELLO WORLD", "keys": "M-l", "tier": 1}
+{"name": "downcase-word-count", "text": "|HELLO WORLD FOO", "keys": "C-u 2 M-l", "tier": 1}
+{"name": "downcase-word-mid", "text": "HE|LLO", "keys": "M-l", "tier": 1}
+{"name": "downcase-word-neg", "text": "HELLO WO|RLD", "keys": "M-- M-l", "tier": 1}
+{"name": "capitalize-word-basic", "text": "|hello world", "keys": "M-c", "tier": 1}
+{"name": "capitalize-word-count", "text": "|hello world foo", "keys": "C-u 2 M-c", "tier": 1}
+{"name": "capitalize-word-upper", "text": "|HELLO world", "keys": "M-c", "tier": 1}
+{"name": "capitalize-word-mid", "text": "he|llo world", "keys": "M-c", "tier": 1}
+{"name": "capitalize-word-mixed", "text": "|hELLo", "keys": "M-c", "tier": 1}
+{"name": "upcase-word-at-end", "text": "hello|", "keys": "M-u", "tier": 1}
+{"name": "transpose-chars-mid", "text": "ab|cd", "keys": "C-t", "tier": 1}
+{"name": "transpose-chars-eol", "text": "abc|", "keys": "C-t", "tier": 1}
+{"name": "transpose-chars-bol", "text": "|abc", "keys": "C-t", "tier": 1}
+{"name": "transpose-chars-twice", "text": "a|bcd", "keys": "C-t C-t", "tier": 1}
+{"name": "transpose-chars-second", "text": "ab|cd", "keys": "C-t C-t", "tier": 1}
+{"name": "transpose-chars-newline", "text": "ab|\ncd", "keys": "C-t", "tier": 1}
+{"name": "transpose-words-basic", "text": "foo| bar", "keys": "M-t", "tier": 1}
+{"name": "transpose-words-mid", "text": "foo ba|r baz", "keys": "M-t", "tier": 1}
+{"name": "transpose-words-start", "text": "|foo bar", "keys": "M-t", "tier": 1}
+{"name": "transpose-words-punct", "text": "foo, |bar", "keys": "M-t", "tier": 1}
+{"name": "transpose-words-end", "text": "foo bar|", "keys": "M-t", "tier": 1}
+{"name": "open-line-basic", "text": "ab|cd", "keys": "C-o", "tier": 1}
+{"name": "open-line-count", "text": "ab|cd", "keys": "C-u 3 C-o", "tier": 1}
+{"name": "open-line-bol", "text": "|abc", "keys": "C-o", "tier": 1}
+{"name": "open-line-eol", "text": "abc|", "keys": "C-o", "tier": 1}
+{"name": "open-line-empty", "text": "|", "keys": "C-o", "tier": 1}
+{"name": "open-line-then-type", "text": "ab|cd", "keys": "C-o X", "tier": 1}
+{"name": "delete-blank-lines-many", "text": "a\n\n\n|\n\nb", "keys": "C-x C-o", "tier": 1}
+{"name": "delete-blank-lines-single", "text": "a\n|\nb", "keys": "C-x C-o", "tier": 1}
+{"name": "delete-blank-lines-nonblank", "text": "a|bc\n\n\nd", "keys": "C-x C-o", "tier": 1}
+{"name": "delete-blank-lines-nonblank-noblank", "text": "a|bc\ndef", "keys": "C-x C-o", "tier": 1}
+{"name": "delete-blank-lines-top", "text": "|\n\n\nb", "keys": "C-x C-o", "tier": 1}
+{"name": "delete-blank-lines-eob", "text": "a\n|\n", "keys": "C-x C-o", "tier": 1}
+{"name": "delete-blank-lines-first-of-run", "text": "a\n|\n\n\nb", "keys": "C-x C-o", "tier": 1}
+{"name": "mark-whole-buffer", "text": "ab|cd", "keys": "C-x h", "tier": 1}
+{"name": "mark-whole-buffer-empty", "text": "|", "keys": "C-x h", "tier": 1}
+{"name": "mark-whole-buffer-start", "text": "|abcd", "keys": "C-x h", "tier": 1}
+{"name": "mark-whole-then-upcase", "text": "|abc", "keys": "C-x h M-u", "tier": 1}
+{"name": "mark-ring-pop", "text": "a^bc|de", "keys": "C-u C-SPC", "tier": 1}
+{"name": "set-mark-then-pop", "text": "|abcde", "keys": "C-SPC C-f C-f C-u C-SPC", "tier": 1}
+{"name": "goto-line-3", "text": "|l1\nl2\nl3\nl4", "keys": "M-g g 3 RET", "tier": 1}
+{"name": "goto-line-1", "text": "l1\nl2\nl|3", "keys": "M-g g 1 RET", "tier": 1}
+{"name": "goto-line-mg", "text": "|l1\nl2\nl3\nl4", "keys": "M-g M-g 2 RET", "tier": 1}
+{"name": "goto-line-beyond", "text": "|l1\nl2\nl3", "keys": "M-g g 9 RET", "tier": 1}
+{"name": "goto-line-then-upcase", "text": "|abc\ndef\nghi", "keys": "M-g g 2 RET M-u", "tier": 1}
+{"name": "goto-line-first", "text": "|abc\ndef", "keys": "M-g g 2 RET", "tier": 1}
+{"name": "copy-to-register-noarg", "text": "^hel|lo", "keys": "C-x r s a", "tier": 1}
+{"name": "copy-to-register-delete", "text": "^hel|lo", "keys": "C-u C-x r s a", "tier": 1}
+{"name": "copy-insert-register", "text": "^ab|cXY", "keys": "C-x r s a M-> C-x r i a", "tier": 1}
+{"name": "copy-insert-register-arg", "text": "^ab|cXY", "keys": "C-x r s a M-> C-u C-x r i a", "tier": 1}
+{"name": "copy-delete-insert", "text": "^ab|cd", "keys": "C-u C-x r s a C-e C-x r i a", "tier": 1}
+{"name": "point-jump-register", "text": "|hello world", "keys": "C-x r SPC a M-> C-x r j a", "tier": 1}
+{"name": "point-jump-after-edit", "text": "|hello", "keys": "C-x r SPC a C-e X C-x r j a", "tier": 1}
+{"name": "insert-register-empty", "text": "a^b|c", "keys": "C-x r s a M-> C-x r i a", "tier": 1}
+{"name": "kill-rectangle-basic", "text": "a^bcd\nefgh\nij|kl", "keys": "C-x r k", "tier": 1}
+{"name": "yank-rectangle-basic", "text": "a^bcd\nefgh\nij|kl\nmnop", "keys": "C-x r k M-> C-x r y", "tier": 1}
+{"name": "string-rectangle-basic", "text": "a^bcd\nefgh\nij|kl", "keys": "C-x r t X X RET", "tier": 1}
+{"name": "kill-rectangle-wide", "text": "^abcd\nefgh\nijk|l", "keys": "C-x r k", "tier": 1}
+{"name": "string-rectangle-longer", "text": "a^bc\ndef\nij|k", "keys": "C-x r t Z Z Z RET", "tier": 1}
+{"name": "kill-rectangle-one-line", "text": "ab^cd|ef", "keys": "C-x r k", "tier": 1}
+{"name": "yank-rectangle-inline", "text": "^ab\ncd|\nXYZW", "keys": "C-x r k C-n C-n C-f C-x r y", "tier": 1}
+{"name": "indent-tab-relative", "text": "  foo\nb|ar", "keys": "TAB", "tier": 1}
+{"name": "indent-tab-empty-prev", "text": "  foo bar\nbaz|", "keys": "TAB", "tier": 1}
+{"name": "indent-tab-no-prev", "text": "|hello", "keys": "TAB", "tier": 1}
+{"name": "indent-tab-first-line", "text": "|foo", "keys": "TAB", "tier": 1}
+{"name": "indent-tab-tabstop", "text": "foo\n|bar", "keys": "TAB", "tier": 1}
+{"name": "dabbrev-basic", "text": "hello hel|", "keys": "M-/", "tier": 1}
+{"name": "dabbrev-prefix", "text": "foobar foo foob|", "keys": "M-/", "tier": 1}
+{"name": "dabbrev-forward", "text": "te| testing", "keys": "M-/", "tier": 1}
+{"name": "dabbrev-none", "text": "hello xyz|", "keys": "M-/", "tier": 1}
+{"name": "dabbrev-backward-nearest", "text": "apple ant ap|", "keys": "M-/", "tier": 1}
+{"name": "macro-define-only", "text": "|abc", "keys": "C-x ( X Y C-x )", "tier": 1}
+{"name": "macro-define-move", "text": "|abc", "keys": "C-x ( C-f C-f C-x )", "tier": 1}
+{"name": "macro-abort-define", "text": "|abc", "keys": "C-x ( X Y C-g", "tier": 1}
+{"name": "macro-call-no-macro", "text": "|abc", "keys": "C-x e", "tier": 1}
+{"name": "macro-end-not-defining", "text": "|abc", "keys": "C-x )", "tier": 1}
+{"name": "macro-abort-restores-input", "text": "a|b", "keys": "C-x ( C-f X C-g", "tier": 1}
+{"name": "keyboard-quit-mark", "text": "|abcde", "keys": "C-SPC C-f C-f C-g", "tier": 1}
+{"name": "keyboard-quit-prefix", "text": "|abc", "keys": "C-u 5 C-g", "tier": 1}
+{"name": "keyboard-quit-plain", "text": "ab|c", "keys": "C-g", "tier": 1}
+{"name": "upcase-word-unicode", "text": "|café bar", "keys": "M-u", "tier": 1}
+{"name": "capitalize-word-leading-space", "text": "|  foo bar", "keys": "M-c", "tier": 1}
+{"name": "transpose-words-count", "text": "a| b c", "keys": "C-u 2 M-t", "tier": 1}
+{"name": "kill-word-unicode", "text": "|café bar", "keys": "M-d", "tier": 1}
+{"name": "forward-sentence-question", "text": "|Really?  Yes.", "keys": "M-e", "tier": 1}
+{"name": "forward-sentence-bang", "text": "|Wow!  Nice.", "keys": "M-e", "tier": 1}
+{"name": "open-line-negative", "text": "ab|cd", "keys": "M-- C-o", "tier": 1}
+{"name": "copy-register-whole-buffer", "text": "|abc", "keys": "C-x h C-x r s a C-x r i a", "tier": 1}
+{"name": "delete-blank-lines-only-blank", "text": "|\n", "keys": "C-x C-o", "tier": 1}
+{"name": "delete-blank-lines-trailing", "text": "abc\n\n|\n", "keys": "C-x C-o", "tier": 1}
+{"name": "transpose-chars-count", "text": "ab|cde", "keys": "C-u 2 C-t", "tier": 1}
+{"name": "backward-kill-word-punct", "text": "foo-bar|", "keys": "M-DEL", "tier": 1}
+{"name": "kill-word-punct", "text": "|foo-bar baz", "keys": "M-d", "tier": 1}
+{"name": "upcase-two-words", "text": "|one two three", "keys": "M-u M-u", "tier": 1}
+{"name": "capitalize-sentence", "text": "|the quick brown", "keys": "M-c M-c M-c", "tier": 1}
+{"name": "mark-ring-set-pop-twice", "text": "|abcdef", "keys": "C-SPC C-f C-f C-SPC C-f C-u C-SPC C-u C-SPC", "tier": 1}
+{"name": "point-register-two", "text": "|abcdef", "keys": "C-x r SPC a C-f C-f C-x r SPC b M-> C-x r j a", "tier": 1}
+{"name": "insert-register-twice", "text": "^X|Y", "keys": "C-x r s a M-> C-x r i a C-x r i a", "tier": 1}
+{"name": "string-rectangle-then-move", "text": "a^bcd\nefgh\nij|kl", "keys": "C-x r t Q RET C-a", "tier": 1}
+{"name": "kill-yank-rectangle-same", "text": "a^bc\ndef\ngh|i", "keys": "C-x r k C-x r y", "tier": 1}
+{"name": "forward-sentence-multi-para", "text": "|One.  Two.\n\nThree.  Four.", "keys": "M-e M-e M-e", "tier": 1}
+{"name": "backward-sentence-multi-para", "text": "One.  Two.\n\nThree.  Four.|", "keys": "M-a M-a", "tier": 1}
+{"name": "dabbrev-two-candidates-cycle", "text": "foobar foobaz foo|", "keys": "M-/ M-/", "tier": 1}
+{"name": "transpose-words-newline", "text": "foo|\nbar", "keys": "M-t", "tier": 1}
+{"name": "capitalize-word-neg", "text": "hello wo|rld", "keys": "M-- M-c", "tier": 1}
+{"name": "downcase-word-at-end", "text": "HELLO|", "keys": "M-l", "tier": 1}
+{"name": "kill-word-multibyte-mid", "text": "caf|é test", "keys": "M-d", "tier": 1}
+{"name": "open-line-middle-line", "text": "line one\nli|ne two\nline three", "keys": "C-o", "tier": 1}
+{"name": "indent-tab-deeper", "text": "    deep\nx|", "keys": "TAB", "tier": 1}
+{"name": "mark-whole-buffer-multiline", "text": "ab\ncd|\nef", "keys": "C-x h", "tier": 1}
+{"name": "goto-line-zero", "text": "|a\nb\nc", "keys": "M-g g 0 RET", "tier": 1}
+{"name": "copy-to-register-reversed", "text": "hel^lo|", "keys": "C-x r s a", "tier": 1}
+{"name": "transpose-chars-after-insert", "text": "|ab", "keys": "C-f C-f C-t", "tier": 1}
+{"name": "string-rectangle-replace-wider", "text": "a^b\ncd\ne|f", "keys": "C-x r t Q RET", "tier": 1}
+{"name": "yank-rectangle-into-text", "text": "^ab\ncd|", "keys": "C-x r k M-> C-x r y", "tier": 1}
+{"name": "transpose-chars-second-mid", "text": "a|bcd", "keys": "C-f C-t", "tier": 1}
+{"name": "upcase-downcase", "text": "|hello world", "keys": "M-u M-l", "tier": 1}
+{"name": "kill-ring-save-register", "text": "^abc|def", "keys": "C-x r s a C-x r i a", "tier": 1}
+{"name": "backward-sentence-from-mid-second", "text": "First one.  Second o|ne.", "keys": "M-a", "tier": 1}
+{"name": "forward-sentence-three", "text": "|A.  B.  C.  D.", "keys": "C-u 3 M-e", "tier": 1}
+{"name": "open-line-count-two", "text": "x|y", "keys": "C-u 2 C-o", "tier": 1}
+{"name": "capitalize-already", "text": "|Hello World", "keys": "M-c M-c", "tier": 1}
+{"name": "goto-line-last", "text": "|one\ntwo\nthree", "keys": "M-g g 3 RET", "tier": 1}

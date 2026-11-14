@@ -1,20 +1,27 @@
+mod dabbrev;
 mod edit;
 mod files;
 mod kill;
+mod r#macro;
 mod mark;
 mod misc;
 mod r#move;
 mod occur;
+mod rect;
+mod register;
 mod replace;
 mod search;
 mod window;
 
+pub(crate) use dabbrev::DabbrevState;
 pub(crate) use kill::{xterm_paste, yank_from_kill_ring};
 pub(crate) use mark::push_mark;
 pub(crate) use misc::RecenterPosition;
 pub(crate) use r#move::{
-    char_after, char_before, forward_line, is_word, line_end, line_start, scan_words,
+    char_after, char_before, forward_line, is_word, line_end, line_number_position, line_start,
+    scan_words,
 };
+pub(crate) use rect::apply_string_rectangle;
 pub(crate) use search::isearch_command;
 
 use emx_text::ReadError;
@@ -394,6 +401,102 @@ static COMMANDS: &[CommandSpec] = &[
         name: "previous-error-no-select",
         run: occur::previous_error_no_select,
     },
+    CommandSpec {
+        name: "forward-sentence",
+        run: r#move::forward_sentence,
+    },
+    CommandSpec {
+        name: "backward-sentence",
+        run: r#move::backward_sentence,
+    },
+    CommandSpec {
+        name: "goto-line",
+        run: r#move::goto_line,
+    },
+    CommandSpec {
+        name: "backward-kill-word",
+        run: kill::backward_kill_word,
+    },
+    CommandSpec {
+        name: "upcase-word",
+        run: edit::upcase_word,
+    },
+    CommandSpec {
+        name: "downcase-word",
+        run: edit::downcase_word,
+    },
+    CommandSpec {
+        name: "capitalize-word",
+        run: edit::capitalize_word,
+    },
+    CommandSpec {
+        name: "transpose-chars",
+        run: edit::transpose_chars,
+    },
+    CommandSpec {
+        name: "transpose-words",
+        run: edit::transpose_words,
+    },
+    CommandSpec {
+        name: "open-line",
+        run: edit::open_line,
+    },
+    CommandSpec {
+        name: "delete-blank-lines",
+        run: edit::delete_blank_lines,
+    },
+    CommandSpec {
+        name: "indent-for-tab-command",
+        run: edit::indent_for_tab_command,
+    },
+    CommandSpec {
+        name: "mark-whole-buffer",
+        run: mark::mark_whole_buffer,
+    },
+    CommandSpec {
+        name: "dabbrev-expand",
+        run: dabbrev::dabbrev_expand,
+    },
+    CommandSpec {
+        name: "copy-to-register",
+        run: register::copy_to_register,
+    },
+    CommandSpec {
+        name: "insert-register",
+        run: register::insert_register,
+    },
+    CommandSpec {
+        name: "point-to-register",
+        run: register::point_to_register,
+    },
+    CommandSpec {
+        name: "jump-to-register",
+        run: register::jump_to_register,
+    },
+    CommandSpec {
+        name: "kill-rectangle",
+        run: rect::kill_rectangle,
+    },
+    CommandSpec {
+        name: "yank-rectangle",
+        run: rect::yank_rectangle,
+    },
+    CommandSpec {
+        name: "string-rectangle",
+        run: rect::string_rectangle,
+    },
+    CommandSpec {
+        name: "kmacro-start-macro",
+        run: r#macro::kmacro_start_macro,
+    },
+    CommandSpec {
+        name: "kmacro-end-macro",
+        run: r#macro::kmacro_end_macro,
+    },
+    CommandSpec {
+        name: "kmacro-end-and-call-macro",
+        run: r#macro::kmacro_end_and_call_macro,
+    },
 ];
 
 pub fn lookup(name: &str) -> Option<&'static CommandSpec> {
@@ -423,6 +526,9 @@ pub struct CommandContext<'a> {
     /// Emacs `deactivate-mark`: the command loop deactivates the mark after
     /// the command. Buffer changes request it too.
     pub(crate) deactivate_mark: bool,
+    /// A keyboard macro the command asked to run once it has finished, with
+    /// the repeat count (`kmacro-end-and-call-macro`).
+    pub(crate) macro_call: Option<i64>,
 }
 
 impl<'a> CommandContext<'a> {
@@ -448,6 +554,7 @@ impl<'a> CommandContext<'a> {
             next_prefix_arg: PrefixArg::None,
             keep_prefix_state: false,
             deactivate_mark: false,
+            macro_call: None,
         }
     }
 
@@ -534,6 +641,26 @@ impl<'a> CommandContext<'a> {
         buffer
             .delete_with_point(range, point, recorder)
             .map_err(|error| read_only_error(buffer, error))
+    }
+
+    /// Emacs `replace_range`: `range` becomes `bytes` as one change, with
+    /// `point` the Emacs PT that decides where undo leaves point.
+    pub fn replace_range(
+        &mut self,
+        range: Range<u64>,
+        bytes: &[u8],
+        point: u64,
+    ) -> Result<(), CommandError> {
+        let (buffer, recorder) = self.buffer_and_recorder();
+        buffer
+            .replace_range(range, bytes, point, recorder)
+            .map_err(|error| read_only_error(buffer, error))
+    }
+
+    /// Emacs `kmacro-end-and-call-macro`: run the last keyboard macro
+    /// `count` times once this command has finished.
+    pub(crate) fn request_macro_call(&mut self, count: i64) {
+        self.macro_call = Some(count);
     }
 
     /// Emacs `barf-if-buffer-read-only`.

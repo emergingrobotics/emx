@@ -138,6 +138,14 @@ pub(crate) enum Purpose {
         regexp: String,
         default: Option<Vec<u8>>,
     },
+    /// `goto-line`: the line number to go to.
+    GotoLine,
+    /// `string-rectangle`: the string to put on each line of the rectangle
+    /// between `start` and `end`.
+    StringRectangle {
+        start: u64,
+        end: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -743,6 +751,14 @@ impl Editor {
                 } else {
                     Err(user_error("Recover-file canceled"))
                 }
+            }
+            (Purpose::GotoLine, Answer::Line(input)) => {
+                self.goto_line_answered(client, input);
+                Ok(())
+            }
+            (Purpose::StringRectangle { start, end }, Answer::Line(string)) => {
+                self.string_rectangle_answered(client, start, end, string);
+                Ok(())
             }
             (purpose, answer) => {
                 unreachable!("{purpose:?} is asked in a mode that answers {answer:?}")

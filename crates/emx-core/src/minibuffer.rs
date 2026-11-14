@@ -60,6 +60,10 @@ pub(crate) enum HistoryKind {
     QueryReplace,
     /// `regexp-history`, which `occur` reads with.
     Regexp,
+    /// The line number `goto-line` reads.
+    GotoLine,
+    /// The string `string-rectangle` reads.
+    StringRectangle,
 }
 
 /// Every history, newest entry first. Shared by all clients, as one Emacs

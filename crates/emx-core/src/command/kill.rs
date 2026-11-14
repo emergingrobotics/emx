@@ -102,6 +102,14 @@ pub(super) fn kill_word(ctx: &mut CommandContext) -> Result<(), CommandError> {
     kill_text(ctx, point, end, point)
 }
 
+/// `M-DEL`: Emacs `backward-kill-word`, which kills back over ARG words.
+pub(super) fn backward_kill_word(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let count = ctx.prefix_arg.numeric_value();
+    let point = ctx.point();
+    let target = word_target(ctx, count.saturating_neg())?;
+    kill_text(ctx, point, target, point.min(target))
+}
+
 /// Emacs `kill-forward-chars`, the killing half of `delete-char`: kills
 /// `count` characters after point (before it when negative). Running past
 /// the buffer is Emacs's `args-out-of-range`, which names the buffer and

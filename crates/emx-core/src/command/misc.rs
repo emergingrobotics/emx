@@ -68,13 +68,15 @@ pub(super) fn digit_argument(ctx: &mut CommandContext) -> Result<(), CommandErro
     Ok(())
 }
 
-/// Emacs `keyboard-quit`: deactivate the mark, then signal `quit`.
+/// Emacs `keyboard-quit`: deactivate the mark, abort any keyboard macro in
+/// progress, then signal `quit`.
 pub(super) fn keyboard_quit(ctx: &mut CommandContext) -> Result<(), CommandError> {
     ctx.buffer_mut().mark_active = false;
     // An occur still searching on a worker is quit too, as Emacs's
     // synchronous occur would be.
     let client = ctx.client;
     ctx.editor().occur_cancel(client);
+    ctx.editor().abort_keyboard_macro(client);
     Err(CommandError::Quit)
 }
 

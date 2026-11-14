@@ -27,7 +27,7 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 69] = [
+const DEFAULT_BINDINGS: [(&str, &str); 94] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
@@ -97,6 +97,31 @@ const DEFAULT_BINDINGS: [(&str, &str); 69] = [
     ("M--", NEGATIVE_ARGUMENT),
     ("C--", NEGATIVE_ARGUMENT),
     ("C-M--", NEGATIVE_ARGUMENT),
+    ("M-a", "backward-sentence"),
+    ("M-e", "forward-sentence"),
+    ("M-DEL", "backward-kill-word"),
+    ("M-u", "upcase-word"),
+    ("M-l", "downcase-word"),
+    ("M-c", "capitalize-word"),
+    ("C-t", "transpose-chars"),
+    ("M-t", "transpose-words"),
+    ("C-o", "open-line"),
+    ("TAB", "indent-for-tab-command"),
+    ("M-/", "dabbrev-expand"),
+    ("C-x C-o", "delete-blank-lines"),
+    ("C-x h", "mark-whole-buffer"),
+    ("M-g g", "goto-line"),
+    ("M-g M-g", "goto-line"),
+    ("C-x r s", "copy-to-register"),
+    ("C-x r i", "insert-register"),
+    ("C-x r SPC", "point-to-register"),
+    ("C-x r j", "jump-to-register"),
+    ("C-x r k", "kill-rectangle"),
+    ("C-x r y", "yank-rectangle"),
+    ("C-x r t", "string-rectangle"),
+    ("C-x (", "kmacro-start-macro"),
+    ("C-x )", "kmacro-end-macro"),
+    ("C-x e", "kmacro-end-and-call-macro"),
 ];
 const BUFFER_MENU_BINDINGS: [(&str, &str); 1] = [("RET", "Buffer-menu-this-window")];
 /// `occur-mode-map`.
@@ -457,7 +482,10 @@ mod tests {
             keymap.lookup(&keys("ESC 7")),
             Lookup::Command(DIGIT_ARGUMENT)
         );
-        assert_eq!(keymap.lookup(&keys("M-a")), Lookup::Undefined);
+        assert_eq!(
+            keymap.lookup(&keys("M-a")),
+            Lookup::Command("backward-sentence")
+        );
         assert_eq!(keymap.lookup(&keys("C-x ESC")), Lookup::Undefined);
     }
 

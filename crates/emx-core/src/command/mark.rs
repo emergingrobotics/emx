@@ -36,6 +36,17 @@ pub(super) fn set_mark_command(ctx: &mut CommandContext) -> Result<(), CommandEr
     }
 }
 
+/// `C-x h`: Emacs `mark-whole-buffer`. Point to the start, an active mark at
+/// the end.
+pub(super) fn mark_whole_buffer(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let point = ctx.point();
+    push_mark(ctx, point, true, false);
+    let end = ctx.buffer().text.len();
+    push_mark(ctx, end, true, true);
+    ctx.set_point(0);
+    Ok(())
+}
+
 /// Emacs `exchange-point-and-mark`: the mark ends up active, unless a
 /// prefix argument was given.
 pub(super) fn exchange_point_and_mark(ctx: &mut CommandContext) -> Result<(), CommandError> {
