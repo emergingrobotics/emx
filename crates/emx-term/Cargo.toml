@@ -7,3 +7,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+crossterm = { version = "0.29", default-features = false }
+emx-types = { path = "../emx-types" }
+rustix = { workspace = true, features = ["event"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
