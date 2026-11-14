@@ -161,10 +161,7 @@ fn work(
             }
         };
         journal.wait_for(queued.after_journal);
-        #[cfg(debug_assertions)]
-        if panic_on_save && matches!(queued.job, Job::Save { .. }) {
-            panic!("{WORKER_PANIC_ENV} is set: an I/O thread panics on a save");
-        }
+        panic_seam(panic_on_save, &queued.job);
         if let Some(event) = run(queued.job, config) {
             deliver(event);
         }
@@ -179,6 +176,16 @@ fn work(
 fn worker_panic_requested() -> bool {
     std::env::var_os(WORKER_PANIC_ENV).is_some()
 }
+
+#[cfg(debug_assertions)]
+fn panic_seam(panic_on_save: bool, job: &Job) {
+    if panic_on_save && matches!(job, Job::Save { .. }) {
+        panic!("{WORKER_PANIC_ENV} is set: an I/O thread panics on a save");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn panic_seam(_panic_on_save: bool, _job: &Job) {}
 
 /// Release builds carry no test seam.
 #[cfg(not(debug_assertions))]

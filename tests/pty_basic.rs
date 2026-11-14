@@ -25,6 +25,9 @@ const POLL: Duration = Duration::from_millis(20);
 const UNSUPPORTED: &str = "emx: this terminal does not support the Kitty keyboard protocol";
 const CONNECTION_LOST: &str = "emx: server connection lost";
 const RACERS: usize = 4;
+const STARTUP_DELAY_MS: &str = "1500";
+/// Long enough for the harness to answer the keyboard protocol probe.
+const PROBE_ANSWERED: Duration = Duration::from_millis(300);
 
 fn wait_until(what: &str, done: impl Fn() -> bool) {
     let deadline = Instant::now() + WAIT;
@@ -616,4 +619,118 @@ fn unusable_frames_are_discarded_and_a_redraw_requested() {
     while let Ok(Some(message)) = reader.read_msg::<ClientMsg>() {
         assert_ne!(message, ClientMsg::Redraw, "one redraw per unusable run");
     }
+}
+
+fn terminate(pty: &Pty) {
+    let pid = rustix::process::Pid::from_raw(pty.pid() as i32).expect("a pid");
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("SIGTERM");
+}
+
+/// Waits until the program has set the terminal up and its probe was
+/// answered, so it is past `Terminal::enter`.
+fn wait_set_up(pty: &Pty) {
+    wait_until("the terminal to be set up", || {
+        find(&pty.raw_output(), PUSH_KITTY_FLAGS).is_some()
+    });
+    thread::sleep(PROBE_ANSWERED);
+}
+
+#[test]
+fn sigterm_during_a_slow_startup_restores_the_terminal() {
+    let env = TestEnv::new();
+    let _reaper = SessionReaper::new(&env);
+    env.file("f.txt", "text\n");
+    for args in [&["--no-server", "f.txt"][..], &["f.txt"][..]] {
+        let mut pty = Pty::spawn_with(
+            &env,
+            args,
+            Probe::Answer,
+            &[("EMX_TEST_STARTUP_DELAY_MS", STARTUP_DELAY_MS)],
+        );
+        wait_set_up(&pty);
+        terminate(&pty);
+        let status = pty.wait_exit();
+        assert!(status.signal().is_none(), "{args:?}: not killed: {status}");
+        assert_eq!(status.exit_code(), 1, "{args:?}: {status}");
+        assert_restored(&pty);
+    }
+    assert!(noserver_dirs(&env).is_empty(), "{:?}", noserver_dirs(&env));
+}
+
+#[test]
+fn sigterm_restores_an_attached_client() {
+    let env = TestEnv::new();
+    let _reaper = SessionReaper::new(&env);
+    env.file("f.txt", "text\n");
+    let mut pty = Pty::spawn(&env, &["f.txt"]);
+    pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    terminate(&pty);
+    let status = pty.wait_exit();
+    assert_eq!(status.exit_code(), 1, "{status}");
+    assert_restored(&pty);
+    assert!(
+        server_pid(&env.socket_path(), &env.work).is_some(),
+        "session kept"
+    );
+}
+
+#[test]
+fn noserver_diagnostics_go_to_the_log() {
+    let env = TestEnv::new();
+    let _reaper = SessionReaper::new(&env);
+    env.file("f.txt", "text\n");
+    let mut pty = Pty::spawn_with(
+        &env,
+        &["--no-server", "f.txt"],
+        Probe::Answer,
+        &[("EMX_TEST_DIAGNOSTIC", "1")],
+    );
+    pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    pty.type_text("x");
+    pty.wait_text("xtext");
+    let log = env.state_home.join("emx").join("noserver.log");
+    wait_until("the diagnostic in the log", || {
+        fs::read_to_string(&log).is_ok_and(|text| text.contains("EMX_TEST_DIAGNOSTIC"))
+    });
+    assert!(
+        !pty.raw_output_text().contains("EMX_TEST_DIAGNOSTIC"),
+        "{:?}",
+        pty.screen()
+    );
+    pty.keys("C-x C-s C-x C-c");
+    assert!(pty.wait_exit().success());
+}
+
+#[test]
+fn noserver_messages_after_exit_reach_the_terminal() {
+    let env = TestEnv::new();
+    let _reaper = SessionReaper::new(&env);
+    env.file("f.txt", "text\n");
+    let mut panicking = Pty::spawn_with(
+        &env,
+        &["--no-server", "f.txt"],
+        Probe::Answer,
+        &[("EMX_TEST_CLIENT_PANIC", "1")],
+    );
+    assert!(panicking.wait_exit().signal().is_some());
+    assert_restored(&panicking);
+    let output = panicking.raw_output_text();
+    assert!(output.contains("EMX_TEST_CLIENT_PANIC"), "{output:?}");
+    let mut failing = Pty::spawn_with(
+        &env,
+        &["--no-server", "f.txt"],
+        Probe::Answer,
+        &[("EMX_TEST_EDITOR_FAILURE", "1")],
+    );
+    let status = failing.wait_exit();
+    assert_eq!(status.exit_code(), 1, "{status}");
+    assert_restored(&failing);
+    let output = failing.raw_output_text();
+    assert!(
+        output.contains("EMX_TEST_EDITOR_FAILURE is set: the editor thread fails"),
+        "{output:?}"
+    );
+    let mut unsupported = Pty::spawn_with(&env, &["--no-server", "f.txt"], Probe::Silent, &[]);
+    assert_eq!(unsupported.wait_exit().exit_code(), 1);
+    assert!(unsupported.raw_output_text().contains(UNSUPPORTED));
 }

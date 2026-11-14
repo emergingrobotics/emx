@@ -24,8 +24,9 @@ help:
 	@echo "  publish-dry-run  Validate crate packaging for crates.io"
 	@echo "  publish          Publish crate to crates.io"
 
+# Warnings fail the release build too, as clippy -D warnings fails check.
 build:
-	cargo build --release -p emx
+	RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }-Dwarnings" cargo build --release -p emx
 	mkdir -p bin
 	cp target/release/emx bin/emx
 

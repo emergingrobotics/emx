@@ -302,6 +302,21 @@ pub struct Server {
     session: Session,
 }
 
+/// Debug builds print a diagnostic on stderr for every key when this is
+/// set, as the editor thread does when a journal or file operation fails.
+#[cfg(debug_assertions)]
+pub const DIAGNOSTIC_ENV: &str = "EMX_TEST_DIAGNOSTIC";
+
+#[cfg(debug_assertions)]
+fn diagnostic_seam(event: &Event) {
+    if matches!(event, Event::Key(..)) && std::env::var_os(DIAGNOSTIC_ENV).is_some() {
+        eprintln!("emx server: {DIAGNOSTIC_ENV}: a diagnostic for the key");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn diagnostic_seam(_event: &Event) {}
+
 /// Whether the server goes on after a `Server::step`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -471,6 +486,7 @@ impl Server {
                 });
             }
             Input::Client(client, event) => {
+                diagnostic_seam(&event);
                 if self.connections.contains_key(&client) {
                     self.prefetches.input();
                     self.handle(event);

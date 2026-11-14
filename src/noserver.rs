@@ -10,15 +10,18 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::panic;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, bail};
-use emx_core::journal::{JournalWriter, replay_dir};
-use emx_core::{Event, Session};
+use emx_core::journal::{JournalWriter, RecoveredBuffer, replay_dir};
+use emx_core::{Config, Event, Session};
 use emx_proto::ClientMsg;
 use rustix::fs::{CWD, FlockOperation, RenameFlags};
 
@@ -28,6 +31,9 @@ use crate::server::local::LocalLink;
 use crate::server::{self, Input, Server};
 
 const LOCK_NAME: &str = "lock";
+/// Where `--no-server` sessions write their diagnostics, in the state
+/// directory.
+pub const LOG_NAME: &str = "noserver.log";
 const JOURNAL_EXTENSION: &str = "jnl";
 /// A journal being replaced; the `.jnl` it would replace is the valid one.
 const REPLACEMENT_SUFFIX: &str = ".jnl.new";
@@ -39,6 +45,7 @@ const CLAIM_ATTEMPTS: usize = 16;
 
 pub fn run(files: &[OsString]) -> anyhow::Result<ExitCode> {
     let files = client::parse_file_arguments(files);
+    let terminal_stderr = divert_stderr()?;
     let (sender, events) = mpsc::channel();
     let mut started = None;
     let outcome = client::run_tui(
@@ -56,9 +63,64 @@ pub fn run(files: &[OsString]) -> anyhow::Result<ExitCode> {
         Some(editor) => editor.finish(),
         None => Ok(()),
     };
-    let code = outcome?;
+    rustix::stdio::dup2_stderr(&terminal_stderr).context("restoring stderr")?;
+    let code = outcome?.report();
     finished?;
     Ok(code)
+}
+
+/// The editor's diagnostics (a failed journal sync, an auto-save that
+/// could not be removed) are written to stderr, which here is the terminal
+/// the client draws on by diffs: a line printed there would stay on screen.
+/// For the session stderr goes to `noserver.log` in the state directory;
+/// the terminal's stderr is returned for the exit message, and a panic
+/// puts it back so its message reaches the user.
+fn divert_stderr() -> anyhow::Result<Arc<OwnedFd>> {
+    let state = paths::state_dir()?;
+    create_private_dir(&state)?;
+    let log_path = state.join(LOG_NAME);
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(&log_path)
+        .with_context(|| format!("opening the log {}", log_path.display()))?;
+    let terminal = Arc::new(
+        io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .context("keeping the terminal's stderr")?,
+    );
+    let panic_stderr = terminal.clone();
+    let previous = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let restored = rustix::stdio::dup2_stderr(&*panic_stderr);
+        previous(info);
+        if let Err(error) = restored {
+            eprintln!("emx: could not restore stderr for the panic message: {error}");
+        }
+    }));
+    rustix::stdio::dup2_stderr(&log).context("sending stderr to the log")?;
+    Ok(terminal)
+}
+
+fn create_private_dir(path: &Path) -> anyhow::Result<()> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(PRIVATE_DIRECTORY_MODE)
+        .create(path)
+        .with_context(|| format!("creating {}", path.display()))
+}
+
+/// A file or empty directory another process already removed is as good
+/// as removed.
+fn removed(result: io::Result<()>, path: &Path) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("removing {}", path.display())),
+    }
 }
 
 /// The editor thread and the journal directory it writes.
@@ -94,18 +156,20 @@ fn start(sender: &Sender<UiEvent>) -> anyhow::Result<(LocalClient, EditorThread)
     let recovered = replay_dir(&journals.path, &config)?;
     let (inputs, receiver) = mpsc::channel();
     let editor_inputs = inputs.clone();
+    let editor_failed = sender.clone();
     let thread = thread::Builder::new()
         .name("emx-editor".to_string())
         .spawn(move || {
-            let mut server = Server::new(
-                config,
-                Session::NoServer,
-                Box::new(writer),
-                editor_inputs,
-                receiver,
-            )?;
-            server.handle(Event::Recovered(recovered));
-            server.run()
+            let outcome = run_editor(config, writer, recovered, editor_inputs, receiver);
+            if outcome.is_err() {
+                // The client would otherwise wait for frames forever; the
+                // error itself is reported once the terminal is restored.
+                drop(editor_failed.send(UiEvent::ServerClosed {
+                    generation: 0,
+                    error: None,
+                }));
+            }
+            outcome
         })
         .context("starting the editor thread")?;
     let deliver_to = sender.clone();
@@ -135,6 +199,43 @@ fn start(sender: &Sender<UiEvent>) -> anyhow::Result<(LocalClient, EditorThread)
             journals,
         },
     ))
+}
+
+fn run_editor(
+    config: Config,
+    writer: JournalWriter,
+    recovered: Vec<RecoveredBuffer>,
+    inputs: Sender<Input>,
+    receiver: Receiver<Input>,
+) -> anyhow::Result<()> {
+    editor_failure_seam()?;
+    let mut server = Server::new(
+        config,
+        Session::NoServer,
+        Box::new(writer),
+        inputs,
+        receiver,
+    )?;
+    server.handle(Event::Recovered(recovered));
+    server.run()
+}
+
+/// Debug builds fail the editor thread at startup when this is set, so
+/// tests can check that the client does not wait for it forever.
+#[cfg(debug_assertions)]
+pub const EDITOR_FAILURE_ENV: &str = "EMX_TEST_EDITOR_FAILURE";
+
+#[cfg(debug_assertions)]
+fn editor_failure_seam() -> anyhow::Result<()> {
+    if std::env::var_os(EDITOR_FAILURE_ENV).is_some() {
+        bail!("{EDITOR_FAILURE_ENV} is set: the editor thread fails");
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn editor_failure_seam() -> anyhow::Result<()> {
+    Ok(())
 }
 
 struct LocalClient {
@@ -172,11 +273,7 @@ impl JournalDir {
     /// it, so the lock is trusted only while its file is still the one in
     /// the directory.
     fn claim(state: &Path, pid: u32) -> anyhow::Result<JournalDir> {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(PRIVATE_DIRECTORY_MODE)
-            .create(state)
-            .with_context(|| format!("creating {}", state.display()))?;
+        create_private_dir(state)?;
         let path = paths::journal_dir(JournalMode::NoServer { pid })?;
         for _ in 0..CLAIM_ATTEMPTS {
             match DirBuilder::new().mode(PRIVATE_DIRECTORY_MODE).create(&path) {
@@ -282,9 +379,8 @@ impl JournalDir {
         sync_directory(&self.path)?;
         sync_directory(orphan)?;
         if !others {
-            fs::remove_file(&lock_path)
-                .with_context(|| format!("removing {}", lock_path.display()))?;
-            fs::remove_dir(orphan).with_context(|| format!("removing {}", orphan.display()))?;
+            removed(fs::remove_file(&lock_path), &lock_path)?;
+            removed(fs::remove_dir(orphan), orphan)?;
         }
         Ok(())
     }
@@ -303,8 +399,8 @@ impl JournalDir {
             }
         }
         let lock_path = self.path.join(LOCK_NAME);
-        fs::remove_file(&lock_path).with_context(|| format!("removing {}", lock_path.display()))?;
-        fs::remove_dir(&self.path).with_context(|| format!("removing {}", self.path.display()))?;
+        removed(fs::remove_file(&lock_path), &lock_path)?;
+        removed(fs::remove_dir(&self.path), &self.path)?;
         drop(self.lock);
         Ok(())
     }

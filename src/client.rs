@@ -121,7 +121,7 @@ pub fn run(options: ClientOptions) -> anyhow::Result<ExitCode> {
     // start is reported on a usable terminal.
     let stream = connect_or_start(&socket)?;
     let (sender, events) = mpsc::channel();
-    run_tui(
+    let end = run_tui(
         move |sender: &Sender<UiEvent>| -> anyhow::Result<Box<dyn Link>> {
             Ok(Box::new(SocketLink::start(stream, socket, sender.clone())?))
         },
@@ -129,7 +129,8 @@ pub fn run(options: ClientOptions) -> anyhow::Result<ExitCode> {
         events,
         &files,
         options.wait,
-    )
+    )?;
+    Ok(end.report())
 }
 
 fn socket_path() -> anyhow::Result<PathBuf> {
@@ -336,30 +337,48 @@ impl End {
             message: None,
         }
     }
+
+    /// Prints the message, if any, on stderr; the exit code.
+    pub fn report(self) -> ExitCode {
+        if let Some(message) = self.message {
+            eprintln!("{message}");
+        }
+        ExitCode::from(self.code)
+    }
 }
 
 /// Takes over the terminal, probes it, connects with `connect`, and runs
-/// the client until it ends. The terminal is restored before anything is
-/// printed.
+/// the client until it ends. The terminal is restored when this returns;
+/// the caller reports the `End`.
 pub fn run_tui(
     connect: impl FnOnce(&Sender<UiEvent>) -> anyhow::Result<Box<dyn Link>>,
     sender: Sender<UiEvent>,
     events: Receiver<UiEvent>,
     files: &[FileArgument],
     wait: bool,
-) -> anyhow::Result<ExitCode> {
+) -> anyhow::Result<End> {
+    // Registered before the terminal is taken over: from here on SIGTERM
+    // and SIGWINCH queue until the client handles them, instead of killing
+    // it with the terminal raw or being lost during a slow startup.
+    let signals =
+        Signals::new([SIGWINCH, SIGTERM, SIGINT, SIGHUP]).context("installing signal handlers")?;
     let mut terminal = Terminal::enter()?;
-    let outcome = session(&mut terminal, connect, sender, &events, files, wait);
+    let outcome = session(
+        &mut terminal,
+        signals,
+        connect,
+        sender,
+        &events,
+        files,
+        wait,
+    );
     drop(terminal);
-    let end = outcome?;
-    if let Some(message) = end.message {
-        eprintln!("{message}");
-    }
-    Ok(ExitCode::from(end.code))
+    outcome
 }
 
 fn session(
     terminal: &mut Terminal,
+    signals: Signals,
     connect: impl FnOnce(&Sender<UiEvent>) -> anyhow::Result<Box<dyn Link>>,
     sender: Sender<UiEvent>,
     events: &Receiver<UiEvent>,
@@ -377,6 +396,7 @@ fn session(
     }
     let mut decoder = KittyDecoder::new();
     let typed_during_probe = decoder.feed(&probe.leftover);
+    startup_delay_seam();
     let link = connect(&sender)?;
     let (cols, rows) = clamp_size(terminal.size()?);
     let cwd = std::env::current_dir().context("finding the current directory")?;
@@ -402,7 +422,7 @@ fn session(
         }
     }
     start_input_thread(input, sender.clone())?;
-    start_signal_thread(sender)?;
+    start_signal_thread(signals, sender)?;
     loop {
         let event = events
             .recv()
@@ -433,6 +453,24 @@ fn panic_seam(requested: bool) {
 
 #[cfg(not(debug_assertions))]
 fn panic_seam(_requested: bool) {}
+
+/// Debug builds wait this many milliseconds between the probe and
+/// connecting, so tests can signal a client that is still starting.
+#[cfg(debug_assertions)]
+pub const STARTUP_DELAY_ENV: &str = "EMX_TEST_STARTUP_DELAY_MS";
+
+#[cfg(debug_assertions)]
+fn startup_delay_seam() {
+    if let Some(milliseconds) = std::env::var(STARTUP_DELAY_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        thread::sleep(Duration::from_millis(milliseconds));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn startup_delay_seam() {}
 
 /// The server refuses sizes it cannot send whole frames for; a larger
 /// terminal is drawn in its top-left corner. A zero size (a terminal that
@@ -466,9 +504,7 @@ fn start_input_thread(mut input: StdinSource, sender: Sender<UiEvent>) -> anyhow
     Ok(())
 }
 
-fn start_signal_thread(sender: Sender<UiEvent>) -> anyhow::Result<()> {
-    let mut signals =
-        Signals::new([SIGWINCH, SIGTERM, SIGINT, SIGHUP]).context("installing signal handlers")?;
+fn start_signal_thread(mut signals: Signals, sender: Sender<UiEvent>) -> anyhow::Result<()> {
     thread::Builder::new()
         .name("emx-client-signals".to_string())
         .spawn(move || {
