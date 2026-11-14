@@ -1,10 +1,47 @@
-use emx_text::{ReadError, Text, display_units};
+use emx_text::{ReadError, Text, display_units, unit_width};
 
-use super::{CommandContext, CommandError};
+use super::mark::push_mark;
+use super::word_syntax::{CHINESE, COMBINING_DIACRITIC, HIRAGANA, KATAKANA, SCRIPTS, WORD};
+use super::{CommandContext, CommandError, PrefixArg};
 
 /// Bytes read around point to find one display unit; doubled while a single
 /// unit fills the whole window.
 const UNIT_WINDOW: u64 = 64;
+const NEXT_LINE: &str = "next-line";
+const PREVIOUS_LINE: &str = "previous-line";
+/// `beginning-of-buffer` and `end-of-buffer` with a numeric argument N go
+/// N tenths of the way through the buffer.
+const BUFFER_FRACTIONS: i128 = 10;
+const UTF8_MAX_LEN: u64 = 4;
+const LARGEST_SCALAR: u32 = 0x10_FFFF;
+/// Emacs represents an invalid byte B as the character 0x3FFF00 + B.
+const RAW_BYTE_BASE: u32 = 0x3F_FF00;
+
+/// A character category, as named in Emacs's word boundary rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Category {
+    CombiningDiacritic,
+    Chinese,
+    Hiragana,
+    Katakana,
+}
+
+/// One rule of `word-combining-categories` or `word-separating-categories`:
+/// `(C1 . C2)`, where `None` matches any character.
+type CategoryRule = (Option<Category>, Option<Category>);
+
+/// Emacs 29 `word-combining-categories`: across a script change, these
+/// pairs still continue a word.
+const WORD_COMBINING_CATEGORIES: [CategoryRule; 4] = [
+    (None, Some(Category::CombiningDiacritic)),
+    (Some(Category::CombiningDiacritic), None),
+    (Some(Category::Chinese), Some(Category::Hiragana)),
+    (Some(Category::Chinese), Some(Category::Katakana)),
+];
+/// Emacs 29 `word-separating-categories`: within one script, these pairs
+/// still end a word.
+const WORD_SEPARATING_CATEGORIES: [CategoryRule; 1] =
+    [(Some(Category::Hiragana), Some(Category::Katakana))];
 
 pub(super) fn forward_char(ctx: &mut CommandContext) -> Result<(), CommandError> {
     let count = ctx.prefix_arg.numeric_value();
@@ -44,6 +81,405 @@ fn move_units(ctx: &mut CommandContext, count: i64) -> Result<(), CommandError> 
     }
     ctx.set_point(point);
     outcome
+}
+
+pub(super) fn next_line(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let count = ctx.prefix_arg.numeric_value();
+    line_move(ctx, count, false, None).map(|_| ())
+}
+
+pub(super) fn previous_line(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let count = ctx.prefix_arg.numeric_value();
+    line_move(ctx, count.saturating_neg(), false, None).map(|_| ())
+}
+
+/// Emacs `move-beginning-of-line`: with N other than 1, move N - 1 lines
+/// first, stopping at the buffer edges.
+pub(super) fn move_beginning_of_line(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let count = ctx.prefix_arg.numeric_value();
+    if count != 1 {
+        line_move(ctx, count.saturating_sub(1), true, None)?;
+    }
+    let text = ctx.buffer().text.clone();
+    let start = line_start(&text, ctx.point())?;
+    ctx.set_point(start);
+    Ok(())
+}
+
+/// Emacs `move-end-of-line`: the end of the line N - 1 lines away, found
+/// as the position before the start of the line N lines away.
+pub(super) fn move_end_of_line(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    const GOAL_COLUMN: u64 = 0;
+    let count = ctx.prefix_arg.numeric_value();
+    let moved = line_move(ctx, count, true, Some(GOAL_COLUMN))?;
+    if moved {
+        let text = ctx.buffer().text.clone();
+        let start = line_start(&text, ctx.point())?;
+        // Back over the newline that ends the previous line.
+        ctx.set_point(start.saturating_sub(1));
+    }
+    Ok(())
+}
+
+pub(super) fn forward_word(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let count = ctx.prefix_arg.numeric_value();
+    let target = word_target(ctx, count)?;
+    ctx.set_point(target);
+    Ok(())
+}
+
+pub(super) fn backward_word(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let count = ctx.prefix_arg.numeric_value();
+    let target = word_target(ctx, count.saturating_neg())?;
+    ctx.set_point(target);
+    Ok(())
+}
+
+/// Where Emacs `forward-word` with COUNT leaves point: past COUNT words, or
+/// the buffer edge when there are fewer. Never inside a grapheme cluster.
+pub(super) fn word_target(ctx: &CommandContext, count: i64) -> Result<u64, CommandError> {
+    let text = &ctx.buffer().text;
+    let scanned = scan_words(text, ctx.point(), count)?;
+    let target = scanned.unwrap_or(if count > 0 { text.len() } else { 0 });
+    Ok(snap_to_unit(text, target, count > 0)?)
+}
+
+/// Emacs `beginning-of-buffer`: pushes the mark unless given `C-u` or the
+/// region is active; with N, goes N tenths of the way, then to a line start.
+pub(super) fn beginning_of_buffer(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    jump_in_buffer(ctx, |_, numerator| 1 + numerator / BUFFER_FRACTIONS, 0)
+}
+
+/// Emacs `end-of-buffer`, the mirror of `beginning-of-buffer`.
+pub(super) fn end_of_buffer(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let length = ctx.buffer().text.len();
+    jump_in_buffer(
+        ctx,
+        |length, numerator| length - numerator / BUFFER_FRACTIONS,
+        length,
+    )
+}
+
+/// The shared part of `beginning-of-buffer` and `end-of-buffer`. `numbered`
+/// maps the buffer length and length * N to the target for an argument N;
+/// Emacs counts characters there, and emx counts bytes.
+fn jump_in_buffer(
+    ctx: &mut CommandContext,
+    numbered: impl Fn(i128, i128) -> i128,
+    edge: u64,
+) -> Result<(), CommandError> {
+    let argument = ctx.prefix_arg;
+    let universal = matches!(argument, PrefixArg::Raw(_));
+    if !universal && !ctx.region_active() {
+        let point = ctx.point();
+        push_mark(ctx, point, false, false);
+    }
+    let text = ctx.buffer().text.clone();
+    let length = text.len();
+    let target = match argument {
+        PrefixArg::None | PrefixArg::Raw(_) => edge,
+        PrefixArg::Numeric(_) | PrefixArg::Negative => {
+            let numerator = i128::from(length) * i128::from(argument.numeric_value());
+            let wanted = numbered(i128::from(length), numerator).clamp(0, i128::from(length));
+            let wanted = u64::try_from(wanted).expect("clamped to the buffer length");
+            forward_line(&text, wanted, 1)?.1
+        }
+    };
+    ctx.set_point(target);
+    Ok(())
+}
+
+/// Emacs `line-move-1` without invisible text: move COUNT logical lines
+/// and then to the goal column. When the buffer ends first, point goes to
+/// the end (or start) of the last line reached and, unless `noerror`, the
+/// motion signals. Returns whether all lines were moved.
+pub(super) fn line_move(
+    ctx: &mut CommandContext,
+    count: i64,
+    noerror: bool,
+    goal_column: Option<u64>,
+) -> Result<bool, CommandError> {
+    let text = ctx.buffer().text.clone();
+    let tab_width = ctx.editor().config().tab_width;
+    let origin = ctx.point();
+    if !(ctx.last_command_is(NEXT_LINE) || ctx.last_command_is(PREVIOUS_LINE)) {
+        let column = current_column(&text, origin, tab_width)?;
+        ctx.set_temporary_goal_column(column);
+    }
+    let (moved, reached) = if count > 0 {
+        let mut position = origin;
+        if count > 1 {
+            position = forward_line(&text, position, count - 1)?.1;
+        }
+        position = line_end(&text, position)?;
+        let (shortage, after) = forward_line(&text, position, 1)?;
+        (shortage == 0, after)
+    } else {
+        let (shortage, after) = forward_line(&text, origin, count)?;
+        (shortage == 0, after)
+    };
+    if !moved {
+        let stop = if count > 0 {
+            line_end(&text, reached)?
+        } else {
+            line_start(&text, reached)?
+        };
+        ctx.set_point(stop);
+        if noerror {
+            return Ok(false);
+        }
+        return Err(if count > 0 {
+            CommandError::EndOfBuffer
+        } else {
+            CommandError::BeginningOfBuffer
+        });
+    }
+    let column = goal_column.unwrap_or_else(|| ctx.temporary_goal_column());
+    let target = move_to_column(&text, reached, column, tab_width)?;
+    ctx.set_point(target);
+    Ok(true)
+}
+
+/// The start of the line containing `pos`.
+pub(crate) fn line_start(text: &Text, pos: u64) -> Result<u64, ReadError> {
+    Ok(text
+        .find_newline_backward(pos)?
+        .map_or(0, |newline| newline + 1))
+}
+
+/// The end of the line containing `pos`: its newline, or the buffer end.
+pub(crate) fn line_end(text: &Text, pos: u64) -> Result<u64, ReadError> {
+    Ok(text.find_newline_forward(pos)?.unwrap_or(text.len()))
+}
+
+/// Emacs `forward-line`: the position reached and the count of lines left
+/// unmoved, signed like COUNT. Going forward, a last line without a newline
+/// that point crossed counts as moved.
+pub(crate) fn forward_line(text: &Text, pos: u64, count: i64) -> Result<(i64, u64), ReadError> {
+    if count > 0 {
+        let mut position = pos;
+        let mut found = 0;
+        while found < count {
+            match text.find_newline_forward(position)? {
+                Some(newline) => {
+                    position = newline + 1;
+                    found += 1;
+                }
+                None => {
+                    position = text.len();
+                    break;
+                }
+            }
+        }
+        let mut shortage = count - found;
+        if shortage > 0 && position != pos && text.byte_at(position - 1)? != b'\n' {
+            shortage -= 1;
+        }
+        return Ok((shortage, position));
+    }
+    let mut position = line_start(text, pos)?;
+    let mut remaining = count.unsigned_abs();
+    while remaining > 0 && position > 0 {
+        position = line_start(text, position - 1)?;
+        remaining -= 1;
+    }
+    let shortage = i64::try_from(remaining).expect("at most the magnitude of an i64 count");
+    Ok((-shortage, position))
+}
+
+/// Emacs `current-column`: display columns from the line start to `pos`.
+pub(crate) fn current_column(text: &Text, pos: u64, tab_width: u64) -> Result<u64, ReadError> {
+    let start = line_start(text, pos)?;
+    let mut bytes = Vec::new();
+    text.read(start..pos, &mut bytes)?;
+    let tab_width = usize::try_from(tab_width).expect("tab_width is validated small");
+    let mut column = 0;
+    for (_, unit) in display_units(&bytes) {
+        column += unit_width(&unit, column, tab_width);
+    }
+    Ok(column as u64)
+}
+
+/// Emacs `move-to-column` without FORCE, from the line start `start`: stops
+/// at the first unit boundary at or past `goal`, so a unit that spans the
+/// goal column is passed, or at the end of a short line.
+pub(crate) fn move_to_column(
+    text: &Text,
+    start: u64,
+    goal: u64,
+    tab_width: u64,
+) -> Result<u64, ReadError> {
+    let end = line_end(text, start)?;
+    let mut bytes = Vec::new();
+    text.read(start..end, &mut bytes)?;
+    let tab_width = usize::try_from(tab_width).expect("tab_width is validated small");
+    let mut column = 0;
+    for (offset, unit) in display_units(&bytes) {
+        if column as u64 >= goal {
+            return Ok(start + offset as u64);
+        }
+        column += unit_width(&unit, column, tab_width);
+    }
+    Ok(end)
+}
+
+/// Emacs `scan_words`: the position after COUNT words (before, when
+/// negative), or `None` when the buffer edge comes first.
+fn scan_words(text: &Text, from: u64, count: i64) -> Result<Option<u64>, ReadError> {
+    let mut position = from;
+    let mut remaining = count;
+    while remaining > 0 {
+        let mut previous = loop {
+            let Some((character, length)) = char_after(text, position)? else {
+                return Ok(None);
+            };
+            position += length;
+            if is_word(character) {
+                break character;
+            }
+        };
+        while let Some((character, length)) = char_after(text, position)? {
+            if !is_word(character) || word_boundary(previous, character) {
+                break;
+            }
+            position += length;
+            previous = character;
+        }
+        remaining -= 1;
+    }
+    while remaining < 0 {
+        let mut next = loop {
+            let Some((character, length)) = char_before(text, position)? else {
+                return Ok(None);
+            };
+            position -= length;
+            if is_word(character) {
+                break character;
+            }
+        };
+        while let Some((character, length)) = char_before(text, position)? {
+            if !is_word(character) || word_boundary(character, next) {
+                break;
+            }
+            position -= length;
+            next = character;
+        }
+        remaining += 1;
+    }
+    Ok(Some(position))
+}
+
+/// A position inside a grapheme cluster moves to the cluster's end (or its
+/// start, going backward), since point never rests inside one.
+pub(crate) fn snap_to_unit(text: &Text, pos: u64, forward: bool) -> Result<u64, ReadError> {
+    let Some(start) = previous_unit_start(text, pos)? else {
+        return Ok(pos);
+    };
+    let end = next_unit_end(text, start)?.expect("a unit starts before pos");
+    if end <= pos {
+        return Ok(pos);
+    }
+    Ok(if forward { end } else { start })
+}
+
+/// The character starting at `pos` and its length in bytes, or `None` at
+/// the end. An invalid byte is one character, as Emacs's raw bytes are.
+pub(crate) fn char_after(text: &Text, pos: u64) -> Result<Option<(u32, u64)>, ReadError> {
+    if pos >= text.len() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    text.read(pos..text.len().min(pos + UTF8_MAX_LEN), &mut bytes)?;
+    let expected = utf8_sequence_length(bytes[0]);
+    if let Some(sequence) = bytes.get(..expected)
+        && let Ok(decoded) = std::str::from_utf8(sequence)
+        && let Some(character) = decoded.chars().next()
+    {
+        return Ok(Some((u32::from(character), expected as u64)));
+    }
+    Ok(Some((RAW_BYTE_BASE + u32::from(bytes[0]), 1)))
+}
+
+/// The character ending at `pos` and its length in bytes, or `None` at the
+/// start.
+pub(crate) fn char_before(text: &Text, pos: u64) -> Result<Option<(u32, u64)>, ReadError> {
+    if pos == 0 {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    text.read(pos.saturating_sub(UTF8_MAX_LEN)..pos, &mut bytes)?;
+    for length in 1..=bytes.len() {
+        let sequence = &bytes[bytes.len() - length..];
+        if utf8_sequence_length(sequence[0]) == length
+            && let Ok(decoded) = std::str::from_utf8(sequence)
+            && let Some(character) = decoded.chars().next()
+        {
+            return Ok(Some((u32::from(character), length as u64)));
+        }
+    }
+    let last = *bytes.last().expect("pos > 0 reads at least one byte");
+    Ok(Some((RAW_BYTE_BASE + u32::from(last), 1)))
+}
+
+/// The length a UTF-8 sequence starting with `lead` has; 0 for a byte that
+/// cannot start one.
+fn utf8_sequence_length(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 0,
+    }
+}
+
+fn in_ranges(ranges: &[(u32, u32)], code: u32) -> bool {
+    let index = ranges.partition_point(|(start, _)| *start <= code);
+    index > 0 && ranges[index - 1].1 >= code
+}
+
+/// Word syntax in Emacs's `standard-syntax-table`; raw bytes are words too.
+fn is_word(code: u32) -> bool {
+    code > LARGEST_SCALAR || in_ranges(WORD, code)
+}
+
+fn script(code: u32) -> Option<u16> {
+    let index = SCRIPTS.partition_point(|(start, _, _)| *start <= code);
+    (index > 0 && SCRIPTS[index - 1].1 >= code).then(|| SCRIPTS[index - 1].2)
+}
+
+fn in_category(code: u32, category: Category) -> bool {
+    let ranges = match category {
+        Category::CombiningDiacritic => COMBINING_DIACRITIC,
+        Category::Chinese => CHINESE,
+        Category::Hiragana => HIRAGANA,
+        Category::Katakana => KATAKANA,
+    };
+    in_ranges(ranges, code)
+}
+
+/// Emacs `word_boundary_p`: two adjacent word characters split a word when
+/// their scripts differ, unless a combining rule joins them; within one
+/// script, only a separating rule splits them.
+fn word_boundary(first: u32, second: u32) -> bool {
+    let same_script = script(first) == script(second);
+    let (rules, default): (&[CategoryRule], bool) = if same_script {
+        (&WORD_SEPARATING_CATEGORIES, false)
+    } else {
+        (&WORD_COMBINING_CATEGORIES, true)
+    };
+    let matches = |(left, right): &CategoryRule| {
+        let left_matches = left
+            .is_none_or(|category| in_category(first, category) && !in_category(second, category));
+        let right_matches = right
+            .is_none_or(|category| !in_category(first, category) && in_category(second, category));
+        left_matches && right_matches
+    };
+    if rules.iter().any(matches) {
+        !default
+    } else {
+        default
+    }
 }
 
 /// The end of the display unit that starts at `pos`, or `None` at the end.

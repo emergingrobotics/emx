@@ -1,0 +1,183 @@
+{"name": "forward-char-basic", "text": "|abc", "keys": "C-f C-f", "tier": 1}
+{"name": "forward-char-count", "text": "|abcdef", "keys": "C-u 3 C-f", "tier": 1}
+{"name": "forward-char-universal", "text": "|abcdefgh", "keys": "C-u C-f", "tier": 1}
+{"name": "forward-char-negative", "text": "abc|def", "keys": "M-- C-f", "tier": 1}
+{"name": "forward-char-multibyte", "text": "|é中x", "keys": "C-f C-f", "tier": 1}
+{"name": "forward-char-eob-error", "text": "|abc", "keys": "C-f C-f C-f C-f a", "tier": 1}
+{"name": "backward-char-bob-error", "text": "a|bc", "keys": "C-b C-b x", "tier": 1}
+{"name": "backward-char-count", "text": "abcdef|", "keys": "M-4 C-b", "tier": 1}
+{"name": "next-line-basic", "text": "ab|c\ndef", "keys": "C-n", "tier": 1}
+{"name": "next-line-goal-column", "text": "abcd|e\nx\nabcdef", "keys": "C-n C-n", "tier": 1}
+{"name": "next-line-goal-reset", "text": "abcd|e\nx\nabcdef", "keys": "C-n C-b C-n", "tier": 1}
+{"name": "next-line-last-line-error", "text": "ab\nc|d", "keys": "C-n", "tier": 1}
+{"name": "next-line-onto-final-empty-line", "text": "a|b\n", "keys": "C-n", "tier": 1}
+{"name": "next-line-past-final-newline", "text": "a|b\n", "keys": "C-n C-n", "tier": 1}
+{"name": "next-line-count", "text": "|a\nb\nc\nd", "keys": "C-u 2 C-n", "tier": 1}
+{"name": "next-line-count-too-far", "text": "a|b\ncd", "keys": "C-u 5 C-n", "tier": 1}
+{"name": "next-line-negative", "text": "a\nb\nc|d", "keys": "M-- C-n", "tier": 1}
+{"name": "next-line-zero", "text": "ab|c\nd", "keys": "C-u 0 C-n", "tier": 1}
+{"name": "next-line-tab-column", "text": "a\tb|c\n0123456789abc", "keys": "C-n", "tier": 1}
+{"name": "next-line-wide-chars", "text": "中|文\nabcd", "keys": "C-n", "tier": 1}
+{"name": "next-line-into-wide-char", "text": "a|bcd\n中文", "keys": "C-n", "tier": 1}
+{"name": "next-line-after-end-of-line", "text": "ab|c\nlonger line\nxy", "keys": "C-e C-n C-n", "tier": 1}
+{"name": "previous-line-basic", "text": "abc\nde|f", "keys": "C-p", "tier": 1}
+{"name": "previous-line-first-line-error", "text": "a|bc\ndef", "keys": "C-p", "tier": 1}
+{"name": "previous-line-count", "text": "a\nb\nc|d", "keys": "C-u 2 C-p", "tier": 1}
+{"name": "previous-line-goal-column", "text": "abcdef\nx\nabcd|e", "keys": "C-p C-p", "tier": 1}
+{"name": "previous-line-count-too-far", "text": "ab\nc|d", "keys": "C-u 4 C-p", "tier": 1}
+{"name": "beginning-of-line-basic", "text": "abc|def", "keys": "C-a", "tier": 1}
+{"name": "beginning-of-line-count", "text": "a|b\ncd\nef", "keys": "C-u 3 C-a", "tier": 1}
+{"name": "beginning-of-line-negative", "text": "ab\ncd\ne|f", "keys": "M-- C-a", "tier": 1}
+{"name": "end-of-line-basic", "text": "ab|cdef\nx", "keys": "C-e", "tier": 1}
+{"name": "end-of-line-count", "text": "a|b\ncd\nef", "keys": "C-u 2 C-e", "tier": 1}
+{"name": "end-of-line-count-past-end", "text": "a|b\ncd", "keys": "C-u 5 C-e", "tier": 1}
+{"name": "end-of-line-zero", "text": "ab\ncd|e", "keys": "C-u 0 C-e", "tier": 1}
+{"name": "end-of-line-negative", "text": "ab\ncd\ne|f", "keys": "M-- C-e", "tier": 1}
+{"name": "forward-word-basic", "text": "|hello world", "keys": "M-f", "tier": 1}
+{"name": "forward-word-twice", "text": "|hello world", "keys": "M-f M-f", "tier": 1}
+{"name": "forward-word-underscore-is-symbol", "text": "|foo_bar baz", "keys": "M-f", "tier": 1}
+{"name": "forward-word-punctuation", "text": "|  ...foo-bar", "keys": "M-f M-f", "tier": 1}
+{"name": "forward-word-count", "text": "|a b c d e", "keys": "C-u 3 M-f", "tier": 1}
+{"name": "forward-word-negative", "text": "a b c|", "keys": "M-- M-f", "tier": 1}
+{"name": "forward-word-to-eob", "text": "foo |  ", "keys": "M-f", "tier": 1}
+{"name": "forward-word-dollar-percent", "text": "|$100% off", "keys": "M-f", "tier": 1}
+{"name": "forward-word-script-boundary", "text": "|ab😀cd ef", "keys": "M-f M-f", "tier": 1}
+{"name": "forward-word-latin-accents", "text": "|café naïve", "keys": "M-f M-f", "tier": 1}
+{"name": "forward-word-han-kana", "text": "|中文かなカナ x", "keys": "M-f M-f", "tier": 1}
+{"name": "forward-word-greek-latin", "text": "|αβγabc x", "keys": "M-f", "tier": 1}
+{"name": "backward-word-basic", "text": "hello wor|ld", "keys": "M-b M-b", "tier": 1}
+{"name": "backward-word-to-bob", "text": "  |foo", "keys": "M-b", "tier": 1}
+{"name": "backward-word-script-boundary", "text": "ab😀cd|", "keys": "M-b M-b", "tier": 1}
+{"name": "beginning-of-buffer-pushes-mark", "text": "abc\nd|ef", "keys": "M-<", "tier": 1}
+{"name": "end-of-buffer-pushes-mark", "text": "a|bc\ndef", "keys": "M->", "tier": 1}
+{"name": "beginning-of-buffer-active-region", "text": "abc\nd|ef", "keys": "C-SPC C-b M-<", "tier": 1}
+{"name": "beginning-of-buffer-universal-no-mark", "text": "ab|c^", "keys": "C-u M-<", "tier": 1}
+{"name": "beginning-of-buffer-tenths", "text": "|line1\nline2\nline3\nline4\nline5\n", "keys": "M-4 M-<", "tier": 1}
+{"name": "end-of-buffer-tenths", "text": "|0123456789\n0123456789\n0123456789\n", "keys": "M-3 M->", "tier": 1}
+{"name": "beginning-of-buffer-mark-ring", "text": "ab|cd^", "keys": "M-< C-u C-SPC", "tier": 1}
+{"name": "newline-basic", "text": "ab|cd", "keys": "RET", "tier": 1}
+{"name": "newline-count", "text": "ab|cd", "keys": "C-u 3 RET", "tier": 1}
+{"name": "newline-negative-error", "text": "ab|", "keys": "M-- RET", "tier": 1}
+{"name": "newline-trailing-space", "text": "ab  |cd", "keys": "RET", "tier": 1}
+{"name": "newline-undo-groups", "text": "ab|", "keys": "RET RET x C-/", "tier": 1}
+{"name": "self-insert-deactivates-region", "text": "a|bc", "keys": "C-SPC C-f x", "tier": 1}
+{"name": "delete-char-basic", "text": "a|bc", "keys": "C-d", "tier": 1}
+{"name": "delete-char-eob-error", "text": "ab|", "keys": "C-d", "tier": 1}
+{"name": "delete-char-count-kills", "text": "|abcdef", "keys": "C-u 2 C-d", "tier": 1}
+{"name": "delete-char-negative-kills", "text": "abc|def", "keys": "M-- C-d", "tier": 1}
+{"name": "delete-char-ignores-region", "text": "a|bcde", "keys": "C-SPC C-f C-f C-d", "tier": 1}
+{"name": "delete-char-undo-amalgamates", "text": "|abcdef", "keys": "C-d C-d C-d C-/", "tier": 1}
+{"name": "delete-backward-char-basic", "text": "ab|c", "keys": "DEL", "tier": 1}
+{"name": "delete-backward-char-bob-error", "text": "|abc", "keys": "DEL", "tier": 1}
+{"name": "delete-backward-char-count-kills", "text": "abcd|", "keys": "C-u 2 DEL", "tier": 1}
+{"name": "delete-backward-char-kills-prepend", "text": "abcdef|", "keys": "C-u 2 DEL C-u 2 DEL", "tier": 1}
+{"name": "delete-backward-char-negative-count", "text": "a|bcd", "keys": "M-- 2 DEL", "tier": 1}
+{"name": "delete-backward-char-region", "text": "a|bcde", "keys": "C-SPC C-f C-f DEL", "tier": 1}
+{"name": "delete-backward-char-empty-region", "text": "ab|c", "keys": "C-SPC DEL", "tier": 1}
+{"name": "delete-backward-char-undo-amalgamates", "text": "abcdef|", "keys": "DEL DEL DEL C-/", "tier": 1}
+{"name": "delete-backward-char-undo-point", "text": "abc def|", "keys": "C-u 3 DEL C-b C-b C-/", "tier": 1}
+{"name": "kill-line-basic", "text": "ab|c\ndef", "keys": "C-k", "tier": 1}
+{"name": "kill-line-at-eol", "text": "abc|\ndef", "keys": "C-k", "tier": 1}
+{"name": "kill-line-eol", "text": "ab|c\ndef", "keys": "C-k C-k", "tier": 1}
+{"name": "kill-line-whitespace-only", "text": "ab|  \t\ndef", "keys": "C-k", "tier": 1}
+{"name": "kill-line-eob-error", "text": "abc|", "keys": "C-k", "tier": 1}
+{"name": "kill-line-count", "text": "a|b\ncd\nef", "keys": "C-u 2 C-k", "tier": 1}
+{"name": "kill-line-zero", "text": "abc|def", "keys": "C-u 0 C-k", "tier": 1}
+{"name": "kill-line-negative", "text": "ab\ncd|ef", "keys": "M-- C-k", "tier": 1}
+{"name": "kill-line-negative-prepends", "text": "ab\ncd|ef", "keys": "C-k M-- C-k", "tier": 1}
+{"name": "kill-line-count-past-eob", "text": "a|b", "keys": "C-u 3 C-k", "tier": 1}
+{"name": "kill-line-count-at-eob", "text": "ab|", "keys": "C-u 2 C-k", "tier": 1}
+{"name": "kill-line-three-then-yank", "text": "|abc\ndef", "keys": "C-k C-k C-k C-y", "tier": 1}
+{"name": "kill-line-broken-append", "text": "|abc\ndef\nghi", "keys": "C-k C-k C-n C-k", "tier": 1}
+{"name": "kill-word-basic", "text": "|foo bar", "keys": "M-d", "tier": 1}
+{"name": "kill-word-appends", "text": "|foo bar baz", "keys": "M-d M-d", "tier": 1}
+{"name": "kill-word-appends-then-yank", "text": "|foo bar baz", "keys": "M-d M-d C-e C-y", "tier": 1}
+{"name": "kill-region-basic", "text": "a^bc|d", "keys": "C-w", "tier": 1}
+{"name": "kill-region-point-before-mark", "text": "a|bc^d", "keys": "C-w", "tier": 1}
+{"name": "kill-region-no-mark-error", "text": "ab|c", "keys": "C-w", "tier": 1}
+{"name": "kill-region-empty", "text": "ab^|c", "keys": "C-w", "tier": 1}
+{"name": "kill-region-appends-after-kill-line", "text": "a^b|cd", "keys": "C-k C-w", "tier": 1}
+{"name": "kill-region-prepends-backward", "text": "ab|cd^", "keys": "C-k C-b C-x C-x C-w", "tier": 1}
+{"name": "kill-ring-save-basic", "text": "a^bc|d", "keys": "M-w", "tier": 1}
+{"name": "kill-ring-save-deactivates", "text": "a|bcd", "keys": "C-SPC C-f C-f M-w", "tier": 1}
+{"name": "kill-ring-save-then-yank", "text": "a^bc|d", "keys": "M-w C-e C-y", "tier": 1}
+{"name": "kill-region-after-save-does-not-append", "text": "a^bc|d", "keys": "M-w C-w", "tier": 1}
+{"name": "yank-twice", "text": "abc|", "keys": "C-a C-k C-y C-y", "tier": 1}
+{"name": "yank-universal-point-first", "text": "ab^cd|", "keys": "C-w C-u C-y", "tier": 1}
+{"name": "yank-pop-cycle", "text": "|a\nb\nc\n", "keys": "C-k C-f C-k C-f C-k C-f C-y M-y M-y", "tier": 1}
+{"name": "yank-pop-wraps", "text": "|a\nb\nc\n", "keys": "C-k C-f C-k C-f C-k C-f C-y M-y M-y M-y M-y", "tier": 1}
+{"name": "yank-pop-negative", "text": "|a\nb\nc\n", "keys": "C-k C-f C-k C-f C-k C-f C-y M-y M-- M-y", "tier": 1}
+{"name": "yank-numeric", "text": "|a\nb\nc\n", "keys": "C-k C-f C-k C-f C-k C-f M-2 C-y", "tier": 1}
+{"name": "yank-pop-after-universal-yank", "text": "|a\nb\nc\n", "keys": "C-k C-f C-k C-f C-k C-f C-u C-y M-y", "tier": 1}
+{"name": "yank-empty-ring-error", "text": "|abc", "keys": "C-y", "tier": 1}
+{"name": "yank-undo", "text": "ab|c\nd", "keys": "C-k C-y C-y C-/", "tier": 1}
+{"name": "yank-then-exchange", "text": "ab|c\nd", "keys": "C-k C-y C-x C-x", "tier": 1}
+{"name": "set-mark-then-move", "text": "a|bc", "keys": "C-SPC C-f C-f", "tier": 1}
+{"name": "set-mark-toggle-off", "text": "a|bc", "keys": "C-SPC C-SPC", "tier": 1}
+{"name": "set-mark-toggle-on", "text": "a|bc", "keys": "C-SPC C-SPC C-SPC", "tier": 1}
+{"name": "set-mark-pop", "text": "abcdef|", "keys": "C-SPC C-b C-b C-SPC C-b C-u C-SPC", "tier": 1}
+{"name": "set-mark-pop-twice", "text": "abcdef|", "keys": "C-SPC C-b C-b C-SPC C-b C-SPC C-b C-u C-SPC C-u C-SPC", "tier": 1}
+{"name": "set-mark-pop-no-mark-error", "text": "abc|", "keys": "C-u C-SPC", "tier": 1}
+{"name": "set-mark-pop-at-mark", "text": "ab|^c", "keys": "C-u C-SPC", "tier": 1}
+{"name": "set-mark-double-universal", "text": "ab|c^", "keys": "C-u C-u C-SPC", "tier": 1}
+{"name": "set-mark-at-existing-mark", "text": "ab|^c", "keys": "C-SPC", "tier": 1}
+{"name": "exchange-point-and-mark-basic", "text": "a^bc|d", "keys": "C-x C-x", "tier": 1}
+{"name": "exchange-point-and-mark-twice", "text": "a^bc|d", "keys": "C-x C-x C-x C-x", "tier": 1}
+{"name": "exchange-point-and-mark-universal", "text": "a^bc|d", "keys": "C-u C-x C-x", "tier": 1}
+{"name": "exchange-point-and-mark-no-mark-error", "text": "ab|c", "keys": "C-x C-x", "tier": 1}
+{"name": "keyboard-quit-deactivates", "text": "a|bc", "keys": "C-SPC C-f C-g", "tier": 1}
+{"name": "undo-amalgamated-insert", "text": "ab|", "keys": "x y C-/", "tier": 1}
+{"name": "undo-chain-then-redo", "text": "x|", "keys": "a C-u 2 b C-/ C-/ C-b C-/", "tier": 1}
+{"name": "undo-c-x-u", "text": "ab|", "keys": "c C-x u", "tier": 1}
+{"name": "undo-c-underscore", "text": "ab|", "keys": "c C-_", "tier": 1}
+{"name": "undo-count", "text": "ab|", "keys": "x C-b y C-b z M-2 C-/", "tier": 1}
+{"name": "undo-redo-c-question", "text": "ab|", "keys": "c C-u 2 d C-/ C-/ C-?", "tier": 1}
+{"name": "undo-redo-c-m-underscore", "text": "ab|", "keys": "c C-u 2 d C-/ C-/ C-M-_", "tier": 1}
+{"name": "undo-redo-nothing-error", "text": "ab|", "keys": "c C-?", "tier": 1}
+{"name": "undo-nothing-error", "text": "ab|", "keys": "C-/", "tier": 1}
+{"name": "undo-restores-unmodified", "text": "ab|", "keys": "c C-/", "tier": 1}
+{"name": "undo-kill-line", "text": "ab|c\ndef", "keys": "C-k C-/", "tier": 1}
+{"name": "undo-in-region", "text": "|\n\n", "keys": "a C-n b C-a C-SPC C-e C-/", "tier": 1}
+{"name": "undo-empty-active-region", "text": "ab|", "keys": "x C-SPC C-/", "tier": 1}
+{"name": "eob-empty-forward-char", "text": "|", "keys": "C-f", "tier": 1}
+{"name": "eob-empty-next-line", "text": "|", "keys": "C-n", "tier": 1}
+{"name": "eob-empty-previous-line", "text": "|", "keys": "C-p", "tier": 1}
+{"name": "eob-empty-kill-line", "text": "|", "keys": "C-k", "tier": 1}
+{"name": "eob-empty-motion", "text": "|", "keys": "C-e C-a M-f M-b M-> M-<", "tier": 1}
+{"name": "eob-empty-delete-backward", "text": "|", "keys": "DEL", "tier": 1}
+{"name": "eob-empty-kill-region-error", "text": "|", "keys": "C-w", "tier": 1}
+{"name": "eob-empty-insert-undo", "text": "|", "keys": "a b RET c C-/", "tier": 1}
+{"name": "eob-no-newline-next-line", "text": "ab\nc|d", "keys": "C-n", "tier": 1}
+{"name": "eob-no-newline-end-of-line", "text": "a|b\ncd", "keys": "C-n C-e", "tier": 1}
+{"name": "eob-no-newline-kill-line", "text": "ab\nc|d", "keys": "C-k C-k", "tier": 1}
+{"name": "eob-no-newline-end-of-buffer", "text": "|ab\ncd", "keys": "M-> C-p C-e", "tier": 1}
+{"name": "eob-only-newlines-next-line", "text": "|\n\n\n", "keys": "C-n C-n C-n C-n", "tier": 1}
+{"name": "eob-only-newlines-previous-line", "text": "\n\n\n|", "keys": "C-p C-p C-p C-p", "tier": 1}
+{"name": "eob-only-newlines-kill-line", "text": "|\n\n\n", "keys": "C-k C-k C-k C-k", "tier": 1}
+{"name": "eob-only-newlines-forward-word", "text": "|\n\n\n", "keys": "M-f", "tier": 1}
+{"name": "eob-only-newlines-end-of-line", "text": "\n|\n\n", "keys": "C-e C-a C-u 2 C-e", "tier": 1}
+{"name": "eob-crlf-end-of-line", "text": "a|b\r\ncd\r\n", "keys": "C-e", "tier": 1}
+{"name": "eob-crlf-kill-line", "text": "a|b\r\ncd\r\n", "keys": "C-k", "tier": 1}
+{"name": "eob-crlf-kill-line-twice", "text": "a|b\r\ncd\r\n", "keys": "C-k C-k", "tier": 1}
+{"name": "eob-crlf-next-line", "text": "ab|\r\ncd\r\n", "keys": "C-n", "tier": 1}
+{"name": "eob-crlf-next-line-after-cr", "text": "ab\r|\ncd\r\n", "keys": "C-n", "tier": 1}
+{"name": "eob-crlf-forward-char", "text": "a|\r\nb", "keys": "C-f C-f", "tier": 1}
+{"name": "eob-crlf-forward-word", "text": "|ab\r\ncd", "keys": "M-f M-f", "tier": 1}
+{"name": "eob-crlf-delete-backward", "text": "ab\r\n|cd", "keys": "DEL DEL", "tier": 1}
+{"name": "eob-crlf-last-line", "text": "ab\r\n|", "keys": "C-n", "tier": 1}
+{"name": "eob-crlf-end-of-buffer", "text": "|ab\r\ncd\r\n", "keys": "M-> C-p C-k", "tier": 1}
+{"name": "newline-copies-indentation", "text": "  foo|", "keys": "RET", "tier": 1}
+{"name": "newline-trims-and-indents", "text": "  foo|  ", "keys": "RET", "tier": 1}
+{"name": "newline-tab-indentation", "text": "\tfoo|", "keys": "RET", "tier": 1}
+{"name": "newline-reindents-rest", "text": "  ab|  cd", "keys": "RET", "tier": 1}
+{"name": "newline-count-blank-line-indent", "text": "  ab|", "keys": "C-u 2 RET", "tier": 1}
+{"name": "newline-wide-indentation-uses-tabs", "text": "          x|", "keys": "RET", "tier": 1}
+{"name": "newline-at-bol-of-indented-line", "text": "  ab\n|  cd", "keys": "RET", "tier": 1}
+{"name": "newline-blank-previous-line", "text": "  \n|x", "keys": "RET", "tier": 1}
+{"name": "newline-undo-with-indent", "text": "  ab|  ", "keys": "RET C-/", "tier": 1}
+{"name": "newline-in-indentation", "text": "    a|b\n x", "keys": "C-a C-f RET", "tier": 1}
+{"name": "newline-zero-count", "text": "  foo\n  |", "keys": "C-u 0 RET", "tier": 1}
+{"name": "newline-tab-then-spaces-indentation", "text": "\t  x|", "keys": "RET", "tier": 1}
+{"name": "newline-shrinks-tab-indentation", "text": "  y|\t\tz", "keys": "RET", "tier": 1}
+{"name": "delete-char-kill-past-eob-error", "text": "ab|c", "keys": "C-u 2 C-d", "tier": 1}
+{"name": "delete-backward-char-kill-past-bob-error", "text": "a|bc", "keys": "C-u 2 DEL", "tier": 1}

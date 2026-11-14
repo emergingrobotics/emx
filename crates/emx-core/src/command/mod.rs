@@ -1,14 +1,27 @@
 mod edit;
+mod kill;
+mod mark;
 mod misc;
 mod r#move;
+mod word_syntax;
+
+pub(crate) use kill::xterm_paste;
 
 use emx_text::ReadError;
 use emx_types::Key;
 
+use std::ops::Range;
+
 use crate::buffer::{Buffer, BufferId, ChangeRecorder, EditError};
 use crate::editor::Editor;
 use crate::event::ClientId;
+use crate::killring::KillRing;
+use crate::marker::InsertionType;
+use crate::undo::UndoError;
 use crate::window::WindowId;
+
+/// Emacs `user-error` from `region-beginning` and the region commands.
+const NO_REGION: &str = "The mark is not set now, so there is no region";
 
 /// Emacs `prefix-arg` in its raw forms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -80,7 +93,7 @@ pub struct CommandSpec {
     pub run: fn(&mut CommandContext) -> Result<(), CommandError>,
 }
 
-static COMMANDS: [CommandSpec; 8] = [
+static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "forward-char",
         run: r#move::forward_char,
@@ -90,8 +103,92 @@ static COMMANDS: [CommandSpec; 8] = [
         run: r#move::backward_char,
     },
     CommandSpec {
+        name: "next-line",
+        run: r#move::next_line,
+    },
+    CommandSpec {
+        name: "previous-line",
+        run: r#move::previous_line,
+    },
+    CommandSpec {
+        name: "move-beginning-of-line",
+        run: r#move::move_beginning_of_line,
+    },
+    CommandSpec {
+        name: "move-end-of-line",
+        run: r#move::move_end_of_line,
+    },
+    CommandSpec {
+        name: "forward-word",
+        run: r#move::forward_word,
+    },
+    CommandSpec {
+        name: "backward-word",
+        run: r#move::backward_word,
+    },
+    CommandSpec {
+        name: "beginning-of-buffer",
+        run: r#move::beginning_of_buffer,
+    },
+    CommandSpec {
+        name: "end-of-buffer",
+        run: r#move::end_of_buffer,
+    },
+    CommandSpec {
         name: "self-insert-command",
         run: edit::self_insert_command,
+    },
+    CommandSpec {
+        name: "newline",
+        run: edit::newline,
+    },
+    CommandSpec {
+        name: "delete-char",
+        run: edit::delete_char,
+    },
+    CommandSpec {
+        name: "delete-backward-char",
+        run: edit::delete_backward_char,
+    },
+    CommandSpec {
+        name: "undo",
+        run: edit::undo,
+    },
+    CommandSpec {
+        name: "undo-redo",
+        run: edit::undo_redo,
+    },
+    CommandSpec {
+        name: "kill-line",
+        run: kill::kill_line,
+    },
+    CommandSpec {
+        name: "kill-word",
+        run: kill::kill_word,
+    },
+    CommandSpec {
+        name: "kill-region",
+        run: kill::kill_region_command,
+    },
+    CommandSpec {
+        name: "kill-ring-save",
+        run: kill::kill_ring_save,
+    },
+    CommandSpec {
+        name: "yank",
+        run: kill::yank,
+    },
+    CommandSpec {
+        name: "yank-pop",
+        run: kill::yank_pop,
+    },
+    CommandSpec {
+        name: "set-mark-command",
+        run: mark::set_mark_command,
+    },
+    CommandSpec {
+        name: "exchange-point-and-mark",
+        run: mark::exchange_point_and_mark,
     },
     CommandSpec {
         name: "universal-argument",
@@ -134,6 +231,9 @@ pub struct CommandContext<'a> {
     pub key: Option<Key>,
     pub(crate) next_prefix_arg: PrefixArg,
     pub(crate) keep_prefix_state: bool,
+    /// Emacs `deactivate-mark`: the command loop deactivates the mark after
+    /// the command. Buffer changes request it too.
+    pub(crate) deactivate_mark: bool,
 }
 
 impl<'a> CommandContext<'a> {
@@ -158,6 +258,7 @@ impl<'a> CommandContext<'a> {
             key,
             next_prefix_arg: PrefixArg::None,
             keep_prefix_state: false,
+            deactivate_mark: false,
         }
     }
 
@@ -226,6 +327,116 @@ impl<'a> CommandContext<'a> {
     /// read the next key in `universal-argument-map`.
     pub fn universal_argument_mode(&mut self) {
         self.keep_prefix_state = true;
+    }
+
+    /// The command's `last-command` is `name`.
+    pub fn last_command_is(&self, name: &str) -> bool {
+        self.last_command == Some(name)
+    }
+
+    /// Deletes `range` with Emacs PT at `point`, which decides where undo
+    /// leaves point. Point moves like a marker.
+    pub fn delete_with_point(
+        &mut self,
+        range: Range<u64>,
+        point: u64,
+    ) -> Result<Vec<u8>, CommandError> {
+        let (buffer, recorder) = self.buffer_and_recorder();
+        buffer
+            .delete_with_point(range, point, recorder)
+            .map_err(|error| read_only_error(buffer, error))
+    }
+
+    /// Emacs `barf-if-buffer-read-only`.
+    pub fn check_editable(&self) -> Result<(), CommandError> {
+        let buffer = self.buffer();
+        buffer
+            .check_editable()
+            .map_err(|error| read_only_error(buffer, error))
+    }
+
+    /// Emacs `(mark t)`: the mark whether or not it is active.
+    pub fn mark(&self) -> Option<u64> {
+        let buffer = self.buffer();
+        buffer.mark.map(|mark| buffer.marker_pos(mark))
+    }
+
+    /// Emacs `set-marker` on `mark-marker`, without activating it.
+    pub fn set_mark_position(&mut self, pos: u64) {
+        let buffer = self.buffer_mut();
+        match buffer.mark {
+            Some(mark) => buffer.set_marker(mark, pos),
+            None => buffer.mark = Some(buffer.create_marker(pos, InsertionType::StayBefore)),
+        }
+    }
+
+    /// Emacs `region-active-p` (Transient Mark mode is always on).
+    pub fn region_active(&self) -> bool {
+        self.buffer().mark_active && self.mark().is_some()
+    }
+
+    /// Emacs `use-region-p`: an active, non-empty region.
+    pub fn use_region(&self) -> bool {
+        self.region_active() && self.mark() != Some(self.point())
+    }
+
+    /// Emacs `activate-mark`; does nothing without a mark.
+    pub fn activate_mark(&mut self) {
+        if self.mark().is_some() {
+            self.buffer_mut().mark_active = true;
+        }
+    }
+
+    /// Emacs `deactivate-mark` called directly.
+    pub fn deactivate_mark_now(&mut self) {
+        self.buffer_mut().mark_active = false;
+    }
+
+    /// Emacs `(setq deactivate-mark t)`.
+    pub fn request_deactivate_mark(&mut self) {
+        self.deactivate_mark = true;
+    }
+
+    /// The region from mark to point as Emacs's interactive spec reads it:
+    /// `(mark)` first, then `(point)`. Signals without a mark.
+    pub fn mark_and_point(&self) -> Result<(u64, u64), CommandError> {
+        let mark = self.mark().ok_or_else(|| self.error(NO_REGION))?;
+        Ok((mark, self.point()))
+    }
+
+    /// `region-beginning` to `region-end`.
+    pub fn region(&self) -> Result<Range<u64>, CommandError> {
+        let (mark, point) = self.mark_and_point()?;
+        Ok(mark.min(point)..mark.max(point))
+    }
+
+    pub fn kill_ring_mut(&mut self) -> &mut KillRing {
+        self.editor.kill_ring_mut()
+    }
+
+    /// Emacs `temporary-goal-column`, kept per client.
+    pub fn temporary_goal_column(&self) -> u64 {
+        self.editor.temporary_goal_column(self.client)
+    }
+
+    pub fn set_temporary_goal_column(&mut self, column: u64) {
+        self.editor.set_temporary_goal_column(self.client, column);
+    }
+}
+
+/// A failed edit as Emacs reports it: read-only names the buffer.
+fn read_only_error(buffer: &Buffer, error: EditError) -> CommandError {
+    match error {
+        EditError::ReadOnly => CommandError::BufferReadOnly(buffer.name.clone()),
+        other => other.into(),
+    }
+}
+
+/// An undo failure as Emacs reports it.
+fn undo_error(buffer: &Buffer, error: UndoError) -> CommandError {
+    match error {
+        UndoError::Edit(edit) => read_only_error(buffer, edit),
+        other => CommandError::User(other.to_string()),
     }
 }
 

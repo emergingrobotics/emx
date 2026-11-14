@@ -27,6 +27,10 @@ pub const UNDO_STRONG_LIMIT: u64 = 240_000;
 pub const UNDO_OUTER_LIMIT: u64 = 24_000_000;
 /// Emacs `kill-ring-max`.
 pub const KILL_RING_MAX: u64 = 120;
+/// Emacs `mark-ring-max`.
+pub const MARK_RING_MAX: u64 = 16;
+/// Emacs `indent-tabs-mode`: indentation commands may use tabs.
+pub const INDENT_TABS_MODE: bool = true;
 /// Emacs `auto-save-interval` and `auto-save-timeout`.
 pub const AUTO_SAVE_INTERVAL_KEYS: u64 = 300;
 pub const AUTO_SAVE_TIMEOUT_S: u64 = 30;
@@ -70,6 +74,8 @@ pub struct Config {
     pub undo_outer_limit: u64,
     pub append_tail_hash_bytes: u64,
     pub kill_ring_max: u64,
+    pub mark_ring_max: u64,
+    pub indent_tabs_mode: bool,
     pub auto_save_interval_keys: u64,
     pub auto_save_timeout_s: u64,
     pub tab_width: u64,
@@ -101,6 +107,8 @@ impl Default for Config {
             undo_outer_limit: UNDO_OUTER_LIMIT,
             append_tail_hash_bytes: APPEND_TAIL_HASH_BYTES,
             kill_ring_max: KILL_RING_MAX,
+            mark_ring_max: MARK_RING_MAX,
+            indent_tabs_mode: INDENT_TABS_MODE,
             auto_save_interval_keys: AUTO_SAVE_INTERVAL_KEYS,
             auto_save_timeout_s: AUTO_SAVE_TIMEOUT_S,
             tab_width: TAB_WIDTH,
@@ -183,6 +191,7 @@ impl Config {
             ("undo_strong_limit", self.undo_strong_limit),
             ("undo_outer_limit", self.undo_outer_limit),
             ("kill_ring_max", self.kill_ring_max),
+            ("mark_ring_max", self.mark_ring_max),
             ("auto_save_interval_keys", self.auto_save_interval_keys),
             ("auto_save_timeout_s", self.auto_save_timeout_s),
             ("amalgamation_limit", self.amalgamation_limit),
@@ -299,7 +308,8 @@ mod tests {
              undo_outer_limit = 13\nkill_ring_max = 14\nauto_save_interval_keys = 15\n\
              auto_save_timeout_s = 16\ntab_width = 4\nnext_screen_context_lines = 0\n\
              amalgamation_limit = 17\ncolumn_checkpoint_interval = 18\n\
-             long_line_threshold = 19\necho_keystrokes_ms = 0\n",
+             long_line_threshold = 19\necho_keystrokes_ms = 0\nmark_ring_max = 20\n\
+             indent_tabs_mode = false\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -319,6 +329,8 @@ mod tests {
             undo_strong_limit: 12,
             undo_outer_limit: 13,
             kill_ring_max: 14,
+            mark_ring_max: 20,
+            indent_tabs_mode: false,
             auto_save_interval_keys: 15,
             auto_save_timeout_s: 16,
             tab_width: 4,

@@ -229,6 +229,7 @@ dependencies = [
  "emx-types",
  "parking_lot",
  "serde",
+ "serde_json",
  "slotmap",
  "tempfile",
  "thiserror",

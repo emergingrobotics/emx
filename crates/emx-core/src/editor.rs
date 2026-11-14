@@ -112,6 +112,11 @@ struct Client {
     command_loop: CommandLoopState,
     /// The echo area: the last message, or the echo of keys being read.
     echo: String,
+    /// The last input event ended in an error (Emacs `command-error`),
+    /// which would also end a keyboard macro.
+    signaled: bool,
+    /// Emacs `temporary-goal-column` for this client's vertical motion.
+    temporary_goal_column: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +268,8 @@ impl Editor {
                 frame: Frame::new(window),
                 command_loop: CommandLoopState::default(),
                 echo: String::new(),
+                signaled: false,
+                temporary_goal_column: 0,
             },
         );
     }
@@ -324,6 +331,7 @@ impl Editor {
         let client = self.client_mut(client_id);
         // Reading an input event wipes the echo area.
         client.echo.clear();
+        client.signaled = false;
         let state = &mut client.command_loop;
         if !state.pending.is_empty() && key == QUIT_KEY {
             self.signal(client_id, None, &CommandError::Quit);
@@ -412,12 +420,15 @@ impl Editor {
     fn handle_paste(&mut self, client_id: ClientId, bytes: Vec<u8>) {
         let client = self.client_mut(client_id);
         client.echo.clear();
+        client.signaled = false;
         if !client.command_loop.pending.is_empty() {
             let keys = describe_keys(&client.command_loop.pending);
             self.undefined(client_id, format!("{keys} {PASTE_EVENT_DESCRIPTION}"));
             return;
         }
-        self.run_command(client_id, PASTE_COMMAND, None, |ctx| ctx.insert(&bytes));
+        self.run_command(client_id, PASTE_COMMAND, None, |ctx| {
+            command::xterm_paste(ctx, &bytes)
+        });
     }
 
     fn run_command(
@@ -433,17 +444,29 @@ impl Editor {
         let last_command = state.last_command;
         let mut context = CommandContext::new(self, client_id, name, key, prefix_arg, last_command);
         let result = run(&mut context);
+        // Commands may rename themselves, as Emacs commands set
+        // `this-command` (a kill becomes `kill-region`).
+        let this_command = context.this_command;
+        let deactivate_mark = context.deactivate_mark;
         let completion = if context.keep_prefix_state {
             Completion::KeepPrefixState(context.next_prefix_arg)
         } else {
             Completion::Ran {
-                this_command: Some(name),
+                this_command: Some(this_command),
                 next_prefix_arg: context.next_prefix_arg,
             }
         };
         match result {
-            Ok(()) => self.complete(client_id, completion),
-            Err(error) => self.signal(client_id, Some(name), &error),
+            Ok(()) => {
+                // Transient Mark mode: any buffer change sets Emacs's
+                // `deactivate-mark`, which the command loop then honors.
+                if deactivate_mark || self.journal_outbox.len() > journal_start {
+                    let buffer = self.selected_buffer(client_id);
+                    self.buffers[buffer].mark_active = false;
+                }
+                self.complete(client_id, completion);
+            }
+            Err(error) => self.signal(client_id, Some(this_command), &error),
         }
         self.finish_command(client_id, journal_start);
     }
@@ -486,6 +509,7 @@ impl Editor {
         self.ring_bell(client_id);
         let client = self.client_mut(client_id);
         client.echo = error.to_string();
+        client.signaled = true;
         client.command_loop.end_command();
         client.command_loop.last_command = this_command;
         if this_command.is_none() {
@@ -584,12 +608,28 @@ impl Editor {
         &self.client(client_id).echo
     }
 
+    pub(crate) fn signaled(&self, client_id: ClientId) -> bool {
+        self.client(client_id).signaled
+    }
+
     pub(crate) fn ring_bell(&mut self, client_id: ClientId) {
         self.effects.push(Effect::Send(client_id, ServerMsg::Bell));
     }
 
     pub(crate) fn kill_ring(&self) -> &KillRing {
         &self.kill_ring
+    }
+
+    pub(crate) fn kill_ring_mut(&mut self) -> &mut KillRing {
+        &mut self.kill_ring
+    }
+
+    pub(crate) fn temporary_goal_column(&self, client_id: ClientId) -> u64 {
+        self.client(client_id).temporary_goal_column
+    }
+
+    pub(crate) fn set_temporary_goal_column(&mut self, client_id: ClientId, column: u64) {
+        self.client_mut(client_id).temporary_goal_column = column;
     }
 
     pub(crate) fn selected_buffer(&self, client_id: ClientId) -> BufferId {

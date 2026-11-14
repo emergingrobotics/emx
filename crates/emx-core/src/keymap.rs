@@ -27,11 +27,42 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 9] = [
+const DEFAULT_BINDINGS: [(&str, &str); 40] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
     ("<left>", "backward-char"),
+    ("C-n", "next-line"),
+    ("<down>", "next-line"),
+    ("C-p", "previous-line"),
+    ("<up>", "previous-line"),
+    ("C-a", "move-beginning-of-line"),
+    ("<home>", "move-beginning-of-line"),
+    ("C-e", "move-end-of-line"),
+    ("<end>", "move-end-of-line"),
+    ("M-f", "forward-word"),
+    ("M-b", "backward-word"),
+    ("M-<", "beginning-of-buffer"),
+    ("C-<home>", "beginning-of-buffer"),
+    ("M->", "end-of-buffer"),
+    ("C-<end>", "end-of-buffer"),
+    ("RET", "newline"),
+    ("C-d", "delete-char"),
+    ("DEL", "delete-backward-char"),
+    ("C-k", "kill-line"),
+    ("M-d", "kill-word"),
+    ("C-w", "kill-region"),
+    ("M-w", "kill-ring-save"),
+    ("C-y", "yank"),
+    ("M-y", "yank-pop"),
+    ("C-SPC", "set-mark-command"),
+    ("C-@", "set-mark-command"),
+    ("C-x C-x", "exchange-point-and-mark"),
+    ("C-/", "undo"),
+    ("C-_", "undo"),
+    ("C-x u", "undo"),
+    ("C-?", "undo-redo"),
+    ("C-M-_", "undo-redo"),
     ("C-u", "universal-argument"),
     ("C-g", "keyboard-quit"),
     ("M--", NEGATIVE_ARGUMENT),
@@ -75,11 +106,12 @@ impl Keymap {
             bindings: HashMap::new(),
             printable: Some(SELF_INSERT),
         };
-        for (sequence, command) in DEFAULT_BINDINGS {
-            keymap.bind_default(sequence, Binding::Command(command));
-        }
+        // Prefixes first: binding one later would replace its keymap.
         for sequence in DEFAULT_PREFIXES {
             keymap.bind_default(sequence, Binding::Prefix(Keymap::new()));
+        }
+        for (sequence, command) in DEFAULT_BINDINGS {
+            keymap.bind_default(sequence, Binding::Command(command));
         }
         for modifiers in DIGIT_ARGUMENT_MODIFIERS {
             for digit in '0'..='9' {

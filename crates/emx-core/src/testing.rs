@@ -187,6 +187,17 @@ impl Harness {
         buffer.mark.map(|mark| buffer.marker_pos(mark))
     }
 
+    /// Emacs `mark-active`.
+    pub fn mark_active(&self) -> bool {
+        self.buffer().mark_active
+    }
+
+    /// The last key or paste ended in an error, as one would end a keyboard
+    /// macro; the echo area holds its message.
+    pub fn signaled(&self) -> bool {
+        self.editor.signaled(self.client)
+    }
+
     /// Newest first; invalid UTF-8 is replaced.
     pub fn kill_ring(&self) -> Vec<String> {
         self.editor
