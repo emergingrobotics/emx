@@ -19,6 +19,15 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/emergingrobotics/emx"
 
+# A panicking thread would leave the daemon alive but wedged (a buffer
+# saving forever, a client never detached); aborting turns it into a crash
+# the edit journal recovers from. The test harness still unwinds.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

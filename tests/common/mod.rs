@@ -94,10 +94,18 @@ impl TestEnv {
 
     /// Starts `emx server` and waits until it accepts connections.
     pub fn start_server(&self) -> ServerProcess {
+        self.start_server_with(&[])
+    }
+
+    /// `start_server` with extra variables set for the server.
+    pub fn start_server_with(&self, variables: &[(&str, &str)]) -> ServerProcess {
         let stderr = fs::File::create(self.root.path().join("server-stderr.log"))
             .expect("server stderr file");
-        let child = self
-            .emx()
+        let mut command = self.emx();
+        for (name, value) in variables {
+            command.env(name, value);
+        }
+        let child = command
             .arg("server")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::Sender;
@@ -33,6 +33,9 @@ pub const MAX_TERMINAL_ROWS: u16 = 250;
 /// Messages other than frames (answers, events) queued for a client that
 /// does not read them; past this the client is disconnected.
 pub const OUTBOX_MESSAGE_LIMIT: usize = 65_536;
+/// Bytes queued for a client that does not read them; past this the
+/// client is cut off.
+pub const OUTBOX_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdmitError {
@@ -69,50 +72,79 @@ pub enum Delivery {
     Queued,
     /// The frame queue is full; the frame was dropped.
     FrameDropped,
-    /// The client stopped reading; it must be disconnected.
+    /// The client stopped reading (or the message cannot be sent); it must
+    /// be cut off.
     Overflow,
+}
+
+/// One message, encoded as the line the writer sends.
+#[derive(Debug)]
+struct Encoded {
+    line: Vec<u8>,
+    frame: bool,
 }
 
 #[derive(Debug, Default)]
 struct OutboxState {
-    queue: VecDeque<ServerMsg>,
+    queue: VecDeque<Encoded>,
     frames: usize,
+    bytes: usize,
     closed: bool,
     /// A frame was dropped: ask for a resync once the queue drains.
     resync: bool,
 }
 
-/// The messages waiting for a client's writer thread.
+/// The messages waiting for a client's writer thread, bounded by count
+/// and by bytes, so a client that stops reading costs a bounded amount of
+/// memory.
 #[derive(Debug, Default)]
 pub struct Outbox {
     state: Mutex<OutboxState>,
     ready: Condvar,
+    /// The connection, to cut it off while the writer is blocked in a
+    /// write; `None` for an outbox with no socket behind it.
+    stream: Option<UnixStream>,
 }
 
 /// What the writer thread takes from the outbox.
 enum Next {
-    Message(ServerMsg),
+    Line(Vec<u8>),
     /// The queue drained after frames were dropped.
     Resync,
     Closed,
 }
 
 impl Outbox {
+    pub fn for_stream(stream: UnixStream) -> Outbox {
+        Outbox {
+            stream: Some(stream),
+            ..Outbox::default()
+        }
+    }
+
     pub fn push(&self, message: ServerMsg) -> Delivery {
+        let frame = matches!(message, ServerMsg::Frame { .. });
+        let mut line = Vec::new();
+        if let Err(error) = write_msg(&mut line, &message) {
+            eprintln!("emx server: cannot encode a message: {error}");
+            return Delivery::Overflow;
+        }
         let mut state = self.state.lock().expect("outbox lock");
         if state.closed {
             return Delivery::Queued;
         }
-        if matches!(message, ServerMsg::Frame { .. }) {
-            if state.frames >= FRAME_QUEUE_DEPTH as usize {
+        let over_bytes = state.bytes + line.len() > OUTBOX_BYTE_LIMIT;
+        if frame {
+            if state.frames >= FRAME_QUEUE_DEPTH as usize || over_bytes {
                 state.resync = true;
                 return Delivery::FrameDropped;
             }
             state.frames += 1;
-        } else if state.queue.len() >= OUTBOX_MESSAGE_LIMIT {
+        } else if state.queue.len() >= OUTBOX_MESSAGE_LIMIT || over_bytes {
             return Delivery::Overflow;
         }
-        state.queue.push_back(message);
+        state.bytes += line.len();
+        state.queue.push_back(Encoded { line, frame });
         self.ready.notify_one();
         Delivery::Queued
     }
@@ -123,23 +155,62 @@ impl Outbox {
         self.ready.notify_one();
     }
 
+    /// Ends the connection now: what is queued is dropped and the socket
+    /// is shut down, which also ends a write the writer is blocked in.
+    pub fn cut_off(&self) {
+        {
+            let mut state = self.state.lock().expect("outbox lock");
+            state.queue.clear();
+            state.frames = 0;
+            state.bytes = 0;
+            state.closed = true;
+        }
+        self.ready.notify_one();
+        if let Some(stream) = &self.stream
+            && let Err(error) = stream.shutdown(std::net::Shutdown::Both)
+            && error.kind() != io::ErrorKind::NotConnected
+        {
+            eprintln!("emx server: cutting off a client: {error}");
+        }
+    }
+
+    /// Bytes waiting to be written.
+    pub fn queued_bytes(&self) -> usize {
+        self.state.lock().expect("outbox lock").bytes
+    }
+
     /// Takes everything queued at once, as a writer would send it, and
     /// whether a resync is due; for driving a `Server` without sockets.
     pub fn take_queued(&self) -> (Vec<ServerMsg>, bool) {
-        let mut state = self.state.lock().expect("outbox lock");
-        state.frames = 0;
-        let resync = std::mem::take(&mut state.resync);
-        (state.queue.drain(..).collect(), resync)
+        let (lines, resync) = {
+            let mut state = self.state.lock().expect("outbox lock");
+            state.frames = 0;
+            state.bytes = 0;
+            let resync = std::mem::take(&mut state.resync);
+            let lines: Vec<Vec<u8>> = state.queue.drain(..).map(|encoded| encoded.line).collect();
+            (lines, resync)
+        };
+        let messages = lines
+            .iter()
+            .map(|line| {
+                LineReader::new(line.as_slice())
+                    .read_msg::<ServerMsg>()
+                    .expect("the outbox holds what write_msg encoded")
+                    .expect("one message per line")
+            })
+            .collect();
+        (messages, resync)
     }
 
     fn next(&self) -> Next {
         let mut state = self.state.lock().expect("outbox lock");
         loop {
-            if let Some(message) = state.queue.pop_front() {
-                if matches!(message, ServerMsg::Frame { .. }) {
+            if let Some(encoded) = state.queue.pop_front() {
+                if encoded.frame {
                     state.frames -= 1;
                 }
-                return Next::Message(message);
+                state.bytes -= encoded.line.len();
+                return Next::Line(encoded.line);
             }
             if state.closed {
                 return Next::Closed;
@@ -158,7 +229,9 @@ impl Outbox {
 pub fn serve(stream: UnixStream, client: ClientId, inputs: Sender<Input>) {
     let mut reader = LineReader::new(&stream);
     let hello = match read_hello(&mut reader) {
-        Ok(hello) => hello,
+        Ok(Some(hello)) => hello,
+        // A connection closed before saying anything (a liveness probe).
+        Ok(None) => return,
         Err(reason) => {
             refuse(&stream, &reason);
             return;
@@ -171,7 +244,14 @@ pub fn serve(stream: UnixStream, client: ClientId, inputs: Sender<Input>) {
             return;
         }
     };
-    let outbox = Arc::new(Outbox::default());
+    let cut_off_stream = match stream.try_clone() {
+        Ok(cut_off_stream) => cut_off_stream,
+        Err(error) => {
+            eprintln!("emx server: cannot serve a client: {error}");
+            return;
+        }
+    };
+    let outbox = Arc::new(Outbox::for_stream(cut_off_stream));
     outbox.push(ServerMsg::Welcome {
         server_pid: std::process::id(),
     });
@@ -220,17 +300,20 @@ struct Hello {
     rows: u16,
 }
 
-fn read_hello(reader: &mut LineReader<&UnixStream>) -> Result<Hello, String> {
-    let message = reader
+fn read_hello(reader: &mut LineReader<&UnixStream>) -> Result<Option<Hello>, String> {
+    let Some(message) = reader
         .read_msg::<ClientMsg>()
-        .map_err(|error| error.to_string())?;
-    let Some(ClientMsg::Hello {
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    let ClientMsg::Hello {
         kind,
         cwd,
         cols,
         rows,
         wait_for,
-    }) = message
+    } = message
     else {
         return Err("the first message must be hello".to_string());
     };
@@ -242,12 +325,12 @@ fn read_hello(reader: &mut LineReader<&UnixStream>) -> Result<Hello, String> {
         return Err(format!("cwd {} is not absolute", cwd.display()));
     }
     check_size(cols, rows)?;
-    Ok(Hello {
+    Ok(Some(Hello {
         kind,
         cwd,
         cols,
         rows,
-    })
+    }))
 }
 
 fn check_size(cols: u16, rows: u16) -> Result<(), String> {
@@ -346,12 +429,15 @@ pub fn absolute_path(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 fn write_loop(stream: UnixStream, client: ClientId, outbox: &Outbox, inputs: &Sender<Input>) {
-    let mut writer = BufWriter::new(&stream);
+    let mut writer = &stream;
     loop {
         match outbox.next() {
-            Next::Message(message) => {
-                if let Err(error) = write_msg(&mut writer, &message) {
-                    if error.kind() != io::ErrorKind::BrokenPipe {
+            Next::Line(line) => {
+                if let Err(error) = writer.write_all(&line) {
+                    if !matches!(
+                        error.kind(),
+                        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                    ) {
                         eprintln!("emx server: writing to client {}: {error}", client.0);
                     }
                     break;

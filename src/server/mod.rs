@@ -560,7 +560,7 @@ impl Server {
             Delivery::Queued => {}
             Delivery::FrameDropped => connection.awaiting_resync = true,
             Delivery::Overflow => {
-                self.disconnect(client, "the client stopped reading");
+                self.cut_off(client);
                 return;
             }
         }
@@ -573,6 +573,21 @@ impl Server {
         }
     }
 
+    /// A client that stops reading is cut off at once: its backlog is
+    /// dropped and its socket shut down, even mid-write.
+    fn cut_off(&mut self, client: ClientId) {
+        let Some(connection) = self.connections.remove(&client) else {
+            return;
+        };
+        eprintln!(
+            "emx server: client {} stopped reading; cutting it off",
+            client.0
+        );
+        connection.outbox.cut_off();
+        self.raised.push_back(Event::ClientDetached(client));
+    }
+
+    /// Tells the client why, then ends the connection.
     fn disconnect(&mut self, client: ClientId, reason: &str) {
         let Some(connection) = self.connections.remove(&client) else {
             return;

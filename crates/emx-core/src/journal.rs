@@ -55,6 +55,9 @@ const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 const GROUP_AND_OTHER_BITS: u32 = 0o077;
 const JOURNAL_EXTENSION: &str = "jnl";
+/// A restarted journal is written as `<id>.jnl.new` until it replaces the
+/// old one; replay reads only `.jnl` files.
+const REPLACEMENT_EXTENSION: &str = "new";
 const ID_HEX_DIGITS: usize = 32;
 const HEX_RADIX: u32 = 16;
 
@@ -642,6 +645,9 @@ struct OpenJournal {
     length: u64,
     /// The last append failed and may have left part of a frame.
     torn: bool,
+    /// Records go to this new file, which replaces the journal once its
+    /// epoch is durable (see `start_afresh`).
+    replacing: Option<PathBuf>,
 }
 
 /// How a journal file's data is made durable; `fdatasync` except where a
@@ -715,7 +721,11 @@ impl JournalWriter {
                     let journal = writer.open_journal(buffer)?;
                     writer.journals.insert(buffer, journal);
                 }
-                if writer.afresh.contains(&buffer) {
+                let replacing = writer
+                    .journals
+                    .get(&buffer)
+                    .is_some_and(|journal| journal.replacing.is_some());
+                if writer.afresh.contains(&buffer) || replacing {
                     writer.start_afresh(buffer)?;
                 }
                 writer.append(buffer, &Record::Header(header))
@@ -728,14 +738,29 @@ impl JournalWriter {
                 if self.poisoned.contains(&buffer) && !epoch {
                     return Err(JournalError::Poisoned { journal: buffer });
                 }
-                self.guarded(buffer, |writer| writer.append(buffer, &record))?;
+                self.guarded(buffer, |writer| {
+                    writer.append(buffer, &record)?;
+                    if epoch {
+                        writer.finish_replacement(buffer)?;
+                    }
+                    Ok(())
+                })?;
                 if epoch {
                     self.poisoned.remove(&buffer);
                 }
                 Ok(())
             }
             JournalOp::Close { buffer } => {
-                self.journals.remove(&buffer);
+                if let Some(replacing) = self
+                    .journals
+                    .remove(&buffer)
+                    .and_then(|journal| journal.replacing)
+                {
+                    fs::remove_file(&replacing).map_err(|source| JournalError::Write {
+                        path: replacing.clone(),
+                        source,
+                    })?;
+                }
                 self.dirty.remove(&buffer);
                 self.poisoned.remove(&buffer);
                 self.afresh.remove(&buffer);
@@ -800,29 +825,70 @@ impl JournalWriter {
         failures
     }
 
-    /// Empties a journal whose sync failed, keeping only the magic, so the
-    /// header and epoch that follow are all it holds.
+    /// Starts a journal whose sync failed over in a new file beside it.
+    /// The old file keeps its records, durable or not, until the new one
+    /// holds a header and an epoch on disk (`finish_replacement`): a crash
+    /// in between replays the old one.
     fn start_afresh(&mut self, id: JournalId) -> Result<(), JournalError> {
-        let path = self.journal_path(id);
+        let temporary = self
+            .directory
+            .join(format!("{}.{REPLACEMENT_EXTENSION}", id.file_name()));
+        let write_error = |source| JournalError::Write {
+            path: temporary.clone(),
+            source,
+        };
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(write_error(error)),
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(&temporary)
+            .map_err(write_error)?;
+        file.write_all(MAGIC).map_err(write_error)?;
         let journal = self
             .journals
             .get_mut(&id)
             .ok_or(JournalError::NotOpen { journal: id })?;
-        let reset = |journal: &mut OpenJournal| -> std::io::Result<()> {
-            journal.file.set_len(0)?;
-            journal.file.seek(SeekFrom::Start(0))?;
-            journal.file.write_all(MAGIC)?;
-            Ok(())
-        };
-        if let Err(source) = reset(journal) {
-            journal.torn = true;
-            return Err(JournalError::Write { path, source });
-        }
+        journal.file = file;
         journal.length = MAGIC.len() as u64;
         journal.torn = false;
+        journal.replacing = Some(temporary);
         self.afresh.remove(&id);
         self.dirty.insert(id);
         Ok(())
+    }
+
+    /// The new file of a restarted journal holds its epoch: make it durable,
+    /// then rename it over the old journal and make the rename durable.
+    fn finish_replacement(&mut self, id: JournalId) -> Result<(), JournalError> {
+        let path = self.journal_path(id);
+        let Some(journal) = self.journals.get_mut(&id) else {
+            return Ok(());
+        };
+        let Some(temporary) = journal.replacing.clone() else {
+            return Ok(());
+        };
+        (self.sync_data.0)(&journal.file).map_err(|source| JournalError::Write {
+            path: temporary.clone(),
+            source,
+        })?;
+        fs::rename(&temporary, &path).map_err(|source| JournalError::Write {
+            path: path.clone(),
+            source,
+        })?;
+        journal.replacing = None;
+        File::open(&self.directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| JournalError::Write {
+                path: self.directory.clone(),
+                source,
+            })
     }
 
     fn journal_path(&self, id: JournalId) -> PathBuf {
@@ -876,6 +942,7 @@ impl JournalWriter {
         self.directory_dirty = true;
         self.dirty.insert(id);
         Ok(OpenJournal {
+            replacing: None,
             file,
             length,
             torn: false,

@@ -1229,3 +1229,80 @@ fn sync_failure_starts_the_journal_afresh() {
         "only the new epoch is in the file ({size} bytes for {text} bytes of text)"
     );
 }
+
+/// Restarting after a failed sync must not destroy records that were
+/// already durable: the new journal replaces the old one only once its
+/// header and epoch are on disk.
+#[test]
+fn restart_replaces_the_journal_only_once_the_new_one_is_durable() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let journal = directory.path().join(JOURNAL_DIRECTORY);
+    // Fail the syncs numbered here (1-based): the batch sync, then the
+    // sync of the replacement.
+    let calls = Arc::new(AtomicU32::new(0));
+    let counter = calls.clone();
+    let mut writer = JournalWriter::with_sync(
+        &journal,
+        Box::new(move |file: &fs::File| {
+            let call = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 || call == 2 {
+                return Err(std::io::Error::from_raw_os_error(5));
+            }
+            file.sync_data()
+        }),
+    )
+    .expect("writer");
+    let mut harness = Harness::new();
+    harness.type_text("durable");
+    let ops = harness.journal_ops();
+    let id = journal_id(&ops);
+    apply_journal_unsynced(&mut writer, ops);
+    assert_eq!(writer.sync().len(), 1, "the batch sync fails");
+    let old_file = journal.join(id.file_name());
+    let old = fs::read(&old_file).expect("old journal");
+    let replay_old = || {
+        let recovered = replay_dir(&journal, &Config::default()).expect("replay");
+        rebuilt(&recovered).3.to_vec()
+    };
+    assert_eq!(replay_old(), b"durable");
+
+    harness.type_text("!");
+    harness.journal_ops();
+    harness.journal_write_failed(id, "Input/output error");
+    let mut restart = harness.journal_ops().into_iter();
+    let open = restart.next().expect("header");
+    assert!(matches!(open, JournalOp::Open { .. }));
+    writer.apply(open).expect("the header goes to the new file");
+    assert_eq!(fs::read(&old_file).expect("old journal"), old, "untouched");
+    assert_eq!(replay_old(), b"durable", "a crash now replays the old one");
+    let epoch = restart.next().expect("epoch");
+    assert!(
+        writer.apply(epoch).is_err(),
+        "the replacement's sync fails, so it does not replace"
+    );
+    assert_eq!(fs::read(&old_file).expect("old journal"), old, "untouched");
+
+    harness.journal_write_failed(id, "Input/output error");
+    apply_journal(&mut writer, harness.journal_ops()).expect("second restart");
+    assert_eq!(replay_old(), b"durable!");
+    let names: Vec<String> = fs::read_dir(&journal)
+        .expect("journal dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(names, vec![id.file_name()], "no replacement file is left");
+}
+
+fn apply_journal_unsynced(writer: &mut JournalWriter, ops: Vec<JournalOp>) {
+    for op in ops {
+        writer.apply(op).expect("apply");
+    }
+}

@@ -20,6 +20,11 @@ pub const IO_THREADS: usize = 4;
 /// The indexer reports its progress every this many blocks.
 pub const INDEX_PROGRESS_BLOCKS: u64 = 256;
 
+/// Set in the environment, a save job panics on its I/O thread: the seam
+/// tests use to check that a worker panic ends the server (`panic =
+/// "abort"`) instead of leaving it wedged.
+pub const WORKER_PANIC_ENV: &str = "EMX_TEST_WORKER_PANIC";
+
 /// Where workers deliver the events their results become.
 pub type Deliver = Arc<dyn Fn(Event) + Send + Sync>;
 
@@ -81,6 +86,7 @@ pub struct Pool {
 impl Pool {
     pub fn new(config: Arc<Config>, journal: JournalProgress, deliver: Deliver) -> Pool {
         let shared = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
+        let panic_on_save = std::env::var_os(WORKER_PANIC_ENV).is_some();
         let threads = (0..IO_THREADS)
             .map(|index| {
                 let shared = shared.clone();
@@ -89,7 +95,7 @@ impl Pool {
                 let deliver = deliver.clone();
                 thread::Builder::new()
                     .name(format!("emx-io-{index}"))
-                    .spawn(move || work(&shared, &config, &journal, &deliver))
+                    .spawn(move || work(&shared, &config, &journal, &deliver, panic_on_save))
                     .expect("spawning an I/O thread")
             })
             .collect();
@@ -127,6 +133,7 @@ fn work(
     config: &Config,
     journal: &JournalProgress,
     deliver: &Deliver,
+    panic_on_save: bool,
 ) {
     let (queue, ready) = shared;
     loop {
@@ -153,6 +160,9 @@ fn work(
             }
         };
         journal.wait_for(queued.after_journal);
+        if panic_on_save && matches!(queued.job, Job::Save { .. }) {
+            panic!("{WORKER_PANIC_ENV} is set: an I/O thread panics on a save");
+        }
         if let Some(event) = run(queued.job, config) {
             deliver(event);
         }

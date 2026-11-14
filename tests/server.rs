@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use common::{ServerProcess, TestEnv, WAIT};
 use emx::server::client_conn::{AdmitError, Outbox, admit, peer_uid};
-use emx::server::journal_writer::JournalBackend;
+use emx::server::journal_writer::{JOURNAL_IDLE_SYNC_MS, JournalBackend, JournalThread};
+use emx::server::workers::WORKER_PANIC_ENV;
 use emx::server::{Input, Server, Step};
 use emx_core::config::DAEMON_GRACE_MS;
 use emx_core::journal::{
@@ -645,4 +646,211 @@ fn prefetch_deduped() {
     );
     harness.step_until(|harness| harness.shows("0123456789abcdef"));
     assert_eq!(harness.server.prefetch_reads(), 1);
+}
+
+// ---- Fix round 1 ---------------------------------------------------------------
+
+/// A panicking thread must not leave the daemon alive but wedged: with
+/// `panic = "abort"` the process ends, the panic hook having run (it is
+/// what restores a terminal), and the journal brings the edits back.
+#[test]
+fn worker_panic_ends_the_server_and_the_next_one_replays() {
+    let env = TestEnv::new();
+    let path = env.file("panic.txt", "on disk\n");
+    let mut server = env.start_server_with(&[(WORKER_PANIC_ENV, "1")]);
+    let mut client = env.connect(ClientKind::Tui);
+    client.open(&path);
+    client.type_text("unsaved ");
+    client.wait_text("unsaved on disk");
+    client.keys("C-x C-s");
+    let status = server.wait_exit(WAIT).expect("the panic ends the server");
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(rustix::process::Signal::ABORT.as_raw()),
+        "aborted; stderr:\n{}",
+        env.server_stderr()
+    );
+    assert!(
+        env.server_stderr()
+            .contains("an I/O thread panics on a save"),
+        "the panic hook ran before the abort:\n{}",
+        env.server_stderr()
+    );
+    drop(client);
+    assert_eq!(fs::read_to_string(&path).expect("read"), "on disk\n");
+    let _restarted = env.start_server();
+    let mut client = env.connect(ClientKind::Tui);
+    client.open(&path);
+    client.wait_text("unsaved on disk");
+    assert!(client.modeline().contains("**"), "{}", client.modeline());
+}
+
+fn resident_bytes(pid: u32) -> u64 {
+    const KIB: u64 = 1024;
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).expect("proc status");
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("VmRSS:"))
+        .expect("VmRSS");
+    let kib: u64 = line
+        .split_whitespace()
+        .nth(1)
+        .expect("value")
+        .parse()
+        .expect("number");
+    kib * KIB
+}
+
+/// A subscriber that never reads is cut off once its backlog passes
+/// `OUTBOX_BYTE_LIMIT`, even while its writer is blocked in a write.
+#[test]
+fn stalled_subscriber_is_cut_off() {
+    use std::io::{Read, Write};
+
+    const BUFFERS: usize = 100;
+    const REQUESTS: usize = 2000;
+    const DIRECTORY_LEVELS: usize = 18;
+    const LEVEL_NAME: usize = 200;
+    const MEMORY_BOUND: u64 = 100 * 1024 * 1024;
+
+    let env = TestEnv::new();
+    let mut deep = env.work.clone();
+    for level in 0..DIRECTORY_LEVELS {
+        let letter = char::from(b'a' + level as u8);
+        deep.push(letter.to_string().repeat(LEVEL_NAME));
+    }
+    fs::create_dir_all(&deep).expect("deep directory");
+    let server = env.start_server();
+    let mut good = env.connect(ClientKind::Tui);
+    for index in 0..BUFFERS {
+        good.open(&deep.join(format!("f{index}")));
+    }
+
+    let mut stalled = UnixStream::connect(env.socket_path()).expect("connect");
+    let mut lines = Vec::new();
+    emx_proto::write_msg(
+        &mut lines,
+        &emx_proto::ClientMsg::Hello {
+            kind: ClientKind::Cli,
+            cwd: WirePath::from(env.work.as_path()),
+            cols: 80,
+            rows: 24,
+            wait_for: None,
+        },
+    )
+    .expect("encode");
+    emx_proto::write_msg(
+        &mut lines,
+        &emx_proto::ClientMsg::Request {
+            id: 0,
+            req: Request::SubscribeEvents,
+        },
+    )
+    .expect("encode");
+    for id in 1..=REQUESTS as u64 {
+        emx_proto::write_msg(
+            &mut lines,
+            &emx_proto::ClientMsg::Request {
+                id,
+                req: Request::ListBuffers,
+            },
+        )
+        .expect("encode");
+    }
+    // The server stops reading once it cuts the client off, so the write
+    // may fail part way.
+    drop(stalled.write_all(&lines));
+    // Not reading until the server has given up on the client.
+    let deadline = Instant::now() + WAIT;
+    while !env
+        .server_stderr()
+        .contains("stopped reading; cutting it off")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "never cut off; stderr:\n{}",
+            env.server_stderr()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    // The socket is shut down at once, even though the writer was blocked
+    // in a write the client never read: the client's writes now fail.
+    let mut ping = Vec::new();
+    emx_proto::write_msg(
+        &mut ping,
+        &emx_proto::ClientMsg::Request {
+            id: 0,
+            req: Request::DiffExternal {
+                path: WirePath::Text("/x".to_string()),
+            },
+        },
+    )
+    .expect("encode");
+    let deadline = Instant::now() + WAIT;
+    while stalled.write_all(&ping).is_ok() {
+        assert!(Instant::now() < deadline, "the socket stays open");
+        thread::sleep(Duration::from_millis(1));
+    }
+    good.keys("C-g");
+    good.type_text("still here");
+    good.wait_text("still here");
+    stalled.set_read_timeout(Some(WAIT)).expect("read timeout");
+    let mut received = Vec::new();
+    stalled.read_to_end(&mut received).unwrap_or_else(|error| {
+        panic!(
+            "the server closes the connection: {error}; stderr:\n{}",
+            env.server_stderr()
+        )
+    });
+    assert!(
+        resident_bytes(server.pid()) < MEMORY_BOUND,
+        "the backlog stays bounded"
+    );
+    assert!(
+        received.len() < REQUESTS * BUFFERS * LEVEL_NAME,
+        "the backlog was dropped, not sent"
+    );
+    good.type_text("!");
+    good.wait_text("still here!");
+}
+
+/// DESIGN section 2: "every journal_fsync_ms or on idle".
+#[test]
+fn quiet_after_an_edit_syncs_long_before_the_batch_interval() {
+    struct CountingBackend {
+        syncs: Arc<AtomicU64>,
+    }
+
+    impl JournalBackend for CountingBackend {
+        fn apply(&mut self, _op: JournalOp) -> Result<(), JournalError> {
+            Ok(())
+        }
+
+        fn sync(&mut self) -> Vec<SyncFailure> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        }
+    }
+
+    const BATCH: Duration = Duration::from_secs(60);
+    const IDLE_SLACK: u64 = 25;
+    let syncs = Arc::new(AtomicU64::new(0));
+    let mut journal = JournalThread::spawn(
+        Box::new(CountingBackend {
+            syncs: syncs.clone(),
+        }),
+        BATCH,
+        Box::new(|_| {}),
+    );
+    journal.submit(JournalOp::Close {
+        buffer: emx_core::journal::JournalId(1),
+    });
+    let started = Instant::now();
+    while syncs.load(Ordering::SeqCst) == 0 {
+        assert!(
+            started.elapsed() < Duration::from_millis(JOURNAL_IDLE_SYNC_MS * IDLE_SLACK),
+            "no idle sync"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
 }

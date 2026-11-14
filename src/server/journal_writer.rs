@@ -19,6 +19,9 @@ use emx_core::journal::{JournalError, JournalId, JournalOp, JournalWriter, Recor
 /// journal wait this long before they are reported again, so a disk that
 /// keeps failing does not keep the editor restarting the journal in a loop.
 pub const JOURNAL_RETRY_MS: u64 = 1000;
+/// DESIGN section 2 syncs "every `journal_fsync_ms` or on idle": once no
+/// operation has arrived for this long, what was applied is synced.
+pub const JOURNAL_IDLE_SYNC_MS: u64 = 20;
 
 /// What the journal thread writes to; a `JournalWriter` except in tests.
 pub trait JournalBackend: Send {
@@ -101,6 +104,8 @@ impl JournalThread {
             progress: progress.clone(),
             report,
             unsynced_since: None,
+            last_applied: Instant::now(),
+            idle_sync: true,
             reported_at: HashMap::new(),
             held: HashMap::new(),
         };
@@ -166,6 +171,11 @@ struct Batcher {
     report: Box<dyn Fn(JournalFailure) + Send>,
     /// When the oldest operation not yet synced was applied.
     unsynced_since: Option<Instant>,
+    /// When the latest operation was applied.
+    last_applied: Instant,
+    /// After a failed sync, the retry waits for the batch interval rather
+    /// than the idle delay, until a new operation arrives.
+    idle_sync: bool,
     /// When each journal's failure was last reported.
     reported_at: HashMap<JournalId, Instant>,
     /// Failures held back by `JOURNAL_RETRY_MS`.
@@ -217,10 +227,7 @@ impl Batcher {
                 None => {}
             }
             let now = Instant::now();
-            if self
-                .unsynced_since
-                .is_some_and(|since| now >= since + self.fsync_interval)
-            {
+            if self.sync_due().is_some_and(|due| now >= due) {
                 self.sync();
             }
             self.report_held(now);
@@ -228,8 +235,19 @@ impl Batcher {
         self.sync();
     }
 
+    /// When the unsynced operations must be synced: after the batch
+    /// interval, or sooner once the queue has been idle.
+    fn sync_due(&self) -> Option<Instant> {
+        let since = self.unsynced_since?;
+        let batch = since + self.fsync_interval;
+        if !self.idle_sync {
+            return Some(batch);
+        }
+        Some(batch.min(self.last_applied + Duration::from_millis(JOURNAL_IDLE_SYNC_MS)))
+    }
+
     fn next_deadline(&self) -> Option<Instant> {
-        let sync = self.unsynced_since.map(|since| since + self.fsync_interval);
+        let sync = self.sync_due();
         let retry = self
             .held
             .keys()
@@ -256,7 +274,9 @@ impl Batcher {
             Err(error) => self.failed(journal, error.to_string()),
         }
         self.progress.advance(sequence);
-        self.unsynced_since.get_or_insert_with(Instant::now);
+        self.last_applied = Instant::now();
+        self.idle_sync = true;
+        self.unsynced_since.get_or_insert(self.last_applied);
     }
 
     fn sync(&mut self) {
@@ -265,6 +285,7 @@ impl Batcher {
             None
         } else {
             // What failed stays dirty; try again after another interval.
+            self.idle_sync = false;
             Some(Instant::now())
         };
         for failure in failures {
