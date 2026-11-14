@@ -1,4 +1,5 @@
 mod files;
+mod reload;
 mod requests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -24,6 +25,7 @@ use crate::render::{PrefetchRequest, render};
 use crate::undo::{UndoLimits, outer_limit_warning};
 pub(crate) use files::Purpose;
 use files::{AutoSaveRequest, ExitWait, SaveRequest};
+use reload::ReloadRequest;
 use requests::{GroupReply, OpenRequest, Reply};
 
 use crate::window::{
@@ -164,6 +166,8 @@ enum TimerPurpose {
     AutoSaveIdle,
     /// The client's cursor may be reported to `emx events` again.
     CursorEvent(ClientId),
+    /// A settling file is looked at again.
+    Settle(BufferId),
 }
 
 /// How a command finished, for the command loop's bookkeeping.
@@ -231,6 +235,21 @@ pub struct Editor {
     reverting: BTreeSet<BufferId>,
     reload_replies: Vec<GroupReply>,
     save_replies: Vec<GroupReply>,
+    /// Observations in flight, and whether another was asked for meanwhile.
+    observing: HashMap<BufferId, bool>,
+    /// The settle timer each settling buffer waits for.
+    settle_timers: HashMap<BufferId, TimerId>,
+    /// External changes that came while the buffer was busy, looked into
+    /// once it is not.
+    reload_recheck: BTreeSet<BufferId>,
+    reloading: HashMap<BufferId, ReloadRequest>,
+    /// Appends being read, with the text they extend.
+    appending: HashMap<BufferId, Text>,
+    /// Confirmed `revert-buffer`s waiting for the file to settle, and who
+    /// asked.
+    revert_pending: HashMap<BufferId, Option<ClientId>>,
+    /// Follow-edit mode: a reload moves point to the first changed line.
+    follow_edit: bool,
 }
 
 impl Editor {
@@ -279,6 +298,13 @@ impl Editor {
             reverting: BTreeSet::new(),
             reload_replies: Vec::new(),
             save_replies: Vec::new(),
+            observing: HashMap::new(),
+            settle_timers: HashMap::new(),
+            reload_recheck: BTreeSet::new(),
+            reloading: HashMap::new(),
+            appending: HashMap::new(),
+            revert_pending: HashMap::new(),
+            follow_edit: false,
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -332,6 +358,14 @@ impl Editor {
             Event::AutoSaved { buffer, result } => self.auto_saved(buffer, result),
             Event::AutoSaveRead { buffer, result } => self.auto_save_read(buffer, result),
             Event::Recovered(buffers) => self.recovered(buffers),
+            Event::FileChanged { path } => self.file_changed(&path),
+            Event::FileRenamed { from, to } => self.file_renamed(&from, &to),
+            Event::Observed { buffer, result } => self.observed(buffer, result),
+            Event::Reloaded { buffer, result } => self.reloaded(buffer, result),
+            Event::AppendRead { buffer, result } => self.append_read(buffer, result),
+            Event::DiffReady {
+                requester, result, ..
+            } => self.diff_ready(requester, result),
         }
         self.redisplay();
         self.report_cursors();
@@ -594,10 +628,12 @@ impl Editor {
             }
             TimerPurpose::AutoSaveIdle => self.auto_save_idle(id),
             TimerPurpose::CursorEvent(client) => self.cursor_timer_expired(client, id),
+            TimerPurpose::Settle(buffer) => self.settle_timer(buffer, id),
         }
     }
 
     fn handle_key(&mut self, client_id: ClientId, key: Key) {
+        self.buffer_viewed(client_id);
         let client = self.client_mut(client_id);
         // Reading an input event wipes the echo area.
         client.echo.clear();
@@ -1249,11 +1285,7 @@ mod tests {
         let mut editor = Editor::new(Config::default()).expect("valid config");
         attach(&mut editor, FIRST);
         let scratch = editor.selected_buffer(FIRST);
-        editor.buffer_mut(scratch).file = Some(FileBinding {
-            path: "/tmp/file".into(),
-            identity: None,
-            saving: false,
-        });
+        editor.buffer_mut(scratch).file = Some(FileBinding::new("/tmp/file".into(), None));
         type_keys(&mut editor, FIRST, "a");
         assert!(editor.has_unsaved());
         // The edit armed the auto-save idle timer; only detach's count.

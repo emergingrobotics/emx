@@ -483,7 +483,8 @@ fn connection_closed_before_welcome_is_retried_once() {
     let exiting = exiting_server(&env, 1, true);
     let pty = Pty::spawn(&env, &["f.txt"]);
     exiting.join().expect("the exiting server");
-    let modeline = pty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    let modeline =
+        pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
     assert!(modeline.contains(":@---  F2  f.txt"), "{modeline:?}");
     assert_eq!(session_servers(&env).len(), 1, "a new server was started");
 }

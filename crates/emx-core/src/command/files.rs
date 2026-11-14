@@ -56,3 +56,30 @@ pub(super) fn read_only_mode(ctx: &mut CommandContext) -> Result<(), CommandErro
     buffer.read_only = !buffer.read_only;
     Ok(())
 }
+
+/// Emacs `revert-buffer`: the file replaces the buffer's text, undoably,
+/// asking first when that discards edits.
+pub(super) fn revert_buffer(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().revert_buffer_command(client)
+}
+
+/// Keeps the buffer over a newer file on disk: the next save overwrites it
+/// without asking.
+pub(super) fn keep_mine(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().keep_mine_command(client)
+}
+
+/// Shows what an external change changed, in `*diff-external*`.
+pub(super) fn diff_external(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().diff_external_command(client)
+}
+
+/// Toggles moving point to the first changed line when a file reloads.
+pub(super) fn follow_edit_mode(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().follow_edit_mode_command(client);
+    Ok(())
+}

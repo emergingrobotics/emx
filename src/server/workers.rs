@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
-use emx_core::autosave;
+use emx_core::diff::{self, DiffJob};
 use emx_core::io::{self, SaveFailure, SavePlan};
-use emx_core::{AutoSaveJob, BufferId, Config, Event, PrefetchRequest};
-use emx_text::{BlockCache, LineIndex, Original, Sources, index_file};
+use emx_core::{AutoSaveJob, BufferId, Config, Event, PrefetchRequest, ReloadJob};
+use emx_core::{autosave, reload};
+use emx_text::{BlockCache, FileIdentity, LineIndex, Original, Sources, index_file};
 
 use super::journal_writer::JournalProgress;
 
@@ -50,6 +51,20 @@ pub enum Job {
         request: PrefetchRequest,
         cache: Arc<BlockCache>,
     },
+    Observe {
+        buffer: BufferId,
+        path: PathBuf,
+        old_len: Option<u64>,
+    },
+    Reload(ReloadJob),
+    ReadAppend {
+        buffer: BufferId,
+        path: PathBuf,
+        old: FileIdentity,
+        new: FileIdentity,
+        old_tail_hash: u64,
+    },
+    Diff(DiffJob),
 }
 
 impl Job {
@@ -59,7 +74,13 @@ impl Job {
         match self {
             Job::AutoSave(job) => Some(job.file.clone()),
             Job::RemoveAutoSave { file } | Job::ReadAutoSave { file, .. } => Some(file.clone()),
-            Job::Load { .. } | Job::Save { .. } | Job::Prefetch { .. } => None,
+            Job::Load { .. }
+            | Job::Save { .. }
+            | Job::Prefetch { .. }
+            | Job::Observe { .. }
+            | Job::Reload(_)
+            | Job::ReadAppend { .. }
+            | Job::Diff(_) => None,
         }
     }
 }
@@ -201,7 +222,41 @@ fn run(job: Job, config: &Config) -> Option<Event> {
         }),
         Job::Save { buffer, plan } => Some(Event::SaveFinished {
             buffer,
-            result: io::save(&plan).map_err(|error| SaveFailure::from(&error)),
+            result: io::save_file(&plan, config.append_tail_hash_bytes)
+                .map_err(|error| SaveFailure::from(&error)),
+        }),
+        Job::Observe {
+            buffer,
+            path,
+            old_len,
+        } => Some(Event::Observed {
+            buffer,
+            result: reload::observe(&path, old_len, config.append_tail_hash_bytes),
+        }),
+        Job::Reload(job) => Some(Event::Reloaded {
+            buffer: job.buffer,
+            result: reload::reload_file(&job.path, config, &job.previous, &job.anchors),
+        }),
+        Job::ReadAppend {
+            buffer,
+            path,
+            old,
+            new,
+            old_tail_hash,
+        } => Some(Event::AppendRead {
+            buffer,
+            result: reload::read_appended(
+                &path,
+                old,
+                new,
+                old_tail_hash,
+                config.append_tail_hash_bytes,
+            ),
+        }),
+        Job::Diff(job) => Some(Event::DiffReady {
+            buffer: job.buffer,
+            requester: job.requester,
+            result: diff::run_diff(&job),
         }),
         Job::AutoSave(job) => Some(Event::AutoSaved {
             buffer: job.buffer,

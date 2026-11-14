@@ -6,20 +6,77 @@ use emx_text::{FileIdentity, ReadError, Text};
 use slotmap::SlotMap;
 
 use crate::marker::{InsertionType, Marker, MarkerId};
+use crate::reload::ExternalState;
 use crate::undo::{ChangeContext, UndoLimits, UndoList};
 
 slotmap::new_key_type! {
     pub struct BufferId;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct FileBinding {
     pub path: PathBuf,
     /// The on-disk version the buffer was read from or last saved to;
     /// `None` when the file does not exist yet.
     pub identity: Option<FileIdentity>,
     pub saving: bool,
+    /// What happened to the file on disk since (live reload).
+    pub external: ExternalState,
+    /// The text before the last reload, for `diff-external`.
+    pub previous_text: Option<Text>,
+    /// The file changed on disk since the buffer was last looked at.
+    pub changed_since_viewed: bool,
+    /// xxh3 of the `append_tail_hash_bytes` before the end of the
+    /// `identity` version, for telling an append from a rewrite.
+    pub tail_hash: u64,
+    /// The version emx itself last wrote, which must never cause a reload.
+    pub own_save_identity: Option<FileIdentity>,
+    /// The file is on a filesystem the watcher cannot see changes on, so
+    /// it is polled.
+    pub polled: bool,
+    /// A reload was undone: the text is older than the file, so a save
+    /// would overwrite newer changes made on disk.
+    pub content_predates_disk: bool,
 }
+
+impl FileBinding {
+    pub fn new(path: PathBuf, identity: Option<FileIdentity>) -> FileBinding {
+        FileBinding {
+            path,
+            identity,
+            saving: false,
+            external: ExternalState::Clean,
+            previous_text: None,
+            changed_since_viewed: false,
+            tail_hash: 0,
+            own_save_identity: None,
+            polled: false,
+            content_predates_disk: false,
+        }
+    }
+}
+
+impl PartialEq for FileBinding {
+    fn eq(&self, other: &Self) -> bool {
+        let same_previous = match (&self.previous_text, &other.previous_text) {
+            (Some(left), Some(right)) => left.same_root(right),
+            (None, None) => true,
+            _ => false,
+        };
+        self.path == other.path
+            && self.identity == other.identity
+            && self.saving == other.saving
+            && self.external == other.external
+            && same_previous
+            && self.changed_since_viewed == other.changed_since_viewed
+            && self.tail_hash == other.tail_hash
+            && self.own_save_identity == other.own_save_identity
+            && self.polled == other.polled
+            && self.content_predates_disk == other.content_predates_disk
+    }
+}
+
+impl Eq for FileBinding {}
 
 /// The buffer coding's modeline letter (Emacs `mode-line-mule-info`): a
 /// visited file whose bytes are all ASCII stays undecided (`-`) until a
@@ -320,6 +377,26 @@ impl Buffer {
         }
         self.modified_tick += 1;
         recorder.record(self.id, &Change::ReplaceAll { text });
+    }
+
+    /// Appends original bytes `range` at the end of the text: the visited
+    /// file grew by an append. Undo records it as an insertion. It is not
+    /// journaled: the caller ends the journal's epoch, since the text is
+    /// the file's again.
+    pub(crate) fn apply_append_original(&mut self, range: Range<u64>) {
+        let at = self.text.len();
+        let length = range.end - range.start;
+        if length == 0 {
+            return;
+        }
+        let text = self.text.append_original(range);
+        let context = self.change_context();
+        self.undo.record_insert(at, length, &context);
+        self.text = text;
+        for marker in self.markers.values_mut() {
+            marker.adjust_for_insert(at, length);
+        }
+        self.modified_tick += 1;
     }
 
     /// Positions past the end are clamped, as Emacs `set-marker` does.

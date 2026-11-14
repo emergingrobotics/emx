@@ -363,11 +363,7 @@ fn plan_save_decides_rename_or_in_place() {
     write_file(&path, b"abc\n");
     let identity = FileIdentity::of_path(&path).expect("stat");
     let text = Text::from_original(Sources::memory(Arc::from(&b"abc\n"[..])));
-    let binding = FileBinding {
-        path: path.clone(),
-        identity: Some(identity),
-        saving: false,
-    };
+    let binding = FileBinding::new(path.clone(), Some(identity));
     const USER: u32 = 1000;
     const OTHER: u32 = 1001;
     const ROOT: u32 = 0;
@@ -1080,7 +1076,8 @@ fn save_with_no_clients_rearms_the_daemon_grace_timer() {
             .any(|effect| matches!(effect, Effect::SetTimer { .. })),
         "an unsaved buffer keeps the daemon"
     );
-    let result = emx_core::io::save(&plan).map_err(|error| emx_core::io::SaveFailure::from(&error));
+    let result = emx_core::io::save_file(&plan, emx_core::config::APPEND_TAIL_HASH_BYTES)
+        .map_err(|error| emx_core::io::SaveFailure::from(&error));
     editor.handle(Event::SaveFinished { buffer, result });
     let timers: Vec<emx_core::TimerId> = editor
         .take_effects()
@@ -1325,7 +1322,10 @@ fn saving_buffers_refuse_write_file_and_second_saves() {
     let buffer = harness.buffer().id;
     harness.handle(Event::SaveFinished {
         buffer,
-        result: Ok(FileIdentity::of_path(&path).expect("stat")),
+        result: Ok(emx_core::io::SavedFile {
+            identity: FileIdentity::of_path(&path).expect("stat"),
+            tail_hash: 0,
+        }),
     });
     assert!(!harness.buffer().is_modified());
 }
@@ -1470,7 +1470,8 @@ fn a_question_answered_after_another_client_saved_starts_no_second_save() {
         .collect();
     assert_eq!(saves.len(), 1);
     let (buffer, plan) = &saves[0];
-    let result = emx_core::io::save(plan).map_err(|error| emx_core::io::SaveFailure::from(&error));
+    let result = emx_core::io::save_file(plan, emx_core::config::APPEND_TAIL_HASH_BYTES)
+        .map_err(|error| emx_core::io::SaveFailure::from(&error));
     editor.handle(Event::SaveFinished {
         buffer: *buffer,
         result: result.clone(),

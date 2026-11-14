@@ -253,6 +253,22 @@ static COMMANDS: &[CommandSpec] = &[
         run: files::server_edit,
     },
     CommandSpec {
+        name: "revert-buffer",
+        run: files::revert_buffer,
+    },
+    CommandSpec {
+        name: "keep-mine",
+        run: files::keep_mine,
+    },
+    CommandSpec {
+        name: "diff-external",
+        run: files::diff_external,
+    },
+    CommandSpec {
+        name: "follow-edit-mode",
+        run: files::follow_edit_mode,
+    },
+    CommandSpec {
         name: "recover-this-file",
         run: files::recover_this_file,
     },

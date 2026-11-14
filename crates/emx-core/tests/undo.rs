@@ -290,11 +290,10 @@ fn undo_restores_unmodified_flag() {
         mtime_ns: 5,
         ..first_save
     };
-    session.buffer.file = Some(emx_core::FileBinding {
-        path: "/tmp/f".into(),
-        identity: Some(first_save),
-        saving: false,
-    });
+    session.buffer.file = Some(emx_core::FileBinding::new(
+        "/tmp/f".into(),
+        Some(first_save),
+    ));
     session.self_insert("x");
     session.goto(0);
     session.buffer.file.as_mut().expect("bound").identity = Some(second_save);
@@ -640,11 +639,10 @@ fn reload_undo_survives_edit_and_undo() {
         mtime_ns: 3,
     };
     let mut session = Session::new("old text", 4);
-    session.buffer.file = Some(emx_core::FileBinding {
-        path: "/tmp/reloaded".into(),
-        identity: Some(before_reload),
-        saving: false,
-    });
+    session.buffer.file = Some(emx_core::FileBinding::new(
+        "/tmp/reloaded".into(),
+        Some(before_reload),
+    ));
     session
         .buffer
         .replace_all(text_of("brand new"), &mut session.log)
@@ -698,4 +696,65 @@ fn amalgamation_limit_comes_from_config() {
     session.self_insert("xxxxx");
     session.undo().expect("undo");
     assert_eq!((session.text().as_str(), session.point()), ("xxx", 3));
+}
+
+#[test]
+fn replace_all_counts_the_text_it_keeps() {
+    // A ReplaceAll entry keeps the replaced text alive, which Emacs would
+    // count as a deleted string: a reload of a large in-memory file is
+    // charged its size, so the strong limit cuts the groups before it. A
+    // fixed per-entry charge would keep them all.
+    let limits = UndoLimits {
+        limit: 1000,
+        strong_limit: 1500,
+        outer_limit: 1_000_000,
+        amalgamation_limit: emx_core::config::AMALGAMATION_LIMIT,
+    };
+    let mut session = Session::with_limits("", 0, limits);
+    session.self_insert("x");
+    for content in ["r".repeat(10), "n".repeat(3000), "tiny".to_string()] {
+        session
+            .buffer
+            .replace_all(text_of(&content), &mut session.log)
+            .expect("replace");
+        session.finish("revert-buffer");
+    }
+    assert_eq!(session.undo(), Ok("Undo"));
+    assert_eq!(session.text(), "n".repeat(3000));
+    assert_eq!(session.undo(), Err(NO_FURTHER.to_string()));
+    assert_eq!(session.text(), "n".repeat(3000));
+
+    // Small replaced texts are all kept.
+    let mut session = Session::with_limits("", 0, limits);
+    session.self_insert("x");
+    for content in ["r".repeat(10), "n".repeat(30), "tiny".to_string()] {
+        session
+            .buffer
+            .replace_all(text_of(&content), &mut session.log)
+            .expect("replace");
+        session.finish("revert-buffer");
+    }
+    for expected in ["n".repeat(30), "r".repeat(10), "x".to_string()] {
+        assert_eq!(session.undo(), Ok("Undo"));
+        assert_eq!(session.text(), expected);
+    }
+
+    // Texts sharing one original (an edit undone and redone) cost nothing
+    // more than the entry.
+    let shared = text_of("same original");
+    let mut session = Session::with_limits("", 0, limits);
+    session.buffer.text = shared.clone();
+    session
+        .buffer
+        .replace_all(shared.delete(0..5).expect("delete"), &mut session.log)
+        .expect("replace");
+    session.finish("revert-buffer");
+    let sizes: Vec<UndoEntry> = session.buffer.undo.entries();
+    assert!(
+        sizes
+            .iter()
+            .any(|entry| matches!(entry, UndoEntry::ReplaceAll { .. }))
+    );
+    assert_eq!(session.undo(), Ok("Undo"));
+    assert_eq!(session.text(), "same original");
 }

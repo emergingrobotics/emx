@@ -60,6 +60,8 @@ pub struct Loaded {
     /// The auto-save file is newer than the file (Emacs
     /// `file-newer-than-file-p`), so there may be work to recover.
     pub auto_save_newer: bool,
+    /// xxh3 of the `append_tail_hash_bytes` before the end of the file.
+    pub tail_hash: u64,
 }
 
 impl PartialEq for Loaded {
@@ -71,6 +73,7 @@ impl PartialEq for Loaded {
             && self.writable == other.writable
             && self.directory_exists == other.directory_exists
             && self.auto_save_newer == other.auto_save_newer
+            && self.tail_hash == other.tail_hash
     }
 }
 
@@ -345,7 +348,16 @@ pub fn load_file(path: &Path, config: &Config) -> Result<Loaded, LoadError> {
             true,
         )
     };
+    let tail_hash = crate::reload::text_tail_hash(
+        &Text::from_original(sources.clone()),
+        config.append_tail_hash_bytes,
+    )
+    .map_err(|source| LoadError::Read {
+        path: path.to_path_buf(),
+        source: io::Error::other(source.to_string()),
+    })?;
     Ok(Loaded {
+        tail_hash,
         sources,
         identity: Some(identity),
         coding,
@@ -367,6 +379,7 @@ fn new_file(path: &Path, auto_save_newer: bool) -> Loaded {
         writable: directory_exists && access_writable(directory),
         directory_exists,
         auto_save_newer,
+        tail_hash: crate::reload::tail_hash_of(&[], 0),
     }
 }
 
@@ -598,6 +611,41 @@ pub fn in_place_plan(
         text: text.clone(),
         moves,
         expected: info.existing.map(|file| file.identity),
+    })
+}
+
+/// The version a save wrote, as the editor receives it from a worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavedFile {
+    pub identity: FileIdentity,
+    /// xxh3 of the `append_tail_hash_bytes` before the end of what was
+    /// written, so a later append to the saved file is recognized.
+    pub tail_hash: u64,
+}
+
+/// Carries out a plan as a worker does: hashes the tail of the text, then
+/// writes it. The tail is read first because an in-place save rewrites
+/// the file the text may read from.
+pub fn save_file(plan: &SavePlan, tail_bytes: u64) -> Result<SavedFile, SaveError> {
+    save_file_with(plan, tail_bytes, &mut file_sink)
+}
+
+/// Like `save_file`, with every write going through a sink made by `sinks`.
+pub fn save_file_with(
+    plan: &SavePlan,
+    tail_bytes: u64,
+    sinks: &mut SinkFactory,
+) -> Result<SavedFile, SaveError> {
+    let tail_hash = crate::reload::text_tail_hash(plan.text(), tail_bytes).map_err(|source| {
+        SaveError::Read {
+            path: plan.target().to_path_buf(),
+            source,
+        }
+    })?;
+    let identity = save_with(plan, sinks)?;
+    Ok(SavedFile {
+        identity,
+        tail_hash,
     })
 }
 

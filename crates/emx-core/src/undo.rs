@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 
-use emx_text::{FileIdentity, Text};
+use emx_text::{FileIdentity, Original, Text};
 use parking_lot::Mutex;
 
 use crate::buffer::{Buffer, ChangeRecorder, EditError};
@@ -73,6 +73,12 @@ pub enum UndoEntry {
     MarkerAdjust { marker: MarkerId, adjustment: i64 },
     /// The whole text was replaced (a reload).
     ReplaceAll { before: Text, after: Text },
+    /// The change group is a reload from disk: undoing it leaves text
+    /// older than the file.
+    Reload,
+    /// The change group undid a reload: undoing it brings the reloaded
+    /// text back.
+    ReloadUndone,
     /// `nil`.
     Boundary,
 }
@@ -86,11 +92,29 @@ impl UndoEntry {
             UndoEntry::Deletion { text, .. } => {
                 2 * CONS_BYTES + STRING_HEADER_BYTES + text.len() as u64
             }
-            UndoEntry::ReplaceAll { .. } => 2 * CONS_BYTES + REPLACE_ALL_BYTES,
+            UndoEntry::ReplaceAll { before, after } => {
+                2 * CONS_BYTES + REPLACE_ALL_BYTES + retained_bytes(before, after)
+            }
             UndoEntry::Insertion { .. }
+            | UndoEntry::Reload
+            | UndoEntry::ReloadUndone
             | UndoEntry::FirstChange { .. }
             | UndoEntry::MarkerAdjust { .. } => 2 * CONS_BYTES,
         }
+    }
+}
+
+/// Memory a ReplaceAll entry keeps alive on its own, which Emacs would
+/// count as the size of the deleted string: the in-memory original of the
+/// text it restores, unless that text shares it with the text it replaces.
+/// Texts read from a file through the block cache cost no memory.
+fn retained_bytes(before: &Text, after: &Text) -> u64 {
+    if Arc::ptr_eq(before.sources(), after.sources()) {
+        return 0;
+    }
+    match &before.sources().original {
+        Original::Memory(bytes) => bytes.len() as u64,
+        Original::File(_) => 0,
     }
 }
 
@@ -106,6 +130,10 @@ pub enum UndoError {
     OutsideBuffer,
     #[error("Buffer text differs from the reloaded text; cannot undo the reload")]
     ReloadMismatch,
+    #[error(
+        "Cannot undo the reload: the file was rewritten on disk and the text before it is gone"
+    )]
+    OriginalGone,
     #[error("{0}")]
     Edit(#[from] EditError),
 }
@@ -435,6 +463,11 @@ impl UndoList {
         });
     }
 
+    /// Marks the change group just recorded as a reload from disk.
+    pub(crate) fn record_reload(&mut self) {
+        self.push(UndoEntry::Reload);
+    }
+
     pub(crate) fn record_replace_all(
         &mut self,
         before: Text,
@@ -599,7 +632,7 @@ impl UndoList {
                         selected.push(node.entry.clone());
                     }
                 }
-                UndoEntry::MarkerAdjust { .. } => {}
+                UndoEntry::MarkerAdjust { .. } | UndoEntry::Reload | UndoEntry::ReloadUndone => {}
                 UndoEntry::ReplaceAll { .. } => break,
                 entry => {
                     let adjusted = adjust_entry(entry, &deltas);
@@ -708,6 +741,12 @@ fn entry_delta(entry: &UndoEntry) -> (i64, i64) {
 }
 
 impl Buffer {
+    fn set_content_predates_disk(&mut self, predates: bool) {
+        if let Some(file) = self.file.as_mut() {
+            file.content_predates_disk = predates;
+        }
+    }
+
     /// Emacs `undo-auto-amalgamate`: call at the start of `self-insert-command`,
     /// `delete-char` and the commands built on them (`newline`,
     /// `delete-backward-char`), before their edit, when they act on a single
@@ -855,6 +894,9 @@ impl Buffer {
         point: &mut Option<u64>,
         recorder: &mut dyn ChangeRecorder,
     ) -> Result<List, UndoError> {
+        // Applied only once every change undid: a failed undo leaves the
+        // text, and so the warning, as they were.
+        let mut predates_disk = None;
         for _ in 0..count {
             while let Some(node) = list.take() {
                 list = next_of(&node);
@@ -917,7 +959,18 @@ impl Buffer {
                             self.set_marker(*marker, adjusted);
                         }
                     }
+                    UndoEntry::Reload => {
+                        self.undo.push(UndoEntry::ReloadUndone);
+                        predates_disk = Some(true);
+                    }
+                    UndoEntry::ReloadUndone => {
+                        self.undo.push(UndoEntry::Reload);
+                        predates_disk = Some(false);
+                    }
                     UndoEntry::ReplaceAll { before, after } => {
+                        if !before.retired_pieces().is_empty() {
+                            return Err(UndoError::OriginalGone);
+                        }
                         // Edits undone since the reload leave equal content
                         // under a new root, so compare content, not identity.
                         if after.len() != self.text.len()
@@ -932,6 +985,9 @@ impl Buffer {
                     }
                 }
             }
+        }
+        if let Some(predates) = predates_disk {
+            self.set_content_predates_disk(predates);
         }
         Ok(list)
     }

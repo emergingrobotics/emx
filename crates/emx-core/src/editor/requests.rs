@@ -7,16 +7,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use emx_proto::{
-    BufferInfo, ClientKind, EditorEvent, Request, Response, ServerMsg, WireError, WirePath,
-    error_code,
+    BufferInfo, ClientKind, EditorEvent, ExternalKind, Request, Response, ServerMsg, WireError,
+    WirePath, error_code,
 };
 use emx_text::{LineLookup, ReadError, Text};
 
 use super::files::{Purpose, SaveFlow};
+use super::reload::ReloadFailure;
 use super::{Editor, TimerPurpose};
-use crate::buffer::{BufferId, Change, ChangeRecorder};
+use crate::buffer::BufferId;
+use crate::diff::DiffRequester;
 use crate::event::{ClientId, Effect, TimerId};
-use crate::io::Loaded;
 
 const NO_CLIENT_MESSAGE: &str = "no emx client is attached; run 'emx FILE' in a terminal first";
 const BUFFER_MODIFIED_MESSAGE: &str = "buffer modified";
@@ -69,13 +70,6 @@ fn wire_path(path: &Path) -> WirePath {
     WirePath::from(path)
 }
 
-/// A reload replaces text that is already on disk: nothing to journal.
-struct Unjournaled;
-
-impl ChangeRecorder for Unjournaled {
-    fn record(&mut self, _buffer: BufferId, _change: &Change) {}
-}
-
 impl Editor {
     pub(super) fn handle_request(&mut self, client: ClientId, id: u64, request: Request) {
         let reply = Reply { client, id };
@@ -104,13 +98,9 @@ impl Editor {
                 self.subscribe(client);
                 self.reply(reply, Ok(Response::Ok));
             }
-            Request::DiffExternal { .. } => self.reply(
-                reply,
-                Err(wire_error(
-                    error_code::NO_EXTERNAL_CHANGE,
-                    NO_EXTERNAL_CHANGE_MESSAGE,
-                )),
-            ),
+            Request::DiffExternal { path } => {
+                self.request_diff_external(reply, &path.into_path_buf());
+            }
         }
     }
 
@@ -350,8 +340,8 @@ impl Editor {
 
     // ---- reload --------------------------------------------------------------
 
-    /// Milestone 1 reload: an unmodified buffer is read again from disk;
-    /// a modified one is left alone and reported. Without a file, every
+    /// `emx reload`: an unmodified buffer is read again from disk through
+    /// the one reload path; a modified one is left alone and reported. Without a file, every
     /// file buffer is reloaded.
     fn request_reload(&mut self, reply: Reply, path: Option<PathBuf>) {
         let mut failures = Vec::new();
@@ -396,9 +386,8 @@ impl Editor {
                 failures.push(wire_error(code, message));
                 continue;
             }
-            let path = file.path.clone();
             if self.reverting.insert(buffer) {
-                self.effects.push(Effect::Load { buffer, path });
+                self.request_reload_of(buffer);
             }
             remaining.insert(buffer);
         }
@@ -410,68 +399,64 @@ impl Editor {
         self.start_group(group, GroupKind::Reload);
     }
 
-    /// A file read again for a reload arrived: replace the text as one
-    /// undoable change, unmodified, unless the buffer changed meanwhile.
-    pub(super) fn revert_loaded(&mut self, buffer: BufferId, result: Result<Loaded, String>) {
-        let outcome = self.revert(buffer, result);
+    /// A reload for a request finished; `outcome` says why it was not
+    /// applied.
+    pub(super) fn reload_request_done(
+        &mut self,
+        buffer: BufferId,
+        outcome: Result<(), ReloadFailure>,
+    ) {
+        let outcome = outcome.map_err(|failure| match failure {
+            ReloadFailure::Modified => {
+                let name = self
+                    .buffers
+                    .get(buffer)
+                    .map(|target| target.name.clone())
+                    .unwrap_or_default();
+                wire_error(
+                    error_code::BUFFER_MODIFIED,
+                    format!("{name}: {BUFFER_MODIFIED_MESSAGE}"),
+                )
+            }
+            ReloadFailure::Failed(message) => wire_error(error_code::RELOAD_FAILED, message),
+        });
         self.group_buffer_done(GroupKind::Reload, buffer, outcome);
     }
 
-    fn revert(
+    // ---- diff-external -------------------------------------------------------
+
+    fn request_diff_external(&mut self, reply: Reply, path: &Path) {
+        let Some(buffer) = self.buffer_visiting(path) else {
+            return self.reply(
+                reply,
+                Err(wire_error(
+                    error_code::NO_BUFFER,
+                    format!("no buffer visits {}", path.display()),
+                )),
+            );
+        };
+        match self.diff_job(buffer, DiffRequester::Request(reply.client, reply.id)) {
+            Ok(job) => self.effects.push(Effect::Diff(job)),
+            Err(_) => self.reply(
+                reply,
+                Err(wire_error(
+                    error_code::NO_EXTERNAL_CHANGE,
+                    NO_EXTERNAL_CHANGE_MESSAGE,
+                )),
+            ),
+        }
+    }
+
+    pub(super) fn diff_request_done(
         &mut self,
-        buffer: BufferId,
-        result: Result<Loaded, String>,
-    ) -> Result<(), WireError> {
-        let Some(target) = self.buffers.get(buffer) else {
-            return Err(wire_error(
-                error_code::RELOAD_FAILED,
-                "the buffer was killed while it was read",
-            ));
-        };
-        let name = target.name.clone();
-        let loaded = result.map_err(|message| {
-            wire_error(error_code::RELOAD_FAILED, format!("{name}: {message}"))
-        })?;
-        if target.is_modified() {
-            return Err(wire_error(
-                error_code::BUFFER_MODIFIED,
-                format!("{name}: {BUFFER_MODIFIED_MESSAGE}"),
-            ));
-        }
-        let busy = target.loading
-            || target.damaged
-            || target.file.as_ref().is_some_and(|file| file.saving);
-        if busy {
-            return Err(wire_error(
-                error_code::RELOAD_FAILED,
-                format!("{name}: buffer is busy"),
-            ));
-        }
-        let Some(identity) = loaded.identity else {
-            return Err(wire_error(
-                error_code::RELOAD_FAILED,
-                format!("{name}: the file no longer exists"),
-            ));
-        };
-        let text = Text::from_original(loaded.sources);
-        let target = &mut self.buffers[buffer];
-        target.apply_replace_all(text.clone(), &mut Unjournaled);
-        target.undo.boundary(0);
-        target.set_unmodified();
-        target.coding = loaded.coding;
-        target.read_only = !loaded.writable;
-        target.auto_saved_since_save = false;
-        target
-            .file
-            .as_mut()
-            .expect("a reloaded buffer visits a file")
-            .identity = Some(identity);
-        // The text is the file's again: its journal is finished.
-        self.journal_outbox.saved(buffer, identity, text);
-        if loaded.needs_index {
-            self.effects.push(Effect::StartIndex { buffer });
-        }
-        Ok(())
+        client: ClientId,
+        id: u64,
+        result: Result<String, String>,
+    ) {
+        let result = result
+            .map(Response::Diff)
+            .map_err(|message| wire_error(error_code::DIFF_FAILED, message));
+        self.reply(Reply { client, id }, result);
     }
 
     // ---- save-all ------------------------------------------------------------
@@ -613,6 +598,18 @@ impl Editor {
             target.file.as_ref().map(|file| wire_path(&file.path)),
             target.name.clone(),
         )
+    }
+
+    /// A visited file changed on disk and the editor acted on it.
+    pub(super) fn external_change_event(&mut self, buffer: BufferId, kind: ExternalKind) {
+        let Some(path) = self.buffers[buffer]
+            .file
+            .as_ref()
+            .map(|file| wire_path(&file.path))
+        else {
+            return;
+        };
+        self.emit(EditorEvent::ExternalChange { path, kind });
     }
 
     /// A visited file was read into its buffer.

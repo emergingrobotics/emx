@@ -46,6 +46,7 @@ toml = "0.8"
 slotmap = "1"
 xattr = "1"
 crc32fast = "1"
+similar = "2"
 
 [dependencies]
 anyhow = "1"

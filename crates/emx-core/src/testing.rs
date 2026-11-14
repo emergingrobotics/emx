@@ -13,11 +13,13 @@ use emx_types::{Grid, Key, KeyCode, Mods, parse_kbd};
 use crate::autosave;
 use crate::buffer::{Buffer, BufferId};
 use crate::config::Config;
+use crate::diff;
 use crate::editor::{Editor, Session};
 use crate::event::{ClientId, Effect, Event, TimerId};
 use crate::io::{self, SaveFailure, SavePlan, SaveSink, SinkFactory};
 use crate::journal::{JournalError, JournalOp, JournalWriter, RecoveredBuffer, replay_dir};
 use crate::marker::InsertionType;
+use crate::reload;
 use crate::render::{PrefetchRequest, render};
 
 pub const HARNESS_COLS: u16 = 80;
@@ -381,6 +383,49 @@ impl Harness {
                     self.io_errors.push(format!("{}: {error}", file.display()));
                 }
             }
+            Effect::Observe {
+                buffer,
+                path,
+                old_len,
+            } => {
+                let tail_bytes = self.editor.config().append_tail_hash_bytes;
+                return Some(Event::Observed {
+                    buffer,
+                    result: reload::observe(&path, old_len, tail_bytes),
+                });
+            }
+            Effect::Reload(job) => {
+                let result = reload::reload_file(
+                    &job.path,
+                    self.editor.config(),
+                    &job.previous,
+                    &job.anchors,
+                );
+                return Some(Event::Reloaded {
+                    buffer: job.buffer,
+                    result,
+                });
+            }
+            Effect::ReadAppend {
+                buffer,
+                path,
+                old,
+                new,
+                old_tail_hash,
+            } => {
+                let tail_bytes = self.editor.config().append_tail_hash_bytes;
+                return Some(Event::AppendRead {
+                    buffer,
+                    result: reload::read_appended(&path, old, new, old_tail_hash, tail_bytes),
+                });
+            }
+            Effect::Diff(job) => {
+                return Some(Event::DiffReady {
+                    buffer: job.buffer,
+                    requester: job.requester,
+                    result: diff::run_diff(&job),
+                });
+            }
             Effect::ReadAutoSave { buffer, file } => {
                 let result = autosave::read_auto_save(&file).map_err(|error| {
                     format!(
@@ -401,9 +446,10 @@ impl Harness {
     }
 
     fn save(&mut self, buffer: BufferId, plan: &SavePlan) -> Event {
+        let tail_bytes = self.editor.config().append_tail_hash_bytes;
         let result = match self.sinks.as_mut() {
-            Some(Sinks(sinks)) => io::save_with(plan, sinks.as_mut()),
-            None => io::save(plan),
+            Some(Sinks(sinks)) => io::save_file_with(plan, tail_bytes, sinks.as_mut()),
+            None => io::save_file(plan, tail_bytes),
         };
         Event::SaveFinished {
             buffer,

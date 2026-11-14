@@ -12,6 +12,8 @@ pub enum ReadError {
     Io(#[from] io::Error),
     #[error("file truncated: expected {expected_len} bytes, file now has {actual_len}")]
     Truncated { expected_len: u64, actual_len: u64 },
+    #[error("the file was rewritten on disk; the text read from its earlier version is gone")]
+    Retired,
     #[error("block {block} is not cached")]
     NotCached { block: u64 },
 }

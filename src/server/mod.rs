@@ -586,6 +586,30 @@ impl Server {
                 Effect::ReadAutoSave { buffer, file } => {
                     self.submit(Job::ReadAutoSave { buffer, file });
                 }
+                Effect::Observe {
+                    buffer,
+                    path,
+                    old_len,
+                } => self.submit(Job::Observe {
+                    buffer,
+                    path,
+                    old_len,
+                }),
+                Effect::Reload(job) => self.submit(Job::Reload(job)),
+                Effect::ReadAppend {
+                    buffer,
+                    path,
+                    old,
+                    new,
+                    old_tail_hash,
+                } => self.submit(Job::ReadAppend {
+                    buffer,
+                    path,
+                    old,
+                    new,
+                    old_tail_hash,
+                }),
+                Effect::Diff(job) => self.submit(Job::Diff(job)),
                 Effect::Shutdown => self.shutdown = true,
             }
         }
@@ -595,7 +619,9 @@ impl Server {
     /// a snapshot record reads text that a save may rewrite in place.
     fn submit(&self, job: Job) {
         let after_journal = match job {
-            Job::Load { .. } | Job::Save { .. } => self.journal.submitted(),
+            Job::Load { .. } | Job::Save { .. } | Job::Reload(_) | Job::ReadAppend { .. } => {
+                self.journal.submitted()
+            }
             _ => 0,
         };
         self.pool.submit(job, after_journal);

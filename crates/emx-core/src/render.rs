@@ -8,9 +8,10 @@ use std::ops::{ControlFlow, Range};
 use emx_text::{DisplayUnit, display_units, unit_width};
 use emx_types::{Cell, Face, Grid};
 
-use crate::buffer::{Buffer, BufferId};
+use crate::buffer::{Buffer, BufferId, FileBinding};
 use crate::editor::Editor;
 use crate::event::ClientId;
+use crate::reload::ExternalState;
 use crate::window::{
     CONTINUATION_GLYPH, CursorTracker, Fetch, Layout, LineEvent, Reader, ScreenLine, Window,
     frame_layout, not_cached_block, unit_glyphs,
@@ -41,6 +42,11 @@ const MODELINE_MODES: &str = "(Fundamental) ";
 /// Shown, until the buffer is killed, on a buffer whose file an in-place
 /// save left partly rewritten.
 const MODELINE_DAMAGED: &str = "[DAMAGED] ";
+/// The buffer is modified and its file changed on disk.
+const MODELINE_CONFLICT: &str = "[CONFLICT] ";
+const MODELINE_DELETED: &str = "[DELETED] ";
+/// The file was reloaded (or grew) since the buffer was last looked at.
+const MODELINE_CHANGED: &str = "[CHANGED] ";
 /// Shown while the visited file is being read.
 const MODELINE_MODES_LOADING: &str = "(Fundamental Loading) ";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
@@ -420,8 +426,29 @@ fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usiz
     if buffer.damaged {
         writer.write(MODELINE_DAMAGED.as_bytes(), face, face);
     }
+    if let Some(badge) = buffer.file.as_ref().and_then(external_badge) {
+        writer.write(badge.as_bytes(), face, face);
+    }
     while writer.col < usize::from(writer.grid.cols) {
         writer.write(MODELINE_FILL.as_bytes(), face, face);
+    }
+}
+
+/// The modeline notice for what happened to the visited file on disk. A
+/// settling file still shows the state it settles from.
+fn external_badge(binding: &FileBinding) -> Option<String> {
+    let mut state = &binding.external;
+    while let ExternalState::Settling { previous, .. } = state {
+        state = previous;
+    }
+    match state {
+        ExternalState::Conflict { .. } => Some(MODELINE_CONFLICT.to_string()),
+        ExternalState::Deleted => Some(MODELINE_DELETED.to_string()),
+        ExternalState::Renamed(to) => Some(format!("[MOVED to {}] ", to.display())),
+        ExternalState::Clean | ExternalState::KeepMine { .. } if binding.changed_since_viewed => {
+            Some(MODELINE_CHANGED.to_string())
+        }
+        _ => None,
     }
 }
 

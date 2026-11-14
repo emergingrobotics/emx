@@ -185,6 +185,8 @@ pub mod error_code {
     pub const SAVE_FAILED: &str = "save_failed";
     pub const GOTO_FAILED: &str = "goto_failed";
     pub const NO_EXTERNAL_CHANGE: &str = "no_external_change";
+    /// `diff-external` could not read or diff the texts.
+    pub const DIFF_FAILED: &str = "diff_failed";
     /// The connection broke the protocol; the server closes it.
     pub const PROTOCOL: &str = "protocol";
 }

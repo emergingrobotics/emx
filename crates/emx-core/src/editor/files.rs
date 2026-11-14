@@ -16,7 +16,9 @@ use crate::buffer::{BufferId, CodingMnemonic, EditError, FileBinding};
 use crate::command::CommandError;
 use crate::event::{AutoSaveJob, ClientId, Effect};
 use crate::inplace::Move;
-use crate::io::{self, Loaded, SaveFailure, SavePlan, abbreviate, expand_file_name, strerror};
+use crate::io::{
+    self, Loaded, SaveFailure, SavePlan, SavedFile, abbreviate, expand_file_name, strerror,
+};
 use crate::journal::{
     CHANGED_ON_DISK, Header, JournalId, LEFT_PARTLY_REWRITTEN, RecoveredBuffer,
     recovered_buffer_name, render_edits,
@@ -26,6 +28,7 @@ use crate::minibuffer::{
     Answer, BACKSPACE, ESCAPE, HistoryKind, KeyChoice, Minibuffer, Mode, Outcome, Overlay, RETURN,
     control, plain,
 };
+use crate::reload::ExternalState;
 use crate::window::WindowId;
 
 /// Emacs `minibuffer-message-timeout`, and the `sit-for`/`sleep-for` of
@@ -94,11 +97,17 @@ pub(crate) enum Purpose {
     ServerDone {
         buffer: BufferId,
     },
+    /// `revert-buffer` in a modified buffer: discard the edits?
+    Revert {
+        buffer: BufferId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Question {
     Changed,
+    /// A reload was undone: the save would overwrite the newer file.
+    NewerOnDisk,
     WriteProtected,
     CreateDirectory,
     LargeSave,
@@ -128,6 +137,7 @@ pub(crate) struct SaveFlow {
     quiet: bool,
     after: AfterSave,
     changed_confirmed: bool,
+    newer_confirmed: bool,
     write_protected_confirmed: bool,
     method: Option<Method>,
     session: Option<SaveSession>,
@@ -148,6 +158,7 @@ impl SaveFlow {
             quiet,
             after,
             changed_confirmed: false,
+            newer_confirmed: false,
             write_protected_confirmed: false,
             method: None,
             session,
@@ -204,6 +215,9 @@ pub(super) struct SaveRequest {
     tick: u64,
     /// An in-place save of the inode the buffer's original is read from.
     rewrites_original: bool,
+    /// The device and inode an in-place save rewrites: every text still
+    /// reading it is retired once it changed.
+    rewritten_inode: Option<(u64, u64)>,
 }
 
 /// `save-buffers-kill-terminal` waiting for its saves before exiting.
@@ -331,7 +345,7 @@ impl Editor {
     }
 
     /// Emacs `yes-or-no-p`.
-    fn yes_or_no_p(&mut self, client: ClientId, question: String, purpose: Purpose) {
+    pub(super) fn yes_or_no_p(&mut self, client: ClientId, question: String, purpose: Purpose) {
         self.read_from_minibuffer(
             client,
             format!("{question}{YES_OR_NO}"),
@@ -444,7 +458,7 @@ impl Editor {
 
     /// Shows an error from a step that is not a command: Emacs's
     /// `command-error` display.
-    fn fail(&mut self, client: ClientId, error: &CommandError) {
+    pub(super) fn fail(&mut self, client: ClientId, error: &CommandError) {
         if self.clients.contains_key(&client) {
             self.client_mut(client).exit_wait = None;
             self.signal(client, None, error);
@@ -547,6 +561,12 @@ impl Editor {
                     Ok(())
                 }
             }
+            (Purpose::Revert { buffer }, Answer::Yes(yes)) => {
+                if yes {
+                    self.start_revert(client, buffer);
+                }
+                Ok(())
+            }
             (Purpose::Recover { buffer, file }, Answer::Yes(yes)) => {
                 if yes {
                     self.pending_reads.insert(buffer, client);
@@ -587,11 +607,7 @@ impl Editor {
         let buffer = self.create_buffer(&name);
         let created = &mut self.buffers[buffer];
         created.loading = true;
-        created.file = Some(FileBinding {
-            path: path.clone(),
-            identity: None,
-            saving: false,
-        });
+        created.file = Some(FileBinding::new(path.clone(), None));
         self.show_in_selected_window(client, buffer);
         self.pending_loads.insert(buffer, client);
         self.effects.push(Effect::Load { buffer, path });
@@ -621,10 +637,6 @@ impl Editor {
     }
 
     pub(super) fn file_loaded(&mut self, buffer: BufferId, result: Result<Loaded, String>) {
-        if self.reverting.remove(&buffer) {
-            self.revert_loaded(buffer, result);
-            return;
-        }
         let client = self.pending_loads.remove(&buffer);
         if !self.buffers.contains_key(buffer) {
             return;
@@ -650,11 +662,12 @@ impl Editor {
         target.loading = false;
         target.coding = loaded.coding;
         target.auto_saved_since_save = false;
-        target
+        let binding = target
             .file
             .as_mut()
-            .expect("a loading buffer visits a file")
-            .identity = loaded.identity;
+            .expect("a loading buffer visits a file");
+        binding.identity = loaded.identity;
+        binding.tail_hash = loaded.tail_hash;
         let exists = loaded.identity.is_some();
         // Emacs `after-find-file`.
         target.read_only = !loaded.writable;
@@ -687,6 +700,7 @@ impl Editor {
             self.message_to(client, message);
         }
         self.buffer_opened(buffer);
+        self.reload_after_busy(buffer);
     }
 
     pub(super) fn show_in_selected_window(&mut self, client: ClientId, buffer: BufferId) {
@@ -820,6 +834,7 @@ impl Editor {
     /// clients waiting for it are released.
     pub(super) fn kill_buffer(&mut self, buffer: BufferId) {
         self.buffer_killed(buffer);
+        self.forget_reload_state(buffer);
         let replacement = self.other_buffer(buffer);
         let showing: Vec<(ClientId, WindowId)> = self
             .clients
@@ -963,11 +978,7 @@ impl Editor {
         let name = self.unique_buffer_name(&file_name(&path), &path, Some(buffer));
         let target = &mut self.buffers[buffer];
         target.name = name;
-        target.file = Some(FileBinding {
-            path,
-            identity: None,
-            saving: false,
-        });
+        target.file = Some(FileBinding::new(path, None));
         target.auto_saved_since_save = false;
         if write_file {
             target.mark_modified();
@@ -1005,9 +1016,30 @@ impl Editor {
                 binding.path.display()
             ))
         })?;
+        let kept = match binding.external {
+            ExternalState::KeepMine { disk } => Some(disk),
+            _ => None,
+        };
+        if !flow.newer_confirmed && binding.content_predates_disk && kept.is_none() {
+            let question = format!(
+                "Saving will overwrite newer changes on disk (made after {name} was reloaded).  \
+                 Save anyway? "
+            );
+            flow.refuse_unattended(&question)?;
+            self.yes_or_no_p(
+                client,
+                question,
+                Purpose::SaveCheck {
+                    flow,
+                    question: Question::NewerOnDisk,
+                },
+            );
+            return Ok(());
+        }
         if !flow.changed_confirmed
             && let Some(existing) = &info.existing
             && Some(existing.identity) != binding.identity
+            && Some(existing.identity) != kept
         {
             let question = format!("{name} has changed since visited or saved.  Save anyway? ");
             flow.refuse_unattended(&question)?;
@@ -1114,13 +1146,19 @@ impl Editor {
         };
         let rewrites_original = matches!(plan, SavePlan::InPlace { .. })
             && original_inode_is(&text, info.existing.map(|file| file.identity));
+        let rewritten_inode = match (&plan, &info.existing) {
+            (SavePlan::InPlace { .. }, Some(existing)) => {
+                Some((existing.identity.dev, existing.identity.ino))
+            }
+            _ => None,
+        };
         let session = flow.session.take();
         self.start_save_effect(
             client,
             &flow,
             binding.path,
             plan,
-            rewrites_original,
+            (rewrites_original, rewritten_inode),
             session.is_some(),
         )?;
         self.resume_session(client, session)
@@ -1201,9 +1239,10 @@ impl Editor {
     ) -> Result<(), CommandError> {
         match (question, answer) {
             (Question::Changed, Answer::Yes(true)) => flow.changed_confirmed = true,
-            (Question::Changed, Answer::Yes(false)) => {
+            (Question::Changed | Question::NewerOnDisk, Answer::Yes(false)) => {
                 return Err(user_error("Save not confirmed"));
             }
+            (Question::NewerOnDisk, Answer::Yes(true)) => flow.newer_confirmed = true,
             (Question::WriteProtected, Answer::Yes(true)) => {
                 flow.write_protected_confirmed = true;
             }
@@ -1251,7 +1290,7 @@ impl Editor {
         flow: &SaveFlow,
         path: PathBuf,
         plan: SavePlan,
-        rewrites_original: bool,
+        (rewrites_original, rewritten_inode): (bool, Option<(u64, u64)>),
         in_session: bool,
     ) -> Result<(), CommandError> {
         let buffer = flow.buffer;
@@ -1269,6 +1308,7 @@ impl Editor {
             text: plan.text().clone(),
             tick: target.modified_tick(),
             rewrites_original,
+            rewritten_inode,
         };
         self.pending_saves.insert(buffer, request);
         if in_session && let Some(wait) = self.client_mut(client).exit_wait.as_mut() {
@@ -1289,7 +1329,7 @@ impl Editor {
     pub(super) fn save_finished(
         &mut self,
         buffer: BufferId,
-        result: Result<FileIdentity, SaveFailure>,
+        result: Result<SavedFile, SaveFailure>,
     ) {
         let Some(request) = self.pending_saves.remove(&buffer) else {
             return;
@@ -1304,8 +1344,8 @@ impl Editor {
             binding.saving = false;
             let path = binding.path.clone();
             match &result {
-                Ok(identity) => {
-                    let rescue = self.adopt_saved_file(buffer, *identity, &request);
+                Ok(saved) => {
+                    let rescue = self.adopt_saved_file(buffer, *saved, &request);
                     if let Some(rescue) = rescue {
                         let name = self.buffers[buffer].name.clone();
                         self.message_to(
@@ -1330,6 +1370,11 @@ impl Editor {
                 }
                 Err(failure) => {
                     let mut message = failure.message.clone();
+                    if failure.file_damaged
+                        && let Some((dev, ino)) = request.rewritten_inode
+                    {
+                        self.retire_caches_on(dev, ino, None);
+                    }
                     if failure.file_damaged && request.rewrites_original {
                         let rescue = self.mark_damaged(buffer);
                         message.push_str(&format!(
@@ -1366,6 +1411,7 @@ impl Editor {
             self.check_exit(client);
         }
         self.maybe_arm_grace();
+        self.reload_after_busy(buffer);
     }
 
     /// A failed save abandons every pending exit; the exiting clients see
@@ -1423,17 +1469,26 @@ impl Editor {
     fn adopt_saved_file(
         &mut self,
         buffer: BufferId,
-        identity: FileIdentity,
+        saved: SavedFile,
         request: &SaveRequest,
     ) -> Option<String> {
+        let identity = saved.identity;
         let capacity = usize::try_from(self.config.block_cache_bytes).unwrap_or(usize::MAX);
         let target = &mut self.buffers[buffer];
         let binding = target.file.as_mut().expect("a saved buffer visits a file");
         binding.identity = Some(identity);
+        binding.tail_hash = saved.tail_hash;
+        binding.own_save_identity = Some(identity);
+        binding.external = ExternalState::Clean;
+        binding.content_predates_disk = false;
         let path = binding.path.clone();
         if target.modified_tick() != request.tick {
             if request.rewrites_original {
-                return self.mark_damaged(buffer);
+                let rescue = self.mark_damaged(buffer);
+                if let Some((dev, ino)) = request.rewritten_inode {
+                    self.retire_caches_on(dev, ino, None);
+                }
+                return rescue;
             }
             let text = target.text.clone();
             self.journal_outbox.rebase(buffer, text);
@@ -1454,11 +1509,22 @@ impl Editor {
             Original::File(cache) => {
                 let opened = cache.identity();
                 if opened.dev == identity.dev && opened.ino == identity.ino {
-                    cache.rewritten(identity);
-                    Some((
-                        Sources::file(cache.clone(), LineIndex::new(identity.size)),
-                        true,
-                    ))
+                    // A new cache for the new version: texts still reading
+                    // the old one (undo history) must fail, not read the
+                    // rewritten bytes at their old offsets.
+                    let next = cache
+                        .successor(identity)
+                        .or_else(|_| BlockCache::open(&path, capacity));
+                    match next {
+                        Ok(next) if next.identity() == identity => {
+                            let index = LineIndex::new(identity.size);
+                            Some((Sources::file(next, index), true))
+                        }
+                        _ => {
+                            cache.retire();
+                            return self.mark_damaged(buffer);
+                        }
+                    }
                 } else {
                     match BlockCache::open(&path, capacity) {
                         Ok(reopened) if reopened.identity() == identity => {
@@ -1473,6 +1539,20 @@ impl Editor {
                 }
             }
         };
+        if let Some((dev, ino)) = request.rewritten_inode {
+            let keep = replacement
+                .as_ref()
+                .and_then(|(sources, _)| match &sources.original {
+                    Original::File(cache) => Some(cache.clone()),
+                    Original::Memory(_) => None,
+                });
+            let affected = self.retire_caches_on(dev, ino, keep.as_ref());
+            for other in affected {
+                if other != buffer {
+                    self.external_event(other);
+                }
+            }
+        }
         let target = &mut self.buffers[buffer];
         if let Some((sources, needs_index)) = replacement {
             target.text = Text::from_original(sources);
@@ -1907,7 +1987,7 @@ impl Editor {
 
     /// A read-only buffer holding rescued text, journaled at once in
     /// `journal` (or a new journal): the text exists nowhere else.
-    fn create_recovered_buffer(
+    pub(super) fn create_recovered_buffer(
         &mut self,
         name: &str,
         content: Vec<u8>,
@@ -1952,11 +2032,9 @@ impl Editor {
                     let needs_index = matches!(text.sources().original, Original::File(_));
                     let target = &mut self.buffers[buffer];
                     target.text = text.clone();
-                    target.file = path.map(|path| FileBinding {
-                        path,
-                        identity,
-                        saving: false,
-                    });
+                    // The tail hash of a recovered buffer's file is unknown:
+                    // any change to it is classified as a replacement.
+                    target.file = path.map(|path| FileBinding::new(path, identity));
                     target.mark_modified();
                     // Without a file, the journal is the only copy; one with
                     // a file is offered for saving like any modified buffer.

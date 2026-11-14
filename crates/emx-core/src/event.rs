@@ -6,8 +6,10 @@ use emx_text::{FileIdentity, Text};
 use emx_types::Key;
 
 use crate::buffer::BufferId;
-use crate::io::{Loaded, SaveFailure, SavePlan};
+use crate::diff::{DiffJob, DiffRequester};
+use crate::io::{Loaded, SaveFailure, SavePlan, SavedFile};
 use crate::journal::{JournalOp, RecoveredBuffer};
+use crate::reload::{AppendRead, Observation, Reloaded};
 use crate::render::PrefetchRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -49,10 +51,42 @@ pub enum Event {
         buffer: BufferId,
         result: Result<Loaded, String>,
     },
-    /// The result of an `Effect::Save`: the identity of the file written.
+    /// The result of an `Effect::Save`: the version of the file written.
     SaveFinished {
         buffer: BufferId,
-        result: Result<FileIdentity, SaveFailure>,
+        result: Result<SavedFile, SaveFailure>,
+    },
+    /// The watcher (or poller) saw something happen to `path`.
+    FileChanged {
+        path: PathBuf,
+    },
+    /// The watcher saw `from` renamed to `to`.
+    FileRenamed {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// The result of an `Effect::Observe`, as `reload::observe` returned it.
+    Observed {
+        buffer: BufferId,
+        result: Result<Observation, String>,
+    },
+    /// The result of an `Effect::Reload`, as `reload::reload_file` returned
+    /// it.
+    Reloaded {
+        buffer: BufferId,
+        result: Result<Reloaded, String>,
+    },
+    /// The result of an `Effect::ReadAppend`, as `reload::read_appended`
+    /// returned it.
+    AppendRead {
+        buffer: BufferId,
+        result: Result<AppendRead, String>,
+    },
+    /// The result of an `Effect::Diff`, as `diff::run_diff` returned it.
+    DiffReady {
+        buffer: BufferId,
+        requester: DiffRequester,
+        result: Result<String, String>,
     },
     /// The result of an `Effect::AutoSave`.
     AutoSaved {
@@ -131,6 +165,27 @@ pub enum Effect {
         buffer: BufferId,
         file: PathBuf,
     },
+    /// Look at the visited file with `reload::observe` and deliver
+    /// `Event::Observed`.
+    Observe {
+        buffer: BufferId,
+        path: PathBuf,
+        old_len: Option<u64>,
+    },
+    /// Read the file again with `reload::reload_file` and deliver
+    /// `Event::Reloaded`.
+    Reload(ReloadJob),
+    /// Read the bytes an append added with `reload::read_appended` and
+    /// deliver `Event::AppendRead`.
+    ReadAppend {
+        buffer: BufferId,
+        path: PathBuf,
+        old: FileIdentity,
+        new: FileIdentity,
+        old_tail_hash: u64,
+    },
+    /// Diff with `diff::run_diff` and deliver `Event::DiffReady`.
+    Diff(DiffJob),
     /// Apply the operation with `JournalWriter::apply`. Journal effects
     /// must be applied in order, before the effects that follow them are
     /// carried out: a snapshot reads the buffer text, which a later save
@@ -154,3 +209,24 @@ impl PartialEq for AutoSaveJob {
 }
 
 impl Eq for AutoSaveJob {}
+
+#[derive(Debug, Clone)]
+pub struct ReloadJob {
+    pub buffer: BufferId,
+    pub path: PathBuf,
+    /// The text being replaced, whose anchors are mapped onto the new one.
+    pub previous: Text,
+    /// Window points and starts in `previous`.
+    pub anchors: Vec<u64>,
+}
+
+impl PartialEq for ReloadJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.buffer == other.buffer
+            && self.path == other.path
+            && self.previous.same_root(&other.previous)
+            && self.anchors == other.anchors
+    }
+}
+
+impl Eq for ReloadJob {}

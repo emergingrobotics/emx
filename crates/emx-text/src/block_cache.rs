@@ -3,7 +3,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -29,6 +29,9 @@ pub struct BlockCache {
     expected_len: AtomicU64,
     capacity_bytes: usize,
     cached: Mutex<CachedBlocks>,
+    /// The file was rewritten in place: the bytes this cache stood for are
+    /// gone, so every read fails rather than return the new bytes.
+    retired: AtomicBool,
 }
 
 impl std::fmt::Debug for BlockCache {
@@ -38,6 +41,7 @@ impl std::fmt::Debug for BlockCache {
             .field("identity", &self.identity())
             .field("expected_len", &self.len())
             .field("capacity_bytes", &self.capacity_bytes)
+            .field("retired", &self.is_retired())
             .finish_non_exhaustive()
     }
 }
@@ -56,7 +60,11 @@ impl BlockCache {
         }
         let file = File::open(path)?;
         let identity = FileIdentity::of_file(&file)?;
-        Ok(Arc::new(Self {
+        Ok(Self::with_file(file, identity, capacity_bytes))
+    }
+
+    fn with_file(file: File, identity: FileIdentity, capacity_bytes: usize) -> Arc<Self> {
+        Arc::new(Self {
             file,
             identity: Mutex::new(identity),
             expected_len: AtomicU64::new(identity.size),
@@ -65,7 +73,8 @@ impl BlockCache {
                 blocks: LruCache::unbounded(),
                 bytes: 0,
             }),
-        }))
+            retired: AtomicBool::new(false),
+        })
     }
 
     pub fn len(&self) -> u64 {
@@ -81,15 +90,39 @@ impl BlockCache {
         *self.identity.lock()
     }
 
-    /// Records that the open file was rewritten in place and is now the
-    /// `identity` version: every cached block is dropped.
-    pub fn rewritten(&self, identity: FileIdentity) {
-        *self.identity.lock() = identity;
-        self.expected_len.store(identity.size, Ordering::Release);
+    /// The open file was rewritten in place and is now the `identity`
+    /// version: returns a new cache for it on the same open file, and
+    /// retires this one. Texts that still read this cache (undo history, a
+    /// reload's previous text) then fail to read instead of silently
+    /// reading the new bytes at their old offsets.
+    pub fn successor(&self, identity: FileIdentity) -> io::Result<Arc<Self>> {
+        let file = self.file.try_clone()?;
+        self.retire();
+        Ok(Self::with_file(file, identity, self.capacity_bytes))
+    }
+
+    /// The file was rewritten in place by someone else: what this cache
+    /// stood for is gone. Every later read fails with `ReadError::Retired`.
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
         self.invalidate_from(0);
     }
 
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    /// The file grew by an append and is now the `identity` version (same
+    /// device and inode, larger): the bytes already cached stay valid.
+    pub fn appended(&self, identity: FileIdentity) {
+        *self.identity.lock() = identity;
+        self.set_len(identity.size);
+    }
+
     pub fn get(&self, block: u64) -> Result<Arc<[u8]>, ReadError> {
+        if self.is_retired() {
+            return Err(ReadError::Retired);
+        }
         if let Some(data) = self.try_get_cached(block) {
             return Ok(data);
         }
@@ -98,7 +131,12 @@ impl BlockCache {
         Ok(data)
     }
 
+    /// A retired cache has nothing cached: readers that must not block are
+    /// sent to `get`, which reports why.
     pub fn try_get_cached(&self, block: u64) -> Option<Arc<[u8]>> {
+        if self.is_retired() {
+            return None;
+        }
         self.cached.lock().blocks.get(&block).cloned()
     }
 
@@ -149,6 +187,9 @@ impl BlockCache {
     /// Reads one block with `pread`, bypassing the cache. A read shorter than
     /// the expected length means the file was truncated underneath us.
     pub(crate) fn read_block_direct(&self, block: u64) -> Result<Vec<u8>, ReadError> {
+        if self.is_retired() {
+            return Err(ReadError::Retired);
+        }
         let expected_len = self.len();
         let start = block * BLOCK_BYTES;
         if start >= expected_len {

@@ -1409,6 +1409,14 @@ impl JournalOutbox {
         journal.base = base;
     }
 
+    /// The buffer was reloaded from disk (the `identity` version) and is
+    /// unmodified with `base`: like a save, nothing is left to recover, so
+    /// any journal is finished. The change still counts as this event's.
+    pub(crate) fn reloaded(&mut self, buffer: BufferId, identity: FileIdentity, base: Text) {
+        self.changed.push(buffer);
+        self.saved(buffer, identity, base);
+    }
+
     /// The buffer was renamed or now visits another file.
     pub(crate) fn set_header(&mut self, buffer: BufferId, header: Header) {
         let Some(journal) = self.journals.get_mut(&buffer) else {

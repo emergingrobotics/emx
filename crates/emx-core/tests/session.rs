@@ -725,8 +725,10 @@ fn cursor_events_are_throttled_per_client() {
     assert!(moves(&harness.take_messages(cli)).is_empty());
 }
 
+/// A file no buffer visits has no external change to diff (the Task 14
+/// reload tests cover buffers with and without one).
 #[test]
-fn diff_external_has_nothing_recorded_yet() {
+fn diff_external_of_an_unvisited_file_names_no_buffer() {
     let mut harness = server();
     let cli = harness.attach(ClientKind::Cli);
     let id = harness.request(
@@ -738,8 +740,8 @@ fn diff_external_has_nothing_recorded_yet() {
     assert_eq!(
         answer(&mut harness, cli, id),
         Err(WireError {
-            code: error_code::NO_EXTERNAL_CHANGE.to_string(),
-            message: "no external change recorded".to_string(),
+            code: error_code::NO_BUFFER.to_string(),
+            message: "no buffer visits /tmp/x".to_string(),
         })
     );
 }

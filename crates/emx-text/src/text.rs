@@ -309,6 +309,60 @@ impl Text {
         })
     }
 
+    /// Appends original bytes `range` at the end, as one more original
+    /// piece: the file grew by an append and the buffer follows it. Panics
+    /// unless `range` lies inside the original.
+    pub fn append_original(&self, range: Range<u64>) -> Text {
+        assert!(
+            range.start <= range.end && range.end <= self.sources.original.len(),
+            "appended range {range:?} lies inside the {}-byte original",
+            self.sources.original.len()
+        );
+        if range.is_empty() {
+            return self.clone();
+        }
+        let newlines = match &self.sources.original {
+            Original::Memory(bytes) => {
+                let slice = memory_range(
+                    &Piece {
+                        source: PieceSource::Original,
+                        start: range.start,
+                        len: range.end - range.start,
+                        newlines: None,
+                    },
+                    0..range.end - range.start,
+                );
+                Some(memchr::memchr_iter(b'\n', &bytes[slice]).count() as u64)
+            }
+            Original::File(_) => None,
+        };
+        let piece = leaf(Piece {
+            source: PieceSource::Original,
+            start: range.start,
+            len: range.end - range.start,
+            newlines,
+        });
+        Text {
+            root: merge(&self.root, &piece),
+            sources: self.sources.clone(),
+        }
+    }
+
+    /// The pieces that read an original file whose cache was retired: their
+    /// bytes are gone. Each is `(text offset, original range)`.
+    pub fn retired_pieces(&self) -> Vec<(u64, Range<u64>)> {
+        let Original::File(cache) = &self.sources.original else {
+            return Vec::new();
+        };
+        if !cache.is_retired() {
+            return Vec::new();
+        }
+        self.pieces()
+            .filter(|(_, piece)| piece.source == PieceSource::Original)
+            .map(|(offset, piece)| (offset, piece.start..piece.start + piece.len))
+            .collect()
+    }
+
     /// Panics when `range` is not inside the text.
     pub fn delete(&self, range: Range<u64>) -> Result<Text, ReadError> {
         self.assert_range(&range);
