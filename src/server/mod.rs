@@ -10,11 +10,14 @@
 //!   batches (`journal_writer`);
 //! - a pool of I/O threads loads, saves, auto-saves and prefetches, and an
 //!   indexer thread per large file counts lines (`workers`);
+//! - a watcher thread reports changes to visited files, and a poller
+//!   thread looks for them on network filesystems (`watcher`);
 //! - a signal thread turns SIGTERM and SIGINT into a clean exit.
 
 pub mod client_conn;
 pub mod journal_writer;
 pub mod local;
+pub mod watcher;
 pub mod workers;
 
 use std::cmp::Reverse;
@@ -41,6 +44,7 @@ use signal_hook::iterator::Signals;
 use crate::paths::{self, JournalMode};
 use client_conn::{Delivery, Outbox};
 use journal_writer::{JournalBackend, JournalFailure, JournalThread};
+use watcher::Watcher;
 use workers::{Deliver, Indexers, Job, Pool, PrefetchTracker, prefetch_cache};
 
 /// A server that finds the lock held retries for this long, so one
@@ -294,6 +298,7 @@ pub struct Server {
     pool: Pool,
     prefetches: PrefetchTracker,
     indexers: Indexers,
+    watcher: Watcher,
     deliver: Deliver,
     /// Events the server itself raised while carrying out effects.
     raised: VecDeque<Event>,
@@ -352,6 +357,8 @@ impl Server {
             journal.progress(),
             deliver.clone(),
         );
+        let watcher =
+            Watcher::spawn(&config, deliver.clone()).context("starting the file watcher")?;
         let editor = Editor::with_session(config, session)?;
         Ok(Server {
             editor,
@@ -363,6 +370,7 @@ impl Server {
             pool,
             prefetches: PrefetchTracker::default(),
             indexers: Indexers::default(),
+            watcher,
             deliver,
             raised: VecDeque::new(),
             shutdown: false,
@@ -610,6 +618,8 @@ impl Server {
                     old_tail_hash,
                 }),
                 Effect::Diff(job) => self.submit(Job::Diff(job)),
+                Effect::Watch { path } => self.watcher.watch(path),
+                Effect::Unwatch { path } => self.watcher.unwatch(path),
                 Effect::Shutdown => self.shutdown = true,
             }
         }

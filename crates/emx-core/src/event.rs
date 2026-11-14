@@ -65,6 +65,13 @@ pub enum Event {
         from: PathBuf,
         to: PathBuf,
     },
+    /// `path`, watched after an `Effect::Watch`, is polled instead: it is
+    /// on a network filesystem, or watching it failed (`notice` says how,
+    /// for the echo area).
+    FilePolled {
+        path: PathBuf,
+        notice: Option<String>,
+    },
     /// The result of an `Effect::Observe`, as `reload::observe` returned it.
     Observed {
         buffer: BufferId,
@@ -186,6 +193,16 @@ pub enum Effect {
     },
     /// Diff with `diff::run_diff` and deliver `Event::DiffReady`.
     Diff(DiffJob),
+    /// Report changes to `path`, a visited file, as `Event::FileChanged`
+    /// and `Event::FileRenamed` (or `Event::FilePolled` when it can only be
+    /// polled) until `Effect::Unwatch`. Each visited path is watched once,
+    /// however many buffers visit it.
+    Watch {
+        path: PathBuf,
+    },
+    Unwatch {
+        path: PathBuf,
+    },
     /// Apply the operation with `JournalWriter::apply`. Journal effects
     /// must be applied in order, before the effects that follow them are
     /// carried out: a snapshot reads the buffer text, which a later save

@@ -6,9 +6,11 @@
 //! a modified buffer is never touched but flagged as a conflict. All file
 //! reads happen in effects; nothing here blocks on I/O.
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use emx_proto::ExternalKind;
+use emx_proto::{ClientKind, ExternalKind};
 use emx_text::{BlockCache, FileIdentity, Original, Sources, Text};
 
 use super::files::Purpose;
@@ -32,6 +34,39 @@ pub(super) struct Unjournaled;
 
 impl ChangeRecorder for Unjournaled {
     fn record(&mut self, _buffer: BufferId, _change: &Change) {}
+}
+
+/// How many more settle windows a round of reloads waits for files of
+/// the round still settling or being read.
+const RELOAD_ROUND_EXTENSIONS: u32 = 4;
+const RELOAD_SUMMARY_SEPARATOR: &str = ", ";
+const RELOAD_SUMMARY_MORE: &str = ", ...";
+const RELOAD_SUMMARY_ELLIPSIS: &str = "...";
+
+/// The automatic reloads of one settle round, summarized when it ends.
+#[derive(Debug)]
+pub(super) struct ReloadRound {
+    names: Vec<String>,
+    timer: TimerId,
+    extensions: u32,
+}
+
+/// `Reloaded N files changed on disk: a, b, ...`, cut to `width` columns:
+/// the names that fit are listed, then `...` if any did not.
+pub(crate) fn reload_summary(names: &[String], width: usize, tab_width: usize) -> String {
+    let fits = |text: &str| crate::render::text_width(text.as_bytes(), tab_width) <= width;
+    let prefix = format!("Reloaded {} files changed on disk: ", names.len());
+    for listed in (1..=names.len()).rev() {
+        let mut message = prefix.clone() + &names[..listed].join(RELOAD_SUMMARY_SEPARATOR);
+        if listed < names.len() {
+            message.push_str(RELOAD_SUMMARY_MORE);
+        }
+        if fits(&message) {
+            return message;
+        }
+    }
+    // Not even one name fits; the echo area clips a prefix too wide.
+    format!("{prefix}{RELOAD_SUMMARY_ELLIPSIS}")
 }
 
 /// Why a buffer is being read again.
@@ -84,9 +119,9 @@ impl Editor {
 
     pub(super) fn file_renamed(&mut self, from: &std::path::Path, to: &std::path::Path) {
         for buffer in self.buffers_visiting(from) {
+            self.note_changed(buffer);
             let binding = self.binding_mut(buffer);
             binding.external = ExternalState::Renamed(to.to_path_buf());
-            binding.changed_since_viewed = true;
             self.external_change_event(
                 buffer,
                 ExternalKind::Renamed {
@@ -277,9 +312,9 @@ impl Editor {
             return;
         }
         let Some(identity) = observation.identity else {
+            self.note_changed(buffer);
             let binding = self.binding_mut(buffer);
             binding.external = ExternalState::Deleted;
-            binding.changed_since_viewed = true;
             self.external_change_event(buffer, ExternalKind::Deleted);
             return;
         };
@@ -323,9 +358,9 @@ impl Editor {
     /// the change rewrote the file it reads unchanged text from, what it
     /// still holds is put in a `*recovered: NAME*` buffer.
     pub(super) fn conflict(&mut self, buffer: BufferId, disk: FileIdentity) {
+        self.note_changed(buffer);
         let binding = self.binding_mut(buffer);
         binding.external = ExternalState::Conflict { disk };
-        binding.changed_since_viewed = true;
         let name = self.buffers[buffer].name.clone();
         let retired = self.buffers[buffer].text.retired_pieces();
         let message = if retired.is_empty() {
@@ -541,12 +576,12 @@ impl Editor {
             target.set_marker(marker, end);
         }
         let text = target.text.clone();
+        self.note_changed(buffer);
         let binding = self.binding_mut(buffer);
         binding.identity = Some(identity);
         binding.tail_hash = tail_hash;
         binding.external = ExternalState::Clean;
         binding.previous_text = Some(previous);
-        binding.changed_since_viewed = true;
         binding.content_predates_disk = false;
         self.journal_outbox.reloaded(buffer, identity, text);
         if needs_index {
@@ -678,9 +713,9 @@ impl Editor {
         let changed_meanwhile = !target.text.same_root(&request.previous);
         let modified = target.is_modified();
         let Some(identity) = reloaded.loaded.identity else {
+            self.note_changed(buffer);
             let binding = self.binding_mut(buffer);
             binding.external = ExternalState::Deleted;
-            binding.changed_since_viewed = true;
             let path = binding.path.display().to_string();
             return Err(ReloadFailure::Failed(match request.reason {
                 ReloadReason::Request => format!("{name}: the file no longer exists"),
@@ -774,12 +809,12 @@ impl Editor {
         target.coding = loaded.coding;
         target.read_only = !loaded.writable;
         target.auto_saved_since_save = false;
+        self.note_changed(buffer);
         let binding = self.binding_mut(buffer);
         binding.identity = Some(identity);
         binding.tail_hash = loaded.tail_hash;
         binding.external = ExternalState::Clean;
         binding.previous_text = Some(request.previous.clone());
-        binding.changed_since_viewed = true;
         binding.content_predates_disk = false;
         self.journal_outbox.reloaded(buffer, identity, text);
         if loaded.needs_index {
@@ -800,6 +835,9 @@ impl Editor {
             }
         }
         self.external_change_event(buffer, ExternalKind::Reloaded);
+        if request.reason == ReloadReason::Automatic {
+            self.join_reload_round(buffer);
+        }
     }
 
     /// An `emx reload` request starts the one reload path; the reply waits
@@ -981,12 +1019,149 @@ impl Editor {
         }
     }
 
-    /// A key from `client` means the user is looking at its selected
-    /// buffer: its "changed externally" marker is cleared.
+    /// Whether a terminal shows the buffer in one of its windows.
+    fn shown(&self, buffer: BufferId) -> bool {
+        self.clients
+            .values()
+            .filter(|client| client.kind == ClientKind::Tui)
+            .flat_map(|client| client.frame.windows.values())
+            .any(|window| window.buffer == buffer)
+    }
+
+    /// The file changed on disk: a buffer no window shows is marked
+    /// "changed externally" (`[ext]`) for when it is shown again.
+    fn note_changed(&mut self, buffer: BufferId) {
+        if !self.shown(buffer) {
+            self.binding_mut(buffer).changed_since_viewed = true;
+        }
+    }
+
+    /// A key from `client` means its user has seen the buffers its windows
+    /// show: their "changed externally" markers are cleared. The marker
+    /// stays on the frames that first show such a buffer, so it is seen.
     pub(super) fn buffer_viewed(&mut self, client: ClientId) {
-        let buffer = self.selected_buffer(client);
-        if let Some(binding) = self.buffers[buffer].file.as_mut() {
-            binding.changed_since_viewed = false;
+        let buffers: Vec<BufferId> = self
+            .client(client)
+            .frame
+            .windows
+            .values()
+            .map(|window| window.buffer)
+            .collect();
+        for buffer in buffers {
+            if let Some(binding) = self.buffers[buffer].file.as_mut() {
+                binding.changed_since_viewed = false;
+            }
+        }
+    }
+
+    /// One message for the automatic reloads of a settle round: a
+    /// checkout or a multi-file agent edit is reported once, not per file.
+    fn join_reload_round(&mut self, buffer: BufferId) {
+        let name = self.buffers[buffer].name.clone();
+        if let Some(round) = self.reload_round.as_mut() {
+            if !round.names.contains(&name) {
+                round.names.push(name);
+            }
+            return;
+        }
+        let timer = self.set_timer(TimerPurpose::ReloadSummary, self.config.settle_window_ms);
+        self.reload_round = Some(ReloadRound {
+            names: vec![name],
+            timer,
+            extensions: 0,
+        });
+    }
+
+    /// The round ends once no other file of it is still settling or being
+    /// read, up to `RELOAD_ROUND_EXTENSIONS` windows later, so a log being
+    /// appended to all the time cannot hold the message back.
+    pub(super) fn reload_summary_timer(&mut self, id: TimerId) {
+        let Some(round) = self.reload_round.as_mut() else {
+            return;
+        };
+        if round.timer != id {
+            return;
+        }
+        let in_flight = self
+            .reloading
+            .values()
+            .any(|request| request.reason == ReloadReason::Automatic)
+            || self.buffers.values().any(|buffer| {
+                buffer
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| matches!(file.external, ExternalState::Settling { .. }))
+            });
+        if in_flight && round.extensions < RELOAD_ROUND_EXTENSIONS {
+            round.extensions += 1;
+            let timer = self.set_timer(TimerPurpose::ReloadSummary, self.config.settle_window_ms);
+            if let Some(round) = self.reload_round.as_mut() {
+                round.timer = timer;
+            }
+            return;
+        }
+        let Some(mut round) = self.reload_round.take() else {
+            return;
+        };
+        // A single reload stays silent (DESIGN section 3).
+        if round.names.len() < 2 {
+            return;
+        }
+        round.names.sort();
+        let tab_width = usize::try_from(self.config.tab_width).expect("tab_width is bounded");
+        let clients: Vec<(ClientId, u16)> = self
+            .clients
+            .iter()
+            .map(|(id, client)| (*id, client.cols))
+            .collect();
+        for (client, cols) in clients {
+            let message = reload_summary(&round.names, usize::from(cols), tab_width);
+            self.set_echo(client, message);
+        }
+    }
+
+    // ---- Watching --------------------------------------------------------
+
+    /// Every visited file that has been read is watched once; a path no
+    /// buffer visits any more is let go. Run after every event, so every
+    /// way a buffer gains, changes or loses its file is covered.
+    pub(super) fn sync_watches(&mut self) {
+        // Compared by reference: this runs after every key.
+        let visited: BTreeSet<&PathBuf> = self
+            .buffers
+            .values()
+            .filter(|buffer| !buffer.loading)
+            .filter_map(|buffer| buffer.file.as_ref().map(|file| &file.path))
+            .collect();
+        let unchanged = visited.len() == self.watched.len()
+            && visited.iter().all(|path| self.watched.contains(*path));
+        if !unchanged {
+            let visited: BTreeSet<PathBuf> = visited.into_iter().cloned().collect();
+            for path in self.watched.difference(&visited) {
+                self.polled_paths.remove(path);
+                self.effects.push(Effect::Unwatch { path: path.clone() });
+            }
+            for path in visited.difference(&self.watched) {
+                self.effects.push(Effect::Watch { path: path.clone() });
+            }
+            self.watched = visited;
+        }
+        let polled = &self.polled_paths;
+        for buffer in self.buffers.values_mut() {
+            if let Some(file) = buffer.file.as_mut() {
+                file.polled = polled.contains(&file.path);
+            }
+        }
+    }
+
+    pub(super) fn file_polled(&mut self, path: PathBuf, notice: Option<String>) {
+        // The path may have been let go since.
+        if !self.watched.contains(&path) {
+            return;
+        }
+        self.polled_paths.insert(path);
+        if let Some(notice) = notice {
+            self.notify_all(notice);
         }
     }
 
@@ -1014,5 +1189,51 @@ impl Editor {
         self.reloading.remove(&buffer);
         self.appending.remove(&buffer);
         self.revert_pending.remove(&buffer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reload_summary;
+
+    const TAB_WIDTH: usize = 8;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn summary_lists_every_name_that_fits() {
+        let all = names(&["a.rs", "b.rs", "c.rs"]);
+        let full = "Reloaded 3 files changed on disk: a.rs, b.rs, c.rs";
+        assert_eq!(reload_summary(&all, 80, TAB_WIDTH), full);
+        assert_eq!(reload_summary(&all, full.len(), TAB_WIDTH), full);
+    }
+
+    #[test]
+    fn summary_is_cut_to_the_echo_width() {
+        let all = names(&["alpha.rs", "beta.rs", "gamma.rs", "delta.rs"]);
+        let cut = reload_summary(&all, 56, TAB_WIDTH);
+        assert_eq!(
+            cut,
+            "Reloaded 4 files changed on disk: alpha.rs, beta.rs, ..."
+        );
+        assert!(cut.len() <= 56);
+        assert_eq!(
+            reload_summary(&all, 10, TAB_WIDTH),
+            "Reloaded 4 files changed on disk: ..."
+        );
+    }
+
+    #[test]
+    fn summary_width_counts_columns_not_bytes() {
+        let all = names(&["\u{4e2d}\u{6587}.rs", "b.rs"]);
+        let full = "Reloaded 2 files changed on disk: \u{4e2d}\u{6587}.rs, b.rs";
+        let columns = full.chars().count() + 2;
+        assert_eq!(reload_summary(&all, columns, TAB_WIDTH), full);
+        assert_eq!(
+            reload_summary(&all, columns - 1, TAB_WIDTH),
+            "Reloaded 2 files changed on disk: \u{4e2d}\u{6587}.rs, ..."
+        );
     }
 }

@@ -1233,3 +1233,155 @@ fn check_no_content_lost(config: Config, steps: Vec<Step>) -> Result<(), TestCas
     }
     Ok(())
 }
+
+// ---- Watching, notifications and markers (Task 15) ------------------------
+
+#[test]
+fn watches_follow_visited_files() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let a = directory.path().join("a.txt");
+    let b = directory.path().join("b.txt");
+    fs::write(&a, "a\n").expect("write");
+    fs::write(&b, "b\n").expect("write");
+    let mut harness = harness_in(directory.path());
+    assert!(harness.watched().is_empty(), "*scratch* visits no file");
+    visit(&mut harness, &a);
+    visit(&mut harness, &b);
+    visit(&mut harness, &a);
+    assert_eq!(
+        harness.watched().iter().cloned().collect::<Vec<_>>(),
+        vec![a.clone(), b.clone()],
+        "each path once"
+    );
+    harness.keys("C-x k RET");
+    assert_eq!(
+        harness.watched().iter().cloned().collect::<Vec<_>>(),
+        vec![b.clone()],
+        "the killed buffer's file is let go"
+    );
+}
+
+#[test]
+fn polled_file_shows_poll_badge_and_notice() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    fs::write(&path, "a\n").expect("write");
+    let mut harness = harness_in(directory.path());
+    harness.handle(Event::FilePolled {
+        path: path.clone(),
+        notice: Some("not watched yet".to_string()),
+    });
+    assert_eq!(harness.echo(), "", "a path not watched is ignored");
+    visit(&mut harness, &path);
+    assert!(
+        !modeline(&harness).contains("[poll]"),
+        "{}",
+        modeline(&harness)
+    );
+    let notice = "Polling files in /x: cannot watch it (No such file or directory)";
+    harness.handle(Event::FilePolled {
+        path: path.clone(),
+        notice: Some(notice.to_string()),
+    });
+    assert!(
+        modeline(&harness).contains("[poll]"),
+        "{}",
+        modeline(&harness)
+    );
+    assert_eq!(harness.echo(), notice);
+}
+
+#[test]
+fn ext_marker_only_on_buffers_not_shown() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let a = directory.path().join("a.txt");
+    let b = directory.path().join("b.txt");
+    fs::write(&a, "a one\n").expect("write");
+    fs::write(&b, "b one\n").expect("write");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &a);
+    visit(&mut harness, &b);
+    rewrite_in_place(&a, b"a two\n", 1);
+    rewrite_in_place(&b, b"b two\n", 2);
+    harness.handle(Event::FileChanged { path: a.clone() });
+    harness.handle(Event::FileChanged { path: b.clone() });
+    harness.fire_timers();
+    harness.fire_timers();
+    assert_eq!(harness.buffer_text("a.txt").as_deref(), Some("a two\n"));
+    assert_eq!(harness.buffer_text("b.txt").as_deref(), Some("b two\n"));
+    assert!(!modeline(&harness).contains("[ext]"), "b.txt is shown");
+    visit(&mut harness, &a);
+    assert!(
+        modeline(&harness).contains("[ext]"),
+        "a.txt changed unseen: {}",
+        modeline(&harness)
+    );
+    harness.keys("C-f");
+    assert!(!modeline(&harness).contains("[ext]"), "seen now");
+}
+
+#[test]
+fn reloads_of_one_round_are_summarized_once() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let names = ["c.txt", "a.txt", "b.txt"];
+    let mut harness = harness_in(directory.path());
+    let paths: Vec<PathBuf> = names
+        .iter()
+        .map(|name| {
+            let path = directory.path().join(name);
+            fs::write(&path, format!("{name} before\n")).expect("write");
+            visit(&mut harness, &path);
+            path
+        })
+        .collect();
+    for (serial, path) in (1..).zip(&paths) {
+        replace_by_rename(path, b"after\n", serial);
+        harness.handle(Event::FileChanged { path: path.clone() });
+    }
+    // The second look settles every file, and they are reloaded; the
+    // round's timer is then still to come.
+    harness.fire_timers();
+    assert_eq!(harness.echo(), "", "the round is still open");
+    harness.fire_timers();
+    assert_eq!(
+        harness.echo(),
+        "Reloaded 3 files changed on disk: a.txt, b.txt, c.txt"
+    );
+    for name in names {
+        assert_eq!(harness.buffer_text(name).as_deref(), Some("after\n"));
+    }
+}
+
+#[test]
+fn a_single_reload_stays_silent() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    fs::write(&path, "before\n").expect("write");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+    let before = harness.echo();
+    replace_by_rename(&path, b"after\n", 1);
+    external_change(&mut harness, &path);
+    harness.fire_timers();
+    harness.fire_timers();
+    assert_eq!(harness.buffer_text("a.txt").as_deref(), Some("after\n"));
+    assert_eq!(harness.echo(), before, "nothing new is said");
+}
+
+#[test]
+fn a_new_file_buffer_shows_the_file_from_the_top_once_it_appears() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("later.txt");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+    fs::write(&path, "appeared\nsecond\n").expect("create");
+    external_change(&mut harness, &path);
+    harness.fire_timers();
+    assert_eq!(
+        harness.buffer_text("later.txt").as_deref(),
+        Some("appeared\nsecond\n")
+    );
+    let screen = harness.screen();
+    assert_eq!(screen[0].trim_end(), "appeared", "{screen:?}");
+    assert_eq!(harness.point(), 0);
+}

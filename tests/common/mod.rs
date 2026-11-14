@@ -466,6 +466,46 @@ impl RawClient {
         }
     }
 
+    /// Like `wait_screen`, but `each` sees every screen on the way: the
+    /// one there now and the one after every frame.
+    pub fn wait_screen_each(
+        &mut self,
+        mut each: impl FnMut(&[String]),
+        want: impl Fn(&[String]) -> bool,
+    ) -> Vec<String> {
+        let deadline = Instant::now() + WAIT;
+        each(&self.screen());
+        loop {
+            let screen = self.screen();
+            if want(&screen) {
+                return screen;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "screen never matched:\n{}",
+                screen.join("\n")
+            );
+            match self.receive(POLL) {
+                Some(ServerMsg::Frame { .. }) => each(&self.screen()),
+                Some(message) => self.messages.push(message),
+                None => {}
+            }
+        }
+    }
+
+    /// Takes in what arrives for `limit`: frames update the screen, other
+    /// messages are kept.
+    pub fn pump(&mut self, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if let Some(message) = self.receive(POLL)
+                && !matches!(message, ServerMsg::Frame { .. })
+            {
+                self.messages.push(message);
+            }
+        }
+    }
+
     /// Waits until some row contains `text`.
     pub fn wait_text(&mut self, text: &str) -> Vec<String> {
         self.wait_screen(|screen| screen.iter().any(|row| row.contains(text)))

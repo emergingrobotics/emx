@@ -378,6 +378,11 @@ fn center_line(old: &Text, new: &Text, old_start: u64) -> Result<u64, ReadError>
 /// first, else on the same line number (clamped); at the same column,
 /// clamped to the line and kept off the middle of a UTF-8 character.
 pub fn map_anchor(old: &Text, new: &Text, pos: u64) -> Result<u64, ReadError> {
+    // An empty text has no line to find again; its one empty line would
+    // match the empty line after a final newline and show only the end.
+    if old.is_empty() {
+        return Ok(0);
+    }
     let pos = pos.min(old.len());
     let old_start = line_start_at(old, pos)?;
     let old_line = line_range_at(old, old_start)?;

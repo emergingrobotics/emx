@@ -45,8 +45,10 @@ const MODELINE_DAMAGED: &str = "[DAMAGED] ";
 /// The buffer is modified and its file changed on disk.
 const MODELINE_CONFLICT: &str = "[CONFLICT] ";
 const MODELINE_DELETED: &str = "[DELETED] ";
-/// The file was reloaded (or grew) since the buffer was last looked at.
-const MODELINE_CHANGED: &str = "[CHANGED] ";
+/// The file was reloaded (or grew) while no window showed the buffer.
+const MODELINE_CHANGED: &str = "[ext] ";
+/// The visited file is polled, not watched (DESIGN section 3).
+const MODELINE_POLLED: &str = "[poll] ";
 /// Shown while the visited file is being read.
 const MODELINE_MODES_LOADING: &str = "(Fundamental Loading) ";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
@@ -429,6 +431,9 @@ fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usiz
     if let Some(badge) = buffer.file.as_ref().and_then(external_badge) {
         writer.write(badge.as_bytes(), face, face);
     }
+    if buffer.file.as_ref().is_some_and(|file| file.polled) {
+        writer.write(MODELINE_POLLED.as_bytes(), face, face);
+    }
     while writer.col < usize::from(writer.grid.cols) {
         writer.write(MODELINE_FILL.as_bytes(), face, face);
     }
@@ -508,7 +513,7 @@ fn one_line(unit: DisplayUnit) -> DisplayUnit {
     }
 }
 
-fn text_width(bytes: &[u8], tab_width: usize) -> usize {
+pub(crate) fn text_width(bytes: &[u8], tab_width: usize) -> usize {
     let mut column = 0;
     for (_, unit) in display_units(bytes) {
         column += unit_width(&one_line(unit), column, tab_width);

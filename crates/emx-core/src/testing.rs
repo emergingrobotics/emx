@@ -1,7 +1,7 @@
 //! Headless harness: one attached client driven through `Editor::handle`,
 //! with effects processed synchronously. Timers fire only when a test asks.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -95,6 +95,8 @@ pub struct Harness {
     /// Auto-save files that could not be deleted.
     io_errors: Vec<String>,
     journal_ops: Vec<JournalOp>,
+    /// The paths the editor asked to be watched and has not let go.
+    watched: BTreeSet<PathBuf>,
     /// Every message sent, to whom.
     messages: Vec<(ClientId, ServerMsg)>,
     next_client: u64,
@@ -138,6 +140,7 @@ impl Harness {
             sinks: None,
             io_errors: Vec::new(),
             journal_ops: Vec::new(),
+            watched: BTreeSet::new(),
             messages: Vec::new(),
             next_client: HARNESS_CLIENT.0 + 1,
             next_request: 1,
@@ -422,6 +425,12 @@ impl Harness {
                     result: reload::read_appended(&path, old, new, old_tail_hash, tail_bytes),
                 });
             }
+            Effect::Watch { path } => {
+                assert!(self.watched.insert(path), "a path is watched once");
+            }
+            Effect::Unwatch { path } => {
+                assert!(self.watched.remove(&path), "only watched paths are let go");
+            }
             Effect::Diff(job) => {
                 return Some(Event::DiffReady {
                     buffer: job.buffer,
@@ -530,6 +539,11 @@ impl Harness {
     }
 
     /// Journal operations the editor emitted since the last call.
+    /// The paths being watched.
+    pub fn watched(&self) -> &BTreeSet<PathBuf> {
+        &self.watched
+    }
+
     pub fn journal_ops(&mut self) -> Vec<JournalOp> {
         std::mem::take(&mut self.journal_ops)
     }

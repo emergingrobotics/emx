@@ -57,6 +57,7 @@ emx-proto = { path = "crates/emx-proto" }
 emx-term = { path = "crates/emx-term" }
 emx-text = { path = "crates/emx-text" }
 emx-types = { path = "crates/emx-types" }
+notify = { version = "8", default-features = false }
 rustix = { workspace = true, features = ["fs", "net", "process", "stdio"] }
 serde_json = { workspace = true }
 signal-hook = "0.3"

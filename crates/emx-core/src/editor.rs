@@ -168,6 +168,8 @@ enum TimerPurpose {
     CursorEvent(ClientId),
     /// A settling file is looked at again.
     Settle(BufferId),
+    /// The automatic reloads of one settle round are summarized.
+    ReloadSummary,
 }
 
 /// How a command finished, for the command loop's bookkeeping.
@@ -253,6 +255,13 @@ pub struct Editor {
     /// Saves waiting for a look at a target changed under the buffer's
     /// file-backed text, and who asked.
     save_verify: HashMap<BufferId, (ClientId, SaveFlow)>,
+    /// Visited paths the server watches (`Effect::Watch`).
+    watched: BTreeSet<PathBuf>,
+    /// Watched paths that are polled instead.
+    polled_paths: BTreeSet<PathBuf>,
+    /// The settle round of automatic reloads being summarized: the names
+    /// reloaded so far, its timer, and how often it was extended.
+    reload_round: Option<reload::ReloadRound>,
 }
 
 impl Editor {
@@ -309,6 +318,9 @@ impl Editor {
             revert_pending: HashMap::new(),
             follow_edit: false,
             save_verify: HashMap::new(),
+            watched: BTreeSet::new(),
+            polled_paths: BTreeSet::new(),
+            reload_round: None,
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -364,6 +376,7 @@ impl Editor {
             Event::Recovered(buffers) => self.recovered(buffers),
             Event::FileChanged { path } => self.file_changed(&path),
             Event::FileRenamed { from, to } => self.file_renamed(&from, &to),
+            Event::FilePolled { path, notice } => self.file_polled(path, notice),
             Event::Observed { buffer, result } => self.observed(buffer, result),
             Event::Reloaded { buffer, result } => self.reloaded(buffer, result),
             Event::AppendRead { buffer, result } => self.append_read(buffer, result),
@@ -371,6 +384,7 @@ impl Editor {
                 requester, result, ..
             } => self.diff_ready(requester, result),
         }
+        self.sync_watches();
         self.redisplay();
         self.report_cursors();
         self.flush_journal();
@@ -633,6 +647,7 @@ impl Editor {
             TimerPurpose::AutoSaveIdle => self.auto_save_idle(id),
             TimerPurpose::CursorEvent(client) => self.cursor_timer_expired(client, id),
             TimerPurpose::Settle(buffer) => self.settle_timer(buffer, id),
+            TimerPurpose::ReloadSummary => self.reload_summary_timer(id),
         }
     }
 
