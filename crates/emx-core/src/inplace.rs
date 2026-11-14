@@ -16,7 +16,7 @@ use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 
-use emx_text::{BLOCK_SIZE, FileIdentity, PieceSource, Text};
+use emx_text::{BLOCK_SIZE, FileIdentity, Original, PieceSource, Text};
 use rustix::fs::FallocateFlags;
 
 use crate::io::{SaveError, SaveSink, SinkFactory, file_sink, write_text};
@@ -126,10 +126,16 @@ pub fn save_in_place_with(
             });
         }
     };
-    if let Some(expected) = expected
-        && FileIdentity::of_file(&file).map_err(write_error)? != expected
-    {
+    let opened = FileIdentity::of_file(&file).map_err(write_error)?;
+    if expected.is_some_and(|expected| expected != opened) {
         return Err(SaveError::Changed(target.to_path_buf()));
+    }
+    if let Original::File(cache) = &text.sources().original {
+        let source = cache.identity();
+        let same_inode = source.dev == opened.dev && source.ino == opened.ino;
+        if same_inode && (source != opened || !writes_only_inserted_text(text, moves)) {
+            return Err(SaveError::ReadsTarget(target.to_path_buf()));
+        }
     }
     reserve(&file, text.len()).map_err(write_error)?;
     let mut sink = sinks(file.try_clone().map_err(write_error)?);
@@ -164,6 +170,22 @@ fn rewrite(
     file.set_len(text.len()).map_err(write_error)?;
     sink.sync().map_err(write_error)?;
     FileIdentity::of_file(file).map_err(write_error)
+}
+
+/// No `Write` covers bytes of an original piece, which would be read from
+/// the file while it is rewritten.
+fn writes_only_inserted_text(text: &Text, moves: &[Move]) -> bool {
+    let originals: Vec<(u64, u64)> = text
+        .pieces()
+        .filter(|(_, piece)| piece.source == PieceSource::Original)
+        .map(|(offset, piece)| (offset, offset + piece.len))
+        .collect();
+    moves.iter().all(|step| match *step {
+        Move::Write { at, len } => originals
+            .iter()
+            .all(|&(start, end)| end <= at || at + len <= start),
+        Move::Shift { .. } => true,
+    })
 }
 
 /// Allocates the space a growing file needs before any byte moves, so a

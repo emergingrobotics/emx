@@ -77,6 +77,9 @@ pub struct Buffer {
     /// The file is being read; the buffer is read-only until it arrives.
     pub loading: bool,
     pub coding: CodingMnemonic,
+    /// An in-place save failed part way through the file this buffer reads
+    /// its unchanged text from: the text is no longer what was visited.
+    pub damaged: bool,
     /// Where point was when the buffer last left a window, so showing it
     /// again puts point back, as Emacs's buffer point does.
     pub(crate) last_point: Option<MarkerId>,
@@ -103,6 +106,7 @@ impl Buffer {
             undo: UndoList::new(limits),
             loading: false,
             coding: CodingMnemonic::Utf8,
+            damaged: false,
             last_point: None,
             auto_saved_since_save: false,
             markers: SlotMap::with_key(),
@@ -118,6 +122,17 @@ impl Buffer {
 
     pub fn set_unmodified(&mut self) {
         self.save_tick = self.modified_tick;
+    }
+
+    /// Counts changes; a save records it to tell whether the buffer
+    /// changed while the save ran.
+    pub(crate) fn modified_tick(&self) -> u64 {
+        self.modified_tick
+    }
+
+    /// The text as of `tick` is what was saved.
+    pub(crate) fn set_saved_at(&mut self, tick: u64) {
+        self.save_tick = tick;
     }
 
     /// Emacs `(set-buffer-modified-p t)` without a change, as `write-file`
@@ -148,7 +163,7 @@ impl Buffer {
     }
 
     pub(crate) fn check_editable(&self) -> Result<(), EditError> {
-        if self.read_only || self.loading {
+        if self.read_only || self.loading || self.damaged {
             return Err(EditError::ReadOnly);
         }
         if self.file.as_ref().is_some_and(|file| file.saving) {

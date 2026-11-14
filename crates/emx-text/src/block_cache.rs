@@ -25,7 +25,7 @@ struct CachedBlocks {
 /// across rename-replacement.
 pub struct BlockCache {
     file: File,
-    identity: FileIdentity,
+    identity: Mutex<FileIdentity>,
     expected_len: AtomicU64,
     capacity_bytes: usize,
     cached: Mutex<CachedBlocks>,
@@ -35,7 +35,7 @@ impl std::fmt::Debug for BlockCache {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BlockCache")
-            .field("identity", &self.identity)
+            .field("identity", &self.identity())
             .field("expected_len", &self.len())
             .field("capacity_bytes", &self.capacity_bytes)
             .finish_non_exhaustive()
@@ -58,7 +58,7 @@ impl BlockCache {
         let identity = FileIdentity::of_file(&file)?;
         Ok(Arc::new(Self {
             file,
-            identity,
+            identity: Mutex::new(identity),
             expected_len: AtomicU64::new(identity.size),
             capacity_bytes,
             cached: Mutex::new(CachedBlocks {
@@ -76,9 +76,17 @@ impl BlockCache {
         self.len() == 0
     }
 
-    /// Identity of the file as it was when opened.
+    /// Identity of the file as it was when opened or last `rewritten`.
     pub fn identity(&self) -> FileIdentity {
-        self.identity
+        *self.identity.lock()
+    }
+
+    /// Records that the open file was rewritten in place and is now the
+    /// `identity` version: every cached block is dropped.
+    pub fn rewritten(&self, identity: FileIdentity) {
+        *self.identity.lock() = identity;
+        self.expected_len.store(identity.size, Ordering::Release);
+        self.invalidate_from(0);
     }
 
     pub fn get(&self, block: u64) -> Result<Arc<[u8]>, ReadError> {

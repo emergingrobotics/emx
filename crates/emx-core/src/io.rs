@@ -89,6 +89,8 @@ pub enum LoadError {
     Read { path: PathBuf, source: io::Error },
     #[error("{} kept changing while it was read", .0.display())]
     Unstable(PathBuf),
+    #[error("not a regular file: {}", .0.display())]
+    NotRegular(PathBuf),
 }
 
 /// Messages follow Emacs's `write-region` and `rename-file` errors.
@@ -118,6 +120,9 @@ pub enum SaveError {
     },
     #[error("{} changed on disk while it was being saved; not saved", .0.display())]
     Changed(PathBuf),
+    /// The plan would read the text it writes from the file it rewrites.
+    #[error("{} would be rewritten from its own bytes; not saved", .0.display())]
+    ReadsTarget(PathBuf),
     /// An in-place save failed after it began rewriting the file.
     #[error("{error}; {} is left partly rewritten", .path.display())]
     PartlyWritten {
@@ -130,6 +135,24 @@ pub enum SaveError {
         temp: PathBuf,
         cleanup: io::Error,
     },
+}
+
+/// A failed save as the editor receives it from a worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveFailure {
+    pub message: String,
+    /// An in-place save failed after it began rewriting the file, so the
+    /// file holds neither the old nor the new content.
+    pub file_damaged: bool,
+}
+
+impl From<&SaveError> for SaveFailure {
+    fn from(error: &SaveError) -> Self {
+        SaveFailure {
+            message: error.to_string(),
+            file_damaged: matches!(error, SaveError::PartlyWritten { .. }),
+        }
+    }
 }
 
 /// How a save writes the target, decided by `plan_save`. `expected` is the
@@ -295,6 +318,11 @@ pub fn load_file(path: &Path, config: &Config) -> Result<Loaded, LoadError> {
     if metadata.is_dir() {
         return Err(LoadError::IsDirectory(path.to_path_buf()));
     }
+    // FIFOs, devices and sockets never end or block; Emacs's
+    // `insert-file-contents` refuses them the same way.
+    if !metadata.is_file() {
+        return Err(LoadError::NotRegular(path.to_path_buf()));
+    }
     let writable = access_writable(path);
     let (sources, identity, coding, needs_index) = if metadata.len() <= config.in_memory_max {
         let (bytes, identity) = read_whole(path)?;
@@ -353,24 +381,38 @@ fn open_error(path: &Path, source: io::Error) -> LoadError {
     }
 }
 
-/// The bytes and the identity they belong to: the file is stat'ed before
-/// and after reading, and read again if it changed in between.
+/// Reads the file whole for a new buffer. One that shrank or was replaced
+/// while it was read is read again.
 fn read_whole(path: &Path) -> Result<(Vec<u8>, FileIdentity), LoadError> {
+    let read_error = |source| LoadError::Read {
+        path: path.to_path_buf(),
+        source,
+    };
     for _ in 0..LOAD_ATTEMPTS {
-        let mut file = File::open(path).map_err(|source| open_error(path, source))?;
-        let read_error = |source| LoadError::Read {
-            path: path.to_path_buf(),
-            source,
-        };
+        let file = File::open(path).map_err(|source| open_error(path, source))?;
+        if !file.metadata().map_err(read_error)?.is_file() {
+            return Err(LoadError::NotRegular(path.to_path_buf()));
+        }
         let before = FileIdentity::of_file(&file).map_err(read_error)?;
-        let mut bytes = Vec::with_capacity(usize::try_from(before.size).unwrap_or(0));
-        io::Read::read_to_end(&mut file, &mut bytes).map_err(read_error)?;
-        let after = FileIdentity::of_file(&file).map_err(read_error)?;
-        if before == after && bytes.len() as u64 == after.size {
-            return Ok((bytes, after));
+        if let Some(bytes) = read_stat_size(&file, before).map_err(read_error)? {
+            return Ok((bytes, before));
         }
     }
     Err(LoadError::Unstable(path.to_path_buf()))
+}
+
+/// The first `before.size` bytes, never more: a file that grew while it
+/// was read keeps the bytes it had when stat'ed, and what was appended is
+/// newer than the buffer, as any later change is. `None` when the file
+/// shrank or was replaced in the meantime.
+fn read_stat_size(file: &File, before: FileIdentity) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::with_capacity(usize::try_from(before.size).unwrap_or(0));
+    io::Read::read_to_end(&mut io::Read::take(file, before.size), &mut bytes)?;
+    let after = FileIdentity::of_file(file)?;
+    let complete = bytes.len() as u64 == before.size;
+    let appended_to =
+        after.dev == before.dev && after.ino == before.ino && after.size > before.size;
+    Ok((complete && (after == before || appended_to)).then_some(bytes))
 }
 
 /// Emacs `file-writable-p`, with the effective ids.
@@ -453,57 +495,110 @@ pub fn probe_target(path: &Path) -> io::Result<TargetInfo> {
 /// file would get the same owner and group (or root can set them), and the
 /// directory is writable (Emacs `backup-by-copying-when-linked` and
 /// `-when-mismatch`). Otherwise the file is written in place.
-pub fn plan_save(binding: &FileBinding, text: &Text, info: &TargetInfo, euid: u32) -> SavePlan {
-    let in_place = match &info.existing {
-        None => !info.directory_writable,
-        Some(file) => {
-            let cannot_keep_owner =
-                euid != ROOT_UID && (file.uid != euid || file.gid != info.new_file_gid);
-            !info.directory_writable || file.nlink > 1 || cannot_keep_owner
-        }
-    };
-    if in_place {
+pub fn plan_save(
+    binding: &FileBinding,
+    text: &Text,
+    info: &TargetInfo,
+    euid: u32,
+) -> Result<SavePlan, PlanError> {
+    if in_place_reason(info, euid).is_some() {
         in_place_plan(binding, text, info)
     } else {
-        rename_plan(text, info)
+        rename_plan(binding, text, info)
     }
 }
 
-pub fn rename_plan(text: &Text, info: &TargetInfo) -> SavePlan {
-    SavePlan::Rename {
+/// Why a rename would lose something, so the save must be in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InPlaceReason {
+    Hardlinked,
+    UnwritableDirectory,
+    OtherOwner,
+}
+
+pub fn in_place_reason(info: &TargetInfo, euid: u32) -> Option<InPlaceReason> {
+    if !info.directory_writable {
+        return Some(InPlaceReason::UnwritableDirectory);
+    }
+    let file = info.existing.as_ref()?;
+    if file.nlink > 1 {
+        return Some(InPlaceReason::Hardlinked);
+    }
+    let cannot_keep_owner = euid != ROOT_UID && (file.uid != euid || file.gid != info.new_file_gid);
+    cannot_keep_owner.then_some(InPlaceReason::OtherOwner)
+}
+
+/// A save that would write garbage is refused before it starts.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PlanError {
+    /// The buffer reads its unchanged text from the target file, which was
+    /// changed in place since: those bytes are no longer the buffer's.
+    #[error("{0} changed on disk under its buffer; revert or write elsewhere")]
+    ChangedUnderBuffer(String),
+}
+
+/// Whether the buffer's original is the target inode, and if so whether
+/// that inode still holds what the buffer was read from (or last saved).
+fn original_on_target(text: &Text, info: &TargetInfo) -> Option<bool> {
+    let Original::File(cache) = &text.sources().original else {
+        return None;
+    };
+    let disk = info.existing.as_ref()?.identity;
+    let opened = cache.identity();
+    (opened.dev == disk.dev && opened.ino == disk.ino).then_some(opened == disk)
+}
+
+fn changed_under_buffer(binding: &FileBinding) -> PlanError {
+    let name = binding
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| binding.path.display().to_string());
+    PlanError::ChangedUnderBuffer(name)
+}
+
+/// A rename reads the buffer's text, which may come from the target file;
+/// that file must still be what the buffer read.
+pub fn rename_plan(
+    binding: &FileBinding,
+    text: &Text,
+    info: &TargetInfo,
+) -> Result<SavePlan, PlanError> {
+    if original_on_target(text, info) == Some(false) {
+        return Err(changed_under_buffer(binding));
+    }
+    Ok(SavePlan::Rename {
         target: info.target.clone(),
         text: text.clone(),
         expected: info.existing.map(|file| file.identity),
-    }
+    })
 }
 
 /// An in-place save of `text` into the target. When the buffer's original
-/// is that very file, still as it was read or last saved, unchanged pieces
-/// are moved on disk (and skipped when they do not move); otherwise every
-/// byte comes from the buffer.
-pub fn in_place_plan(binding: &FileBinding, text: &Text, info: &TargetInfo) -> SavePlan {
-    let expected = info.existing.map(|file| file.identity);
-    let shifts_file = match (&text.sources().original, expected) {
-        (Original::File(cache), Some(disk)) => {
-            let opened = cache.identity();
-            opened.dev == disk.dev && opened.ino == disk.ino && binding.identity == Some(disk)
-        }
-        _ => false,
-    };
-    let moves = match &text.sources().original {
-        Original::File(cache) if shifts_file => inplace::plan_in_place(text, cache.len()),
+/// is the target inode, unchanged pieces are moved on disk (and skipped
+/// when they do not move) and only inserted text is written: a write never
+/// reads from the file it overwrites. Otherwise every byte comes from the
+/// buffer. A target changed in place under its buffer is refused.
+pub fn in_place_plan(
+    binding: &FileBinding,
+    text: &Text,
+    info: &TargetInfo,
+) -> Result<SavePlan, PlanError> {
+    let moves = match (original_on_target(text, info), &text.sources().original) {
+        (Some(false), _) => return Err(changed_under_buffer(binding)),
+        (Some(true), Original::File(cache)) => inplace::plan_in_place(text, cache.len()),
         _ if text.is_empty() => Vec::new(),
         _ => vec![Move::Write {
             at: 0,
             len: text.len(),
         }],
     };
-    SavePlan::InPlace {
+    Ok(SavePlan::InPlace {
         target: info.target.clone(),
         text: text.clone(),
         moves,
-        expected,
-    }
+        expected: info.existing.map(|file| file.identity),
+    })
 }
 
 /// Carries out a plan, writing through real files.
@@ -851,6 +946,28 @@ mod tests {
             assert_eq!(expand_file_name("/a/b/~/f", base), home.join("f"));
             assert_eq!(abbreviate(&home.join("f")), "~/f");
         }
+    }
+
+    #[test]
+    fn a_file_growing_while_read_keeps_its_stat_size() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("growing.log");
+        fs::write(&path, b"0123456789").expect("write");
+        let file = File::open(&path).expect("open");
+        let before = FileIdentity::of_file(&file).expect("stat");
+        let mut appender = OpenOptions::new().append(true).open(&path).expect("open");
+        Write::write_all(&mut appender, b"appended").expect("append");
+        assert_eq!(
+            read_stat_size(&file, before).expect("read"),
+            Some(b"0123456789".to_vec())
+        );
+        fs::write(&path, b"012").expect("shrink");
+        let file = File::open(&path).expect("open");
+        let stale = FileIdentity {
+            size: 10,
+            ..FileIdentity::of_file(&file).expect("stat")
+        };
+        assert_eq!(read_stat_size(&file, stale).expect("read"), None);
     }
 
     #[test]

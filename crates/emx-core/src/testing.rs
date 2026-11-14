@@ -15,7 +15,7 @@ use crate::buffer::{Buffer, BufferId};
 use crate::config::Config;
 use crate::editor::{Editor, Session};
 use crate::event::{ClientId, Effect, Event, TimerId};
-use crate::io::{self, SavePlan, SaveSink, SinkFactory};
+use crate::io::{self, SaveFailure, SavePlan, SaveSink, SinkFactory};
 use crate::marker::InsertionType;
 use crate::render::{PrefetchRequest, render};
 
@@ -269,7 +269,7 @@ impl Harness {
         };
         Event::SaveFinished {
             buffer,
-            result: result.map_err(|error| error.to_string()),
+            result: result.map_err(|error| SaveFailure::from(&error)),
         }
     }
 

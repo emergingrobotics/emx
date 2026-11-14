@@ -38,6 +38,9 @@ const MODELINE_POSITION_GAP: &str = "   ";
 const LINE_NUMBER_COLUMNS: usize = 6;
 const MODELINE_MODES_GAP: &str = "  ";
 const MODELINE_MODES: &str = "(Fundamental) ";
+/// Shown, until the buffer is killed, on a buffer whose file an in-place
+/// save left partly rewritten.
+const MODELINE_DAMAGED: &str = "[DAMAGED] ";
 /// Shown while the visited file is being read.
 const MODELINE_MODES_LOADING: &str = "(Fundamental Loading) ";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
@@ -412,6 +415,9 @@ fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usiz
         MODELINE_MODES
     };
     writer.write(modes.as_bytes(), face, face);
+    if buffer.damaged {
+        writer.write(MODELINE_DAMAGED.as_bytes(), face, face);
+    }
     while writer.col < usize::from(writer.grid.cols) {
         writer.write(MODELINE_FILL.as_bytes(), face, face);
     }

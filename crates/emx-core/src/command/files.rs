@@ -16,8 +16,7 @@ pub(super) fn save_buffer(ctx: &mut CommandContext) -> Result<(), CommandError> 
 
 pub(super) fn write_file(ctx: &mut CommandContext) -> Result<(), CommandError> {
     let client = ctx.client;
-    ctx.editor().write_file_command(client);
-    Ok(())
+    ctx.editor().write_file_command(client)
 }
 
 pub(super) fn save_some_buffers(ctx: &mut CommandContext) -> Result<(), CommandError> {

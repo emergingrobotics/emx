@@ -15,7 +15,8 @@ use crate::autosave;
 use crate::buffer::{BufferId, CodingMnemonic, EditError, FileBinding};
 use crate::command::CommandError;
 use crate::event::{AutoSaveJob, ClientId, Effect};
-use crate::io::{self, Loaded, SavePlan, abbreviate, expand_file_name, strerror};
+use crate::inplace::Move;
+use crate::io::{self, Loaded, SaveFailure, SavePlan, abbreviate, expand_file_name, strerror};
 use crate::marker::InsertionType;
 use crate::minibuffer::{
     Answer, BACKSPACE, ESCAPE, HistoryKind, KeyChoice, Minibuffer, Mode, Outcome, Overlay, RETURN,
@@ -90,6 +91,7 @@ pub(crate) enum Question {
     WriteProtected,
     CreateDirectory,
     LargeSave,
+    InPlaceRisk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,12 +151,18 @@ pub(crate) struct SaveSession {
     end: SessionEnd,
 }
 
-/// A save in flight and who asked for it.
+/// A save in flight, who asked for it, and what it wrote.
 #[derive(Debug)]
 pub(super) struct SaveRequest {
     client: ClientId,
     quiet: bool,
     after: AfterSave,
+    /// The text written and the buffer's change count when it was taken:
+    /// only if the buffer is still at that count is it unmodified after.
+    text: Text,
+    tick: u64,
+    /// An in-place save of the inode the buffer's original is read from.
+    rewrites_original: bool,
 }
 
 /// `save-buffers-kill-terminal` waiting for its saves before exiting.
@@ -353,6 +361,16 @@ impl Editor {
 
     /// Bracketed paste into the minibuffer inserts the text as typed.
     pub(super) fn minibuffer_paste(&mut self, client: ClientId, bytes: &[u8]) {
+        let reads_a_line = self
+            .client(client)
+            .minibuffer
+            .as_ref()
+            .is_some_and(|minibuffer| matches!(minibuffer.mode, Mode::Line { .. } | Mode::YesOrNo));
+        // Pasted characters must not answer single-key questions.
+        if !reads_a_line {
+            self.ring_bell(client);
+            return;
+        }
         let text = String::from_utf8_lossy(bytes).into_owned();
         for character in text.chars() {
             self.minibuffer_key(client, plain(character));
@@ -421,10 +439,12 @@ impl Editor {
                 Answer::Yes(yes),
             ) => {
                 if yes {
-                    self.visit_new_name(buffer, path, write_file);
-                    let mut flow = SaveFlow::new(buffer, false, AfterSave::Nothing, None);
-                    flow.changed_confirmed = true;
-                    self.continue_save(client, flow)
+                    self.check_savable(buffer).and_then(|()| {
+                        self.visit_new_name(buffer, path, write_file);
+                        let mut flow = SaveFlow::new(buffer, false, AfterSave::Nothing, None);
+                        flow.changed_confirmed = true;
+                        self.continue_save(client, flow)
+                    })
                 } else {
                     Err(user_error("Canceled"))
                 }
@@ -748,17 +768,12 @@ impl Editor {
 
     pub(crate) fn save_buffer_command(&mut self, client: ClientId) -> Result<(), CommandError> {
         let buffer = self.selected_buffer(client);
+        self.check_savable(buffer)?;
         let target = &self.buffers[buffer];
-        if target.loading {
-            return Err(EditError::ReadOnly.into());
-        }
         let Some(file) = &target.file else {
             self.read_file_name(client, "File to save in: ", Purpose::SaveAs { buffer });
             return Ok(());
         };
-        if file.saving {
-            return Err(EditError::Saving.into());
-        }
         // A file that does not exist is written even when unmodified.
         if !target.is_modified() && file.path.exists() {
             self.set_echo(client, "(No changes need to be saved)".to_string());
@@ -770,9 +785,34 @@ impl Editor {
         )
     }
 
-    pub(crate) fn write_file_command(&mut self, client: ClientId) {
+    pub(crate) fn write_file_command(&mut self, client: ClientId) -> Result<(), CommandError> {
         let buffer = self.selected_buffer(client);
+        self.check_savable(buffer)?;
         self.read_file_name(client, "Write file: ", Purpose::WriteFile { buffer });
+        Ok(())
+    }
+
+    /// A buffer being read, being saved, or damaged has no text to save
+    /// (and a save in flight must finish before another starts).
+    fn check_savable(&self, buffer: BufferId) -> Result<(), CommandError> {
+        let Some(target) = self.buffers.get(buffer) else {
+            return Err(user_error("Selecting deleted buffer"));
+        };
+        if target.loading {
+            return Err(CommandError::BufferReadOnly(target.name.clone()));
+        }
+        if target.file.as_ref().is_some_and(|file| file.saving)
+            || self.pending_saves.contains_key(&buffer)
+        {
+            return Err(EditError::Saving.into());
+        }
+        if target.damaged {
+            return Err(user_error(format!(
+                "Buffer {} is damaged: its file was left partly rewritten; nothing to save",
+                target.name
+            )));
+        }
+        Ok(())
     }
 
     /// `write-file`: a directory gets the buffer's file name appended, and
@@ -816,9 +856,7 @@ impl Editor {
         path: PathBuf,
         write_file: bool,
     ) -> Result<(), CommandError> {
-        if !self.buffers.contains_key(buffer) {
-            return Ok(());
-        }
+        self.check_savable(buffer)?;
         if path.exists() {
             let question = format!("File \u{2018}{}\u{2019} exists; overwrite?", path.display());
             self.y_or_n_p(
@@ -860,6 +898,12 @@ impl Editor {
     /// then plans the save and starts it.
     fn continue_save(&mut self, client: ClientId, mut flow: SaveFlow) -> Result<(), CommandError> {
         let buffer = flow.buffer;
+        // A question may have been pending while another client saved, or
+        // the buffer was killed.
+        if !self.buffers.contains_key(buffer) {
+            return self.resume_session(client, flow.session);
+        }
+        self.check_savable(buffer)?;
         let Some(binding) = self
             .buffers
             .get(buffer)
@@ -922,12 +966,27 @@ impl Editor {
             _ => {}
         }
         let text = self.buffers[buffer].text.clone();
-        let plan = match flow.method {
+        let euid = rustix::process::geteuid().as_raw();
+        let planned = match flow.method {
             Some(Method::InPlace) => io::in_place_plan(&binding, &text, &info),
-            Some(Method::Rename) => io::rename_plan(&text, &info),
+            Some(Method::Rename) => io::rename_plan(&binding, &text, &info),
+            None => io::plan_save(&binding, &text, &info, euid),
+        };
+        let plan = planned.map_err(|error| user_error(error.to_string()))?;
+        if let SavePlan::InPlace { moves, .. } = &plan {
+            self.refuse_in_place_over_aliases(buffer, &name, &info)?;
+            let shifts = moves.iter().any(|step| matches!(step, Move::Shift { .. }));
+            if flow.method.is_none()
+                && shifts
+                && let Some(reason) = io::in_place_reason(&info, euid)
+            {
+                self.ask_in_place_risk(client, flow, &name, reason, info.directory_writable);
+                return Ok(());
+            }
+        }
+        let plan = match flow.method {
+            Some(_) => plan,
             None => {
-                let euid = rustix::process::geteuid().as_raw();
-                let plan = io::plan_save(&binding, &text, &info, euid);
                 if matches!(plan, SavePlan::Rename { .. })
                     && text.len() > self.config.large_save_warn
                 {
@@ -960,9 +1019,84 @@ impl Editor {
                 plan
             }
         };
+        let rewrites_original = matches!(plan, SavePlan::InPlace { .. })
+            && original_inode_is(&text, info.existing.map(|file| file.identity));
         let session = flow.session.take();
-        self.start_save_effect(client, &flow, binding.path, plan, session.is_some());
+        self.start_save_effect(
+            client,
+            &flow,
+            binding.path,
+            plan,
+            rewrites_original,
+            session.is_some(),
+        )?;
         self.resume_session(client, session)
+    }
+
+    /// An in-place save rewrites the inode; any other buffer reading its
+    /// unchanged text from that inode (a hardlink or symlink alias) would
+    /// be corrupted.
+    fn refuse_in_place_over_aliases(
+        &self,
+        buffer: BufferId,
+        name: &str,
+        info: &io::TargetInfo,
+    ) -> Result<(), CommandError> {
+        let target = info.existing.map(|file| file.identity);
+        let alias = self
+            .buffers
+            .iter()
+            .find(|(id, other)| *id != buffer && original_inode_is(&other.text, target));
+        match alias {
+            Some((_, other)) => Err(user_error(format!(
+                "{name} is also visited as buffer {}; saving it in place would corrupt that buffer",
+                other.name
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Automatic in-place saves that move the buffer's own file bytes are
+    /// not crash-safe: a failure loses the file and the buffer. Ask first.
+    fn ask_in_place_risk(
+        &mut self,
+        client: ClientId,
+        flow: SaveFlow,
+        name: &str,
+        reason: io::InPlaceReason,
+        rename_possible: bool,
+    ) {
+        let why = match reason {
+            io::InPlaceReason::Hardlinked => "is hardlinked",
+            io::InPlaceReason::OtherOwner => "is owned by another user",
+            io::InPlaceReason::UnwritableDirectory => "is in an unwritable directory",
+        };
+        let mut choices = vec![choice(plain('i'), 'i'), choice(plain('c'), 'c')];
+        let options = if rename_possible {
+            choices.push(choice(plain('r'), 'r'));
+            "(i)n place, (r)ewrite (breaks links/ownership), (c)ancel? "
+        } else {
+            "(i)n place, (c)ancel? "
+        };
+        let prompt = format!(
+            "{name} {why}; saving in place is not crash-safe and a failure loses the file \
+             and this buffer. {options}"
+        );
+        let mode = Mode::Keys {
+            choices,
+            invalid: None,
+            help: None,
+        };
+        self.read_from_minibuffer(
+            client,
+            prompt,
+            String::new(),
+            mode,
+            Purpose::SaveCheck {
+                flow,
+                question: Question::InPlaceRisk,
+            },
+        );
     }
 
     fn answer_save_check(
@@ -1009,6 +1143,9 @@ impl Editor {
             (Question::LargeSave, Answer::Key('r')) => flow.method = Some(Method::Rename),
             (Question::LargeSave, Answer::Key('i')) => flow.method = Some(Method::InPlace),
             (Question::LargeSave, Answer::Key(_)) => return Err(user_error("Canceled")),
+            (Question::InPlaceRisk, Answer::Key('i')) => flow.method = Some(Method::InPlace),
+            (Question::InPlaceRisk, Answer::Key('r')) => flow.method = Some(Method::Rename),
+            (Question::InPlaceRisk, Answer::Key(_)) => return Err(user_error("Canceled")),
             (question, answer) => unreachable!("{question:?} cannot be answered {answer:?}"),
         }
         self.continue_save(client, flow)
@@ -1021,22 +1158,26 @@ impl Editor {
         flow: &SaveFlow,
         path: PathBuf,
         plan: SavePlan,
+        rewrites_original: bool,
         in_session: bool,
-    ) {
+    ) -> Result<(), CommandError> {
         let buffer = flow.buffer;
-        self.buffers[buffer]
+        self.check_savable(buffer)?;
+        let target = &mut self.buffers[buffer];
+        target
             .file
             .as_mut()
             .expect("a saved buffer visits a file")
             .saving = true;
-        self.pending_saves.insert(
-            buffer,
-            SaveRequest {
-                client,
-                quiet: flow.quiet,
-                after: flow.after,
-            },
-        );
+        let request = SaveRequest {
+            client,
+            quiet: flow.quiet,
+            after: flow.after,
+            text: plan.text().clone(),
+            tick: target.modified_tick(),
+            rewrites_original,
+        };
+        self.pending_saves.insert(buffer, request);
         if in_session && let Some(wait) = self.client_mut(client).exit_wait.as_mut() {
             wait.in_flight.insert(buffer);
         }
@@ -1044,61 +1185,125 @@ impl Editor {
             self.set_echo(client, format!("Saving file {}...", path.display()));
         }
         self.effects.push(Effect::Save { buffer, plan });
+        Ok(())
     }
 
-    pub(super) fn save_finished(&mut self, buffer: BufferId, result: Result<FileIdentity, String>) {
-        let request = self
-            .pending_saves
-            .remove(&buffer)
-            .expect("save results come only for saves the editor started");
-        let client = request.client;
-        let Some(target) = self.buffers.get_mut(buffer) else {
+    /// A worker's save result. Results are external input: one for a save
+    /// the editor is not waiting on is ignored.
+    pub(super) fn save_finished(
+        &mut self,
+        buffer: BufferId,
+        result: Result<FileIdentity, SaveFailure>,
+    ) {
+        let Some(request) = self.pending_saves.remove(&buffer) else {
             return;
         };
-        let binding = target.file.as_mut().expect("a saved buffer visits a file");
-        binding.saving = false;
-        let path = binding.path.clone();
-        let succeeded = result.is_ok();
-        match result {
-            Ok(identity) => {
-                self.adopt_saved_file(buffer, identity);
-                if !request.quiet {
-                    self.message_to(client, format!("Wrote {}", path.display()));
-                }
-                if request.after == AfterSave::Kill {
-                    self.kill_buffer(buffer);
-                }
-            }
-            Err(message) => {
-                // Not `fail`: a waiting exit must learn of the failure below.
-                if self.clients.contains_key(&client) {
-                    self.signal(client, None, &user_error(message));
-                }
-            }
-        }
-        if let Some(wait) = self
-            .clients
-            .get_mut(&client)
-            .and_then(|state| state.exit_wait.as_mut())
+        let client = request.client;
+        if let Some(binding) = self
+            .buffers
+            .get_mut(buffer)
+            .and_then(|target| target.file.as_mut())
         {
-            wait.in_flight.remove(&buffer);
-            wait.failed |= !succeeded;
+            binding.saving = false;
+            let path = binding.path.clone();
+            match &result {
+                Ok(identity) => {
+                    self.adopt_saved_file(buffer, *identity, &request);
+                    if !request.quiet {
+                        self.message_to(client, format!("Wrote {}", path.display()));
+                    }
+                    if request.after == AfterSave::Kill && !self.buffers[buffer].is_modified() {
+                        self.kill_buffer(buffer);
+                    }
+                }
+                Err(failure) => {
+                    let mut message = failure.message.clone();
+                    if failure.file_damaged && request.rewrites_original {
+                        self.mark_damaged(buffer);
+                        message.push_str(&format!(
+                            "; buffer {} read that file and is damaged",
+                            self.buffers[buffer].name
+                        ));
+                    }
+                    // Not `fail`: a waiting exit must learn of the failure.
+                    if self.clients.contains_key(&client) {
+                        self.signal(client, None, &user_error(message.clone()));
+                    }
+                    self.abandon_exits(&message);
+                }
+            }
         }
-        self.check_exit(client);
+        let waiting: Vec<ClientId> = self
+            .clients
+            .iter_mut()
+            .filter_map(|(id, state)| {
+                let wait = state.exit_wait.as_mut()?;
+                wait.in_flight.remove(&buffer);
+                Some(*id)
+            })
+            .collect();
+        for client in waiting {
+            self.check_exit(client);
+        }
         self.maybe_arm_grace();
     }
 
-    /// After a save the buffer is unmodified, remembers the file version
-    /// it wrote, and reads from the new file: pieces never refer to bytes an
-    /// in-place save changed, nor keep a replaced file alive.
-    fn adopt_saved_file(&mut self, buffer: BufferId, identity: FileIdentity) {
+    /// A failed save abandons every pending exit; the exiting clients see
+    /// why.
+    fn abandon_exits(&mut self, message: &str) {
+        let exiting: Vec<ClientId> = self
+            .clients
+            .iter()
+            .filter(|(_, state)| state.exit_wait.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for client in exiting {
+            let state = self.client_mut(client);
+            if let Some(wait) = state.exit_wait.as_mut() {
+                wait.failed = true;
+            }
+            if state.minibuffer.is_none() {
+                state.echo = message.to_string();
+            }
+        }
+    }
+
+    /// The buffer's unchanged text came from a file an in-place save left
+    /// partly rewritten: nothing it shows can be trusted, so it says so and
+    /// can be neither edited nor saved.
+    fn mark_damaged(&mut self, buffer: BufferId) {
+        let target = &mut self.buffers[buffer];
+        if let Original::File(cache) = &target.text.sources().original {
+            cache.invalidate_from(0);
+        }
+        target.damaged = true;
+    }
+
+    /// After a save the buffer remembers the file version it wrote. If the
+    /// buffer did not change while the save ran it is unmodified and reads
+    /// from the new file: pieces never refer to bytes an in-place save
+    /// changed, nor keep a replaced file alive. If it changed, it stays
+    /// modified with its own text; text an in-place save pulled from under
+    /// it is marked damaged.
+    fn adopt_saved_file(
+        &mut self,
+        buffer: BufferId,
+        identity: FileIdentity,
+        request: &SaveRequest,
+    ) {
         let capacity = usize::try_from(self.config.block_cache_bytes).unwrap_or(usize::MAX);
         let target = &mut self.buffers[buffer];
         let binding = target.file.as_mut().expect("a saved buffer visits a file");
         binding.identity = Some(identity);
         let path = binding.path.clone();
-        target.set_unmodified();
-        let text = target.text.clone();
+        if target.modified_tick() != request.tick {
+            if request.rewrites_original {
+                self.mark_damaged(buffer);
+            }
+            return;
+        }
+        target.set_saved_at(request.tick);
+        let text = request.text.clone();
         if target.coding == CodingMnemonic::Undecided && !inserted_text_is_ascii(&text) {
             target.coding = CodingMnemonic::Utf8;
         }
@@ -1112,8 +1317,7 @@ impl Editor {
             Original::File(cache) => {
                 let opened = cache.identity();
                 if opened.dev == identity.dev && opened.ino == identity.ino {
-                    cache.invalidate_from(0);
-                    cache.set_len(identity.size);
+                    cache.rewritten(identity);
                     Some((
                         Sources::file(cache.clone(), LineIndex::new(identity.size)),
                         true,
@@ -1302,10 +1506,13 @@ impl Editor {
         let Some(state) = self.clients.get_mut(&client) else {
             return;
         };
+        // Every save must land first, including ones started before the
+        // exit: shutting down would abandon them.
         let ready = state
             .exit_wait
             .as_ref()
-            .is_some_and(|wait| !wait.prompting && wait.in_flight.is_empty());
+            .is_some_and(|wait| !wait.prompting && wait.in_flight.is_empty())
+            && self.pending_saves.is_empty();
         if !ready {
             return;
         }
@@ -1537,6 +1744,16 @@ impl Editor {
             }
         }
     }
+}
+
+/// Whether the text reads its original from the file `identity` names
+/// (same device and inode, whatever its version).
+fn original_inode_is(text: &Text, identity: Option<FileIdentity>) -> bool {
+    let (Original::File(cache), Some(identity)) = (&text.sources().original, identity) else {
+        return false;
+    };
+    let opened = cache.identity();
+    opened.dev == identity.dev && opened.ino == identity.ino
 }
 
 /// Whether the text's inserted bytes are all ASCII; an original read as

@@ -6,7 +6,7 @@ use emx_text::{FileIdentity, Text};
 use emx_types::Key;
 
 use crate::buffer::BufferId;
-use crate::io::{Loaded, SavePlan};
+use crate::io::{Loaded, SaveFailure, SavePlan};
 use crate::render::PrefetchRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -41,7 +41,7 @@ pub enum Event {
     /// The result of an `Effect::Save`: the identity of the file written.
     SaveFinished {
         buffer: BufferId,
-        result: Result<FileIdentity, String>,
+        result: Result<FileIdentity, SaveFailure>,
     },
     /// The result of an `Effect::AutoSave`.
     AutoSaved {

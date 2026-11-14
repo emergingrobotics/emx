@@ -339,6 +339,12 @@ fn in_place_save_of_a_block_cache_buffer_reuses_the_file() {
     visit(&mut harness, &path);
     harness.keys("C-f C-f C-f X Y");
     harness.keys("C-x C-s");
+    assert_eq!(
+        harness.echo_line(),
+        "big.log is hardlinked; saving in place is not crash-safe and a failure loses the \
+         file and this buffer. (i)n place, (r)ewrite (breaks links/ownership), (c)ancel? "
+    );
+    harness.keys("i");
     assert_eq!(harness.echo(), format!("Wrote {}", path.display()));
     let mut expected = content.clone();
     expected.splice(3..3, *b"XY");
@@ -382,7 +388,7 @@ fn plan_save_decides_rename_or_in_place() {
     let is_rename = |info: TargetInfo, euid: u32| {
         matches!(
             plan_save(&binding, &text, &info, euid),
-            SavePlan::Rename { .. }
+            Ok(SavePlan::Rename { .. })
         )
     };
     assert!(is_rename(target(1, USER, USER, true), USER));
@@ -507,7 +513,7 @@ fn a_file_changed_after_planning_is_never_overwritten() {
 
     let info = probe_target(&path).expect("probe");
     let binding = harness.buffer().file.clone().expect("visiting");
-    let in_place = emx_core::io::in_place_plan(&binding, text, &info);
+    let in_place = emx_core::io::in_place_plan(&binding, text, &info).expect("memory text plans");
     write_file(&path, b"and again, longer than before\n");
     assert!(matches!(
         emx_core::io::save(&in_place),
@@ -1074,7 +1080,7 @@ fn save_with_no_clients_rearms_the_daemon_grace_timer() {
             .any(|effect| matches!(effect, Effect::SetTimer { .. })),
         "an unsaved buffer keeps the daemon"
     );
-    let result = emx_core::io::save(&plan).map_err(|error| error.to_string());
+    let result = emx_core::io::save(&plan).map_err(|error| emx_core::io::SaveFailure::from(&error));
     editor.handle(Event::SaveFinished { buffer, result });
     let timers: Vec<emx_core::TimerId> = editor
         .take_effects()
@@ -1194,4 +1200,441 @@ proptest! {
         prop_assert!(on_disk == expected, "file differs from the buffer");
         prop_assert_eq!(saved, FileIdentity::of_path(&path).expect("stat"));
     }
+}
+
+fn block_cache_config() -> Config {
+    Config {
+        in_memory_max: 1024,
+        ..Config::default()
+    }
+}
+
+fn big_content() -> Vec<u8> {
+    (0..200_000u32)
+        .map(|index| b'a' + (index % 26) as u8)
+        .collect()
+}
+
+fn touch_later(path: &Path) {
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open")
+        .set_modified(later)
+        .expect("set mtime");
+}
+
+/// C1: a block-cache buffer whose file changed in place under it would be
+/// saved from the changed bytes; the save is refused instead.
+#[test]
+fn in_place_never_reads_a_file_changed_under_its_buffer() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("big.log");
+    write_file(&path, &big_content());
+    fs::hard_link(&path, directory.path().join("alias.log")).expect("hard link");
+    let mut harness = harness_with(block_cache_config(), directory.path());
+    visit(&mut harness, &path);
+    harness.keys("x");
+    touch_later(&path);
+    harness.keys("C-x C-s");
+    harness.type_text("yes");
+    harness.keys("RET");
+    assert_eq!(
+        harness.echo(),
+        "big.log changed on disk under its buffer; revert or write elsewhere"
+    );
+    assert_eq!(fs::read(&path).expect("read"), big_content());
+    assert!(harness.buffer().is_modified());
+    assert!(!harness.buffer().file.as_ref().expect("visiting").saving);
+}
+
+/// C1: the executor refuses a plan whose writes read the target itself.
+#[test]
+fn in_place_writes_from_the_target_are_refused() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("big.log");
+    write_file(&path, &big_content());
+    let loaded = load_file(&path, &block_cache_config()).expect("load");
+    let identity = loaded.identity;
+    let text = Text::from_original(loaded.sources)
+        .insert(5, b"new")
+        .expect("insert");
+    let plan = SavePlan::InPlace {
+        target: path.clone(),
+        moves: vec![emx_core::inplace::Move::Write {
+            at: 0,
+            len: text.len(),
+        }],
+        text,
+        expected: identity,
+    };
+    let error = emx_core::io::save(&plan).expect_err("refused");
+    assert!(
+        matches!(error, emx_core::io::SaveError::ReadsTarget(_)),
+        "{error}"
+    );
+    assert_eq!(fs::read(&path).expect("read"), big_content());
+}
+
+/// C1: `write-file` onto a hardlink alias of the visited file rewrites
+/// the shared inode by moving its bytes, never reading what it overwrote.
+#[test]
+fn write_file_onto_a_hardlink_alias_saves_correctly() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.log");
+    let alias = directory.path().join("b.log");
+    write_file(&path, &big_content());
+    fs::hard_link(&path, &alias).expect("hard link");
+    let mut harness = harness_with(block_cache_config(), directory.path());
+    visit(&mut harness, &path);
+    harness.keys("C-f C-f X");
+    harness.keys("C-x C-w");
+    harness.type_text("b.log");
+    harness.keys("RET y");
+    assert!(harness.echo_line().starts_with("b.log is hardlinked;"));
+    harness.keys("i");
+    assert_eq!(harness.echo(), format!("Wrote {}", alias.display()));
+    let mut expected = big_content();
+    expected.insert(2, b'X');
+    assert_eq!(fs::read(&alias).expect("read"), expected);
+    assert_eq!(fs::read(&path).expect("read"), expected);
+    assert_eq!(harness.text().as_bytes(), expected.as_slice());
+}
+
+/// C2: nothing starts a second save, or renames the buffer, while one is
+/// in flight; a result nobody waits for is ignored.
+#[test]
+fn saving_buffers_refuse_write_file_and_second_saves() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    write_file(&path, b"a\n");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+    harness.keys("x");
+    harness.hold_saves();
+    harness.keys("C-x C-s");
+    harness.keys("C-x C-w");
+    assert_eq!(harness.echo(), "Buffer is being saved");
+    harness.keys("C-x C-s");
+    assert_eq!(harness.echo(), "Buffer is being saved");
+    assert_eq!(harness.held_saves().len(), 1);
+    assert_eq!(harness.buffer().name, "a.txt");
+    harness.release_saves();
+    assert_eq!(harness.echo(), format!("Wrote {}", path.display()));
+    let buffer = harness.buffer().id;
+    harness.handle(Event::SaveFinished {
+        buffer,
+        result: Ok(FileIdentity::of_path(&path).expect("stat")),
+    });
+    assert!(!harness.buffer().is_modified());
+}
+
+/// C2: text that changed while a save ran is kept and stays modified.
+#[test]
+fn edits_during_a_save_are_kept_modified() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    write_file(&path, b"a\n");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+    harness.keys("x");
+    harness.hold_saves();
+    harness.keys("C-x C-s");
+    // Simulates an edit slipping past the read-only guard.
+    harness.buffer_mut().file.as_mut().expect("visiting").saving = false;
+    harness.keys("C-e z");
+    harness.release_saves();
+    assert_eq!(fs::read(&path).expect("read"), b"xa\n");
+    assert_eq!(harness.text(), "xaz\n");
+    assert!(harness.buffer().is_modified());
+    harness.keys("C-x C-s");
+    assert_eq!(fs::read(&path).expect("read"), b"xaz\n");
+}
+
+fn editor_visiting(path: &Path, clients: &[emx_core::ClientId]) -> emx_core::Editor {
+    let mut editor = emx_core::Editor::new(Config::default()).expect("valid config");
+    for client in clients {
+        editor.handle(Event::ClientAttached {
+            client: *client,
+            cols: 80,
+            rows: 24,
+            kind: emx_proto::ClientKind::Tui,
+        });
+    }
+    let client = clients[0];
+    editor_keys(&mut editor, client, "C-x C-f C-a C-k");
+    editor_type(&mut editor, client, path.to_str().expect("utf-8"));
+    editor_keys(&mut editor, client, "RET");
+    editor
+}
+
+fn editor_keys(editor: &mut emx_core::Editor, client: emx_core::ClientId, kbd: &str) {
+    for key in emx_types::parse_kbd(kbd).expect("kbd") {
+        editor.handle(Event::Key(client, key));
+    }
+}
+
+fn editor_type(editor: &mut emx_core::Editor, client: emx_core::ClientId, text: &str) {
+    for character in text.chars() {
+        editor.handle(Event::Key(
+            client,
+            emx_types::Key {
+                code: emx_types::KeyCode::Char(character),
+                mods: emx_types::Mods::default(),
+            },
+        ));
+    }
+}
+
+fn echo_row(editor: &emx_core::Editor, client: emx_core::ClientId) -> String {
+    let grid = emx_core::render(editor, client).0;
+    grid.row(23)
+        .iter()
+        .map(|cell| cell.text.as_str())
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+fn deliver_load(editor: &mut emx_core::Editor) -> emx_core::BufferId {
+    let (buffer, path) = editor
+        .take_effects()
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::Load { buffer, path } => Some((buffer, path)),
+            _ => None,
+        })
+        .expect("load requested");
+    let result = load_file(&path, editor.config()).map_err(|error| error.to_string());
+    editor.handle(Event::FileLoaded { buffer, result });
+    buffer
+}
+
+/// C2: a loading buffer has no text to write.
+#[test]
+fn loading_buffers_cannot_be_written() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    write_file(&path, b"content\n");
+    let client = emx_core::ClientId(1);
+    let mut editor = editor_visiting(&path, &[client]);
+    editor_keys(&mut editor, client, "C-x C-w");
+    assert_eq!(
+        echo_row(&editor, client),
+        "Buffer is read-only: #<buffer a.txt>"
+    );
+    editor_keys(&mut editor, client, "C-x C-s");
+    assert_eq!(
+        echo_row(&editor, client),
+        "Buffer is read-only: #<buffer a.txt>"
+    );
+    assert!(
+        !editor
+            .take_effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::Save { .. }))
+    );
+    assert_eq!(fs::read(&path).expect("read"), b"content\n");
+}
+
+/// C2: two clients answering the same question start one save, not two.
+#[test]
+fn a_question_answered_after_another_client_saved_starts_no_second_save() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    write_file(&path, b"a\n");
+    let first = emx_core::ClientId(1);
+    let second = emx_core::ClientId(2);
+    let mut editor = editor_visiting(&path, &[first, second]);
+    deliver_load(&mut editor);
+    editor_keys(&mut editor, first, "x");
+    editor_keys(&mut editor, second, "C-x C-f C-a C-k");
+    editor_type(&mut editor, second, path.to_str().expect("utf-8"));
+    editor_keys(&mut editor, second, "RET");
+    write_file(&path, b"changed on disk\n");
+    editor_keys(&mut editor, first, "C-x C-s");
+    editor_keys(&mut editor, second, "C-x C-s");
+    editor_type(&mut editor, second, "yes");
+    editor_keys(&mut editor, second, "RET");
+    editor_type(&mut editor, first, "yes");
+    editor_keys(&mut editor, first, "RET");
+    assert_eq!(echo_row(&editor, first), "Buffer is being saved");
+    let saves: Vec<(emx_core::BufferId, SavePlan)> = editor
+        .take_effects()
+        .into_iter()
+        .filter_map(|effect| match effect {
+            Effect::Save { buffer, plan } => Some((buffer, plan)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(saves.len(), 1);
+    let (buffer, plan) = &saves[0];
+    let result = emx_core::io::save(plan).map_err(|error| emx_core::io::SaveFailure::from(&error));
+    editor.handle(Event::SaveFinished {
+        buffer: *buffer,
+        result: result.clone(),
+    });
+    // A duplicate result is external input, not a crash.
+    editor.handle(Event::SaveFinished {
+        buffer: *buffer,
+        result,
+    });
+    assert_eq!(fs::read(&path).expect("read"), b"xa\n");
+}
+
+/// I1: automatic in-place saves that move the buffer's own bytes ask
+/// first; a failure part way marks the buffer damaged for good.
+#[test]
+fn automatic_in_place_asks_and_a_failure_marks_the_buffer_damaged() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("big.log");
+    write_file(&path, &big_content());
+    fs::hard_link(&path, directory.path().join("alias.log")).expect("hard link");
+    let mut harness = harness_with(block_cache_config(), directory.path());
+    visit(&mut harness, &path);
+    harness.keys("x C-x C-s");
+    assert!(
+        harness
+            .echo_line()
+            .ends_with("(i)n place, (r)ewrite (breaks links/ownership), (c)ancel? ")
+    );
+    harness.keys("c");
+    assert_eq!(harness.echo(), "Canceled");
+    assert_eq!(fs::read(&path).expect("read"), big_content());
+    harness.set_save_sink(fail_after(100));
+    harness.keys("C-x C-s i");
+    assert_eq!(
+        harness.echo(),
+        format!(
+            "Write error: {ENOSPC_MESSAGE}, {}; {} is left partly rewritten; buffer big.log read that file and is damaged",
+            path.display(),
+            path.display()
+        )
+    );
+    assert!(
+        modeline(&harness).contains("[DAMAGED]"),
+        "{}",
+        modeline(&harness)
+    );
+    harness.clear_save_sink();
+    harness.keys("C-x C-s");
+    assert_eq!(
+        harness.echo(),
+        "Buffer big.log is damaged: its file was left partly rewritten; nothing to save"
+    );
+    harness.keys("y");
+    assert_eq!(harness.echo(), "Buffer is read-only: #<buffer big.log>");
+}
+
+/// I1: without a writable directory a rename is not offered.
+#[test]
+fn in_place_question_offers_rewrite_only_when_possible() {
+    assert_not_root();
+    let directory = tempfile::tempdir().expect("tempdir");
+    let locked = directory.path().join("locked");
+    fs::create_dir(&locked).expect("mkdir");
+    let path = locked.join("big.log");
+    write_file(&path, &big_content());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).expect("chmod");
+    let mut harness = harness_with(block_cache_config(), directory.path());
+    visit(&mut harness, &path);
+    harness.keys("x C-x C-s");
+    let question = harness.echo_line();
+    harness.keys("r");
+    let after_r = harness.echo_line();
+    harness.keys("i");
+    let echo = harness.echo();
+    let content = fs::read(&path).expect("read");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert_eq!(
+        question,
+        "big.log is in an unwritable directory; saving in place is not crash-safe and a \
+         failure loses the file and this buffer. (i)n place, (c)ancel? "
+    );
+    assert_eq!(after_r, question, "r is not an answer here");
+    assert_eq!(echo, format!("Wrote {}", path.display()));
+    let mut expected = big_content();
+    expected.insert(0, b'x');
+    assert_eq!(content, expected);
+}
+
+/// I2: another buffer reading the same inode would be corrupted.
+#[test]
+fn in_place_is_refused_while_an_alias_buffer_reads_the_inode() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.log");
+    let alias = directory.path().join("b.log");
+    write_file(&path, &big_content());
+    fs::hard_link(&path, &alias).expect("hard link");
+    let mut harness = harness_with(block_cache_config(), directory.path());
+    visit(&mut harness, &alias);
+    visit(&mut harness, &path);
+    harness.keys("x C-x C-s");
+    assert_eq!(
+        harness.echo(),
+        "a.log is also visited as buffer b.log; saving it in place would corrupt that buffer"
+    );
+    assert_eq!(fs::read(&path).expect("read"), big_content());
+    assert!(harness.buffer().is_modified());
+}
+
+/// I3: files that never end are refused instead of hanging the worker.
+#[test]
+fn non_regular_files_are_refused() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let fifo = directory.path().join("pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed");
+    for path in [
+        fifo.as_path(),
+        Path::new("/dev/zero"),
+        Path::new("/dev/urandom"),
+    ] {
+        let mut harness = harness_in(directory.path());
+        visit(&mut harness, path);
+        assert_eq!(
+            harness.echo(),
+            format!("not a regular file: {}", path.display())
+        );
+        assert_eq!(harness.editor().buffer_names(), vec!["*scratch*"]);
+    }
+}
+
+/// I4: a paste never answers a single-key question.
+#[test]
+fn paste_does_not_answer_key_prompts() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let other = directory.path().join("other.txt");
+    write_file(&other, b"keep\n");
+    let mut harness = harness_in(directory.path());
+    harness.keys("h C-x C-w");
+    harness.type_text("other.txt");
+    harness.keys("RET");
+    let question = harness.echo_line();
+    harness.take_sent();
+    harness.paste(b"yy");
+    assert_eq!(harness.echo_line(), question);
+    assert!(harness.take_sent().contains(&emx_proto::ServerMsg::Bell));
+    assert_eq!(fs::read(&other).expect("read"), b"keep\n");
+}
+
+/// I5: exiting waits for every save in flight, not only its own.
+#[test]
+fn exit_waits_for_saves_started_before_it() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    write_file(&path, b"a\n");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+    harness.keys("x");
+    harness.hold_saves();
+    harness.keys("C-x C-s C-x C-c");
+    assert!(!harness.shutdown_requested(), "a save is still running");
+    harness.release_saves();
+    assert!(harness.shutdown_requested());
+    assert_eq!(fs::read(&path).expect("read"), b"xa\n");
 }
