@@ -27,7 +27,7 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 40] = [
+const DEFAULT_BINDINGS: [(&str, &str); 45] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
@@ -65,6 +65,11 @@ const DEFAULT_BINDINGS: [(&str, &str); 40] = [
     ("C-M-_", "undo-redo"),
     ("C-u", "universal-argument"),
     ("C-g", "keyboard-quit"),
+    ("C-v", "scroll-up-command"),
+    ("<next>", "scroll-up-command"),
+    ("M-v", "scroll-down-command"),
+    ("<prior>", "scroll-down-command"),
+    ("C-l", "recenter-top-bottom"),
     ("M--", NEGATIVE_ARGUMENT),
     ("C--", NEGATIVE_ARGUMENT),
     ("C-M--", NEGATIVE_ARGUMENT),

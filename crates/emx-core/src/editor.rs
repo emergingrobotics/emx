@@ -2,20 +2,23 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use emx_proto::ServerMsg;
-use emx_text::{Sources, Text};
-use emx_types::{Key, KeyCode, Mods};
+use emx_proto::{ClientKind, ServerMsg, diff_grids};
+use emx_text::{ReadError, Sources, Text};
+use emx_types::{Grid, Key, KeyCode, Mods};
 use slotmap::SlotMap;
 
 use crate::buffer::{Buffer, BufferId, Change, ChangeRecorder};
-use crate::command::{self, CommandContext, CommandError, PrefixArg};
+use crate::command::{self, CommandContext, CommandError, PrefixArg, RecenterPosition};
 use crate::config::{Config, ConfigError};
 use crate::event::{ClientId, Effect, Event, TimerId};
 use crate::keymap::{Keymap, Lookup, describe_keys, universal_argument_binding};
 use crate::killring::KillRing;
 use crate::marker::InsertionType;
+use crate::render::{PrefetchRequest, render};
 use crate::undo::{UndoLimits, outer_limit_warning};
-use crate::window::{Frame, Window, WindowId};
+use crate::window::{
+    Fetch, Frame, Layout, Reader, ScreenLine, Window, WindowId, frame_layout, not_cached_block,
+};
 
 const SCRATCH_BUFFER: &str = "*scratch*";
 const PASTE_COMMAND: &str = "xterm-paste";
@@ -108,7 +111,13 @@ impl CommandLoopState {
 struct Client {
     cols: u16,
     rows: u16,
+    kind: ClientKind,
     frame: Frame,
+    /// The last grid sent, which the next frame is diffed against; `None`
+    /// sends the next frame whole.
+    grid: Option<Grid>,
+    /// Emacs `recenter-last-op`, for `C-l` cycling.
+    recenter_last_op: Option<RecenterPosition>,
     command_loop: CommandLoopState,
     /// The echo area: the last message, or the echo of keys being read.
     echo: String,
@@ -201,8 +210,8 @@ impl Editor {
                 client,
                 cols,
                 rows,
-                kind: _,
-            } => self.attach(client, cols, rows),
+                kind,
+            } => self.attach(client, cols, rows, kind),
             Event::ClientDetached(client) => self.detach(client),
             Event::Key(client, key) => self.handle_key(client, key.canonical()),
             Event::Paste(client, bytes) => self.handle_paste(client, bytes),
@@ -213,6 +222,70 @@ impl Editor {
             }
             Event::Timer(id) => self.handle_timer(id),
         }
+        self.redisplay();
+    }
+
+    /// Emacs redisplay after every input event: every window is scrolled to
+    /// show its point, then each terminal client gets the rows of its frame
+    /// that changed. Other clients' edits can move any window's point.
+    fn redisplay(&mut self) {
+        let client_ids: Vec<ClientId> = self.clients.keys().copied().collect();
+        for client_id in &client_ids {
+            self.keep_points_visible(*client_id);
+        }
+        for client_id in client_ids {
+            if self.client(client_id).kind != ClientKind::Tui {
+                continue;
+            }
+            let (grid, prefetch) = render(self, client_id);
+            self.effects
+                .extend(prefetch.into_iter().map(Effect::Prefetch));
+            let client = self.client_mut(client_id);
+            if client.grid.as_ref() != Some(&grid) {
+                let message = diff_grids(client.grid.as_ref(), &grid);
+                client.grid = Some(grid);
+                self.effects.push(Effect::Send(client_id, message));
+            }
+        }
+    }
+
+    /// Recenters each window of the client whose point is off screen.
+    /// Like rendering, this never blocks on I/O: a window whose text is not
+    /// cached keeps its start until the prefetched block arrives and the
+    /// next event redisplays.
+    fn keep_points_visible(&mut self, client_id: ClientId) {
+        let window_ids: Vec<WindowId> = self.client(client_id).frame.windows.keys().collect();
+        for window_id in window_ids {
+            if let Err(error) = self.keep_point_visible(client_id, window_id) {
+                let buffer = self.window(client_id, window_id).buffer;
+                self.effects.push(Effect::Prefetch(PrefetchRequest {
+                    buffer,
+                    block: not_cached_block(error),
+                }));
+            }
+        }
+    }
+
+    fn keep_point_visible(
+        &mut self,
+        client_id: ClientId,
+        window_id: WindowId,
+    ) -> Result<(), ReadError> {
+        let (cols, height) = self.window_size(client_id, window_id);
+        let window = *self.window(client_id, window_id);
+        let buffer = &self.buffers[window.buffer];
+        let text = buffer.text.clone();
+        let point = buffer.marker_pos(window.point);
+        let start = self.window_start(client_id, window_id);
+        let layout = Layout::new(
+            Reader::new(&text, Fetch::CachedOnly),
+            cols,
+            self.tab_width(),
+        );
+        if let Some(start) = layout.keep_point_visible(start, height, point)? {
+            self.set_window_start(client_id, window_id, start);
+        }
+        Ok(())
     }
 
     pub fn take_effects(&mut self) -> Vec<Effect> {
@@ -246,8 +319,9 @@ impl Editor {
         &self.config
     }
 
-    /// Every client kind gets a frame; CLI clients simply never send keys.
-    fn attach(&mut self, client: ClientId, cols: u16, rows: u16) {
+    /// Every client kind gets a frame; CLI clients simply never send keys
+    /// and are never sent frames.
+    fn attach(&mut self, client: ClientId, cols: u16, rows: u16, kind: ClientKind) {
         assert!(
             !self.clients.contains_key(&client),
             "the server attaches each client id once"
@@ -259,13 +333,18 @@ impl Editor {
             buffer: buffer_id,
             point: buffer.create_marker_without_undo(0, InsertionType::StayBefore),
             start: buffer.create_marker_without_undo(0, InsertionType::StayBefore),
+            start_row_skip: 0,
+            hscroll: 0,
         };
         self.clients.insert(
             client,
             Client {
                 cols,
                 rows,
+                kind,
                 frame: Frame::new(window),
+                grid: None,
+                recenter_last_op: None,
                 command_loop: CommandLoopState::default(),
                 echo: String::new(),
                 signaled: false,
@@ -585,6 +664,57 @@ impl Editor {
         self.buffers[window.buffer].set_marker(window.point, pos);
     }
 
+    pub(crate) fn frame(&self, client_id: ClientId) -> &Frame {
+        &self.client(client_id).frame
+    }
+
+    pub(crate) fn tab_width(&self) -> usize {
+        usize::try_from(self.config.tab_width).expect("tab_width is validated small")
+    }
+
+    /// A window's columns and text rows. The one window fills the frame
+    /// above the modeline and echo area.
+    pub(crate) fn window_size(&self, client_id: ClientId, _window: WindowId) -> (u16, u16) {
+        let client = self.client(client_id);
+        (client.cols, frame_layout(client.rows).text_rows)
+    }
+
+    pub(crate) fn window_start(&self, client_id: ClientId, window: WindowId) -> ScreenLine {
+        let window = self.window(client_id, window);
+        ScreenLine {
+            line_start: self.buffers[window.buffer].marker_pos(window.start),
+            row: u64::from(window.start_row_skip),
+        }
+    }
+
+    pub(crate) fn set_window_start(
+        &mut self,
+        client_id: ClientId,
+        window_id: WindowId,
+        start: ScreenLine,
+    ) {
+        let window = &mut self.client_mut(client_id).frame.windows[window_id];
+        // Only a line of over four billion rows could overflow; its window
+        // then starts at the last row that can be recorded.
+        window.start_row_skip = u32::try_from(start.row).unwrap_or(u32::MAX);
+        let window = *window;
+        self.buffers[window.buffer].set_marker(window.start, start.line_start);
+    }
+
+    /// The next frame sent to the client is whole, as after Emacs
+    /// `redraw-frame`.
+    pub(crate) fn request_full_redraw(&mut self, client_id: ClientId) {
+        self.client_mut(client_id).grid = None;
+    }
+
+    pub(crate) fn recenter_last_op(&self, client_id: ClientId) -> Option<RecenterPosition> {
+        self.client(client_id).recenter_last_op
+    }
+
+    pub(crate) fn set_recenter_last_op(&mut self, client_id: ClientId, op: RecenterPosition) {
+        self.client_mut(client_id).recenter_last_op = Some(op);
+    }
+
     pub(crate) fn buffer(&self, id: BufferId) -> &Buffer {
         &self.buffers[id]
     }
@@ -782,6 +912,8 @@ mod tests {
         editor.handle(Event::ClientDetached(FIRST));
         let pending = timers(&editor.take_effects());
         attach(&mut editor, SECOND);
+        // Discard the new client's first frame.
+        editor.take_effects();
         editor.handle(Event::Timer(pending[0].0));
         assert!(editor.take_effects().is_empty());
     }
@@ -844,6 +976,70 @@ mod tests {
         attach(&mut editor, FIRST);
         editor.handle(Event::Resize(FIRST, 100, 40));
         assert_eq!(editor.client_size(FIRST), (100, 40));
+    }
+
+    #[test]
+    fn redisplay_waits_for_uncached_text_instead_of_reading_it() {
+        use std::sync::atomic::AtomicBool;
+
+        use emx_text::{BLOCK_SIZE, BlockCache, LineIndex, index_file};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("big.txt");
+        let mut content = Vec::new();
+        while content.len() < 2 * BLOCK_SIZE + 100 {
+            content.extend_from_slice(b"0123456789abcdef\n");
+        }
+        std::fs::write(&path, &content).expect("write fixture");
+        let cache = BlockCache::open(&path, 3 * BLOCK_SIZE).expect("open cache");
+        let index = LineIndex::new(cache.len());
+        index_file(&cache, &index, &AtomicBool::new(false), &mut |_| {}).expect("index");
+        let text = Text::from_original(Sources::file(cache, index));
+
+        let mut editor = Editor::new(Config::default()).expect("valid config");
+        attach(&mut editor, FIRST);
+        let buffer = editor.selected_buffer(FIRST);
+        editor.buffer_mut(buffer).text = text.clone();
+        let window = editor.selected_window_id(FIRST);
+        let end = text.len();
+        // The window shows the cached top of the file; point jumps to the
+        // uncached end without a command reading it.
+        text.read(0..1, &mut Vec::new()).expect("read block 0");
+        editor.set_window_point(FIRST, window, end);
+        editor.take_effects();
+        editor.handle(Event::Resize(FIRST, 80, 24));
+        let prefetches: Vec<PrefetchRequest> = editor
+            .take_effects()
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Prefetch(request) => Some(request),
+                _ => None,
+            })
+            .collect();
+        assert!(!prefetches.is_empty());
+        assert!(
+            prefetches
+                .iter()
+                .all(|request| request.buffer == buffer && request.block > 0),
+            "only uncached blocks are requested: {prefetches:?}"
+        );
+        assert_eq!(
+            editor.window_start(FIRST, window).line_start,
+            0,
+            "start kept"
+        );
+
+        let mut warm = Vec::new();
+        text.read(0..end, &mut warm).expect("read the whole file");
+        editor.handle(Event::Resize(FIRST, 80, 24));
+        let start = editor.window_start(FIRST, window).line_start;
+        assert_eq!(start, end - 11 * 17, "point's row is in the middle");
+        assert!(
+            !editor
+                .take_effects()
+                .iter()
+                .any(|effect| matches!(effect, Effect::Prefetch(_)))
+        );
     }
 
     #[test]

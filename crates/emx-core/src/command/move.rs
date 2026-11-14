@@ -1,6 +1,7 @@
 use emx_text::{ReadError, Text, display_units, unit_width};
 
 use super::mark::push_mark;
+use super::misc::recenter_if_past_window_end;
 use super::word_syntax::{CHINESE, COMBINING_DIACRITIC, HIRAGANA, KATAKANA, SCRIPTS, WORD};
 use super::{CommandContext, CommandError, PrefixArg};
 
@@ -150,14 +151,19 @@ pub(super) fn beginning_of_buffer(ctx: &mut CommandContext) -> Result<(), Comman
     jump_in_buffer(ctx, |_, numerator| 1 + numerator / BUFFER_FRACTIONS, 0)
 }
 
-/// Emacs `end-of-buffer`, the mirror of `beginning-of-buffer`.
+/// Emacs `end-of-buffer`, the mirror of `beginning-of-buffer`, except
+/// that going to the very end shows it near the window bottom.
 pub(super) fn end_of_buffer(ctx: &mut CommandContext) -> Result<(), CommandError> {
     let length = ctx.buffer().text.len();
     jump_in_buffer(
         ctx,
         |size, numerator| size - numerator / BUFFER_FRACTIONS,
         length,
-    )
+    )?;
+    if matches!(ctx.prefix_arg, PrefixArg::None | PrefixArg::Raw(_)) {
+        recenter_if_past_window_end(ctx)?;
+    }
+    Ok(())
 }
 
 /// The shared part of `beginning-of-buffer` and `end-of-buffer`. `numbered`

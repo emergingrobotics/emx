@@ -912,3 +912,30 @@ fn refresh_newlines_propagates_read_errors() {
         other => panic!("expected Truncated, got {other:?}"),
     }
 }
+
+#[test]
+fn line_of_cached_never_does_io() {
+    let content = generated_content(2 * BLOCK_SIZE + 9, 17);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let text = file_text(&directory.path().join("lines.txt"), &content);
+    let position = BLOCK + 5;
+    match text.line_of_cached(position) {
+        Err(ReadError::NotCached { block }) => assert_eq!(block, 1),
+        other => panic!("expected NotCached, got {other:?}"),
+    }
+    assert_eq!(
+        text.line_of_cached(BLOCK)
+            .expect("whole blocks need no read"),
+        Some(newline_count(&content[..BLOCK_SIZE]))
+    );
+    let mut warm = Vec::new();
+    text.read(BLOCK..BLOCK + 1, &mut warm).expect("read");
+    assert_eq!(
+        text.line_of_cached(position).expect("block 1 is cached"),
+        text.line_of(position).expect("line_of")
+    );
+    assert_eq!(
+        text.line_of_cached(position).expect("block 1 is cached"),
+        Some(newline_count(&content[..BLOCK_SIZE + 5]))
+    );
+}

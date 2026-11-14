@@ -72,10 +72,11 @@ fn is_file_backed(sources: &Sources, piece: &Piece) -> bool {
     piece.source == PieceSource::Original && matches!(sources.original, Original::File(_))
 }
 
-fn block_reader(original: &Original) -> BlockReader<'_> {
-    match original {
-        Original::Memory(bytes) => BlockReader::Memory(bytes),
-        Original::File(cache) => BlockReader::Cache(cache),
+fn block_reader(original: &Original, fetch: Fetch) -> BlockReader<'_> {
+    match (original, fetch) {
+        (Original::Memory(bytes), _) => BlockReader::Memory(bytes),
+        (Original::File(cache), Fetch::Io) => BlockReader::Cache(cache),
+        (Original::File(cache), Fetch::CachedOnly) => BlockReader::CacheOnly(cache),
     }
 }
 
@@ -86,12 +87,13 @@ fn memory_range(piece: &Piece, within: Range<u64>) -> Range<usize> {
 }
 
 /// Newlines in `piece`, or `None` while its original-file region is unindexed.
-fn count_piece(sources: &Sources, piece: &Piece) -> Result<Option<u64>, ReadError> {
+fn count_piece(sources: &Sources, piece: &Piece, fetch: Fetch) -> Result<Option<u64>, ReadError> {
     match (piece.source, &sources.original) {
         (PieceSource::Add, _) => Ok(Some(sources.add.count_newlines(piece.start, piece.len))),
-        (PieceSource::Original, original) => sources
-            .index
-            .count_range_in(block_reader(original), piece.start..piece.start + piece.len),
+        (PieceSource::Original, original) => sources.index.count_range_in(
+            block_reader(original, fetch),
+            piece.start..piece.start + piece.len,
+        ),
     }
 }
 
@@ -258,7 +260,9 @@ impl Text {
 
     fn split_at(&self, tree: &Tree, at: u64) -> Result<(Tree, Tree), ReadError> {
         let sources = &self.sources;
-        split(tree, at, &mut |piece| count_piece(sources, piece))
+        split(tree, at, &mut |piece| {
+            count_piece(sources, piece, Fetch::Io)
+        })
     }
 
     /// Panics when `at` is past the end.
@@ -472,7 +476,7 @@ impl Text {
                 .expect("an add piece holds its counted newlines");
             return Ok(Nth::Found(found));
         }
-        let reader = block_reader(&self.sources.original);
+        let reader = block_reader(&self.sources.original, Fetch::Io);
         let file_range = piece.start..piece.start + piece.len;
         Ok(
             match self.sources.index.nth_newline_in(reader, file_range, n)? {
@@ -486,10 +490,22 @@ impl Text {
     /// Number of newlines strictly before `pos`, or `None` while unindexed.
     pub fn line_of(&self, pos: u64) -> Result<Option<u64>, ReadError> {
         self.assert_range(&(pos..pos));
-        self.prefix_newlines(&self.root, pos)
+        self.prefix_newlines(&self.root, pos, Fetch::Io)
     }
 
-    fn prefix_newlines(&self, tree: &Tree, pos: u64) -> Result<Option<u64>, ReadError> {
+    /// Like `line_of`, but fails with `NotCached` rather than reading the
+    /// file, for callers (the modeline) that must never block on I/O.
+    pub fn line_of_cached(&self, pos: u64) -> Result<Option<u64>, ReadError> {
+        self.assert_range(&(pos..pos));
+        self.prefix_newlines(&self.root, pos, Fetch::CachedOnly)
+    }
+
+    fn prefix_newlines(
+        &self,
+        tree: &Tree,
+        pos: u64,
+        fetch: Fetch,
+    ) -> Result<Option<u64>, ReadError> {
         let Some(node) = tree else {
             return Ok(Some(0));
         };
@@ -503,9 +519,9 @@ impl Text {
         }
         let left_bytes = summary(&node.left).bytes;
         if pos <= left_bytes {
-            return self.prefix_newlines(&node.left, pos);
+            return self.prefix_newlines(&node.left, pos, fetch);
         }
-        let Some(left) = self.prefix_newlines(&node.left, left_bytes)? else {
+        let Some(left) = self.prefix_newlines(&node.left, left_bytes, fetch)? else {
             return Ok(None);
         };
         let within = (pos - left_bytes).min(node.piece.len);
@@ -518,6 +534,7 @@ impl Text {
                     newlines: None,
                     ..node.piece
                 },
+                fetch,
             )?,
         };
         let Some(piece_count) = piece_count else {
@@ -528,7 +545,7 @@ impl Text {
             return Ok(Some(left + piece_count));
         }
         Ok(self
-            .prefix_newlines(&node.right, pos - right_base)?
+            .prefix_newlines(&node.right, pos - right_base, fetch)?
             .map(|right| left + piece_count + right))
     }
 
@@ -537,7 +554,9 @@ impl Text {
     /// reading a partly covered edge block can fail, and that error propagates.
     pub fn refresh_newlines(&self) -> Result<Text, ReadError> {
         let sources = &self.sources;
-        let root = piece_tree::refresh(&self.root, &mut |piece| count_piece(sources, piece))?;
+        let root = piece_tree::refresh(&self.root, &mut |piece| {
+            count_piece(sources, piece, Fetch::Io)
+        })?;
         Ok(Text {
             root,
             sources: self.sources.clone(),

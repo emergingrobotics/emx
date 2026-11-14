@@ -6,6 +6,7 @@ mod r#move;
 mod word_syntax;
 
 pub(crate) use kill::xterm_paste;
+pub(crate) use misc::RecenterPosition;
 
 use emx_text::ReadError;
 use emx_types::Key;
@@ -18,7 +19,7 @@ use crate::event::ClientId;
 use crate::killring::KillRing;
 use crate::marker::InsertionType;
 use crate::undo::UndoError;
-use crate::window::WindowId;
+use crate::window::{ScreenLine, WindowId};
 
 /// Emacs `user-error` from `region-beginning` and the region commands.
 const NO_REGION: &str = "The mark is not set now, so there is no region";
@@ -209,6 +210,18 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "keyboard-quit",
         run: misc::keyboard_quit,
+    },
+    CommandSpec {
+        name: "scroll-up-command",
+        run: misc::scroll_up_command,
+    },
+    CommandSpec {
+        name: "scroll-down-command",
+        run: misc::scroll_down_command,
+    },
+    CommandSpec {
+        name: "recenter-top-bottom",
+        run: misc::recenter_top_bottom,
     },
 ];
 
@@ -412,6 +425,33 @@ impl<'a> CommandContext<'a> {
 
     pub fn kill_ring_mut(&mut self) -> &mut KillRing {
         self.editor.kill_ring_mut()
+    }
+
+    /// The window's columns and text rows.
+    pub(crate) fn window_size(&self) -> (u16, u16) {
+        self.editor.window_size(self.client, self.window)
+    }
+
+    pub(crate) fn window_start(&self) -> ScreenLine {
+        self.editor.window_start(self.client, self.window)
+    }
+
+    pub(crate) fn set_window_start(&mut self, start: ScreenLine) {
+        self.editor
+            .set_window_start(self.client, self.window, start);
+    }
+
+    /// Emacs `redraw-frame` for this client's terminal.
+    pub(crate) fn request_full_redraw(&mut self) {
+        self.editor.request_full_redraw(self.client);
+    }
+
+    pub(crate) fn recenter_last_op(&self) -> Option<RecenterPosition> {
+        self.editor.recenter_last_op(self.client)
+    }
+
+    pub(crate) fn set_recenter_last_op(&mut self, op: RecenterPosition) {
+        self.editor.set_recenter_last_op(self.client, op);
     }
 
     /// Emacs `temporary-goal-column`, kept per client.

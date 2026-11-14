@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use emx_proto::{ClientKind, ServerMsg};
 use emx_text::{Sources, Text};
-use emx_types::{Key, parse_kbd};
+use emx_types::{Grid, Key, parse_kbd};
 
 use crate::buffer::Buffer;
 use crate::config::Config;
 use crate::editor::Editor;
 use crate::event::{ClientId, Effect, Event, TimerId};
 use crate::marker::InsertionType;
+use crate::render::{PrefetchRequest, render};
 
 pub const HARNESS_COLS: u16 = 80;
 pub const HARNESS_ROWS: u16 = 24;
@@ -25,6 +26,7 @@ pub struct Harness {
     client: ClientId,
     sent: Vec<ServerMsg>,
     timers: Vec<TimerId>,
+    prefetches: Vec<PrefetchRequest>,
     shutdown: bool,
 }
 
@@ -48,6 +50,7 @@ impl Harness {
             client: HARNESS_CLIENT,
             sent: Vec::new(),
             timers: Vec::new(),
+            prefetches: Vec::new(),
             shutdown: false,
         };
         harness.handle(Event::ClientAttached {
@@ -124,6 +127,7 @@ impl Harness {
             match effect {
                 Effect::Send(_, message) => self.sent.push(message),
                 Effect::SetTimer { id, .. } => self.timers.push(id),
+                Effect::Prefetch(request) => self.prefetches.push(request),
                 Effect::Shutdown => self.shutdown = true,
             }
         }
@@ -140,6 +144,41 @@ impl Harness {
     /// Messages sent to clients since the last call.
     pub fn take_sent(&mut self) -> Vec<ServerMsg> {
         std::mem::take(&mut self.sent)
+    }
+
+    /// Cache blocks the renderer asked for since the last call.
+    pub fn take_prefetches(&mut self) -> Vec<PrefetchRequest> {
+        std::mem::take(&mut self.prefetches)
+    }
+
+    /// The terminal was resized to `cols` by `rows`.
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.handle(Event::Resize(self.client, cols, rows));
+    }
+
+    /// The client's frame as it is rendered now.
+    pub fn grid(&self) -> Grid {
+        render(&self.editor, self.client).0
+    }
+
+    /// Each row of the frame as text, the second halves of wide characters
+    /// left out.
+    pub fn screen(&self) -> Vec<String> {
+        let grid = self.grid();
+        (0..grid.rows)
+            .map(|row| {
+                grid.row(row)
+                    .iter()
+                    .filter(|cell| cell.width > 0)
+                    .map(|cell| cell.text.as_str())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The cursor as (column, row), or `None` when point is not shown.
+    pub fn cursor(&self) -> Option<(u16, u16)> {
+        self.grid().cursor
     }
 
     pub fn shutdown_requested(&self) -> bool {

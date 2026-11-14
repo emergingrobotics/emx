@@ -3,6 +3,8 @@ use std::time::Duration;
 use emx_proto::{ClientKind, ServerMsg};
 use emx_types::Key;
 
+use crate::render::PrefetchRequest;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientId(pub u64);
 
@@ -38,5 +40,9 @@ pub enum Effect {
         id: TimerId,
         after: Duration,
     },
+    /// Read a cache block that redisplay needed, then deliver an event so
+    /// the frame is rendered again. Repeated after every event until the
+    /// block is cached, so the server keeps one read per block in flight.
+    Prefetch(PrefetchRequest),
     Shutdown,
 }

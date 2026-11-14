@@ -29,6 +29,8 @@ pub enum NthNewline {
 #[derive(Clone, Copy)]
 pub(crate) enum BlockReader<'source> {
     Cache(&'source BlockCache),
+    /// Fails with `NotCached` instead of reading the file.
+    CacheOnly(&'source BlockCache),
     Memory(&'source Arc<[u8]>),
 }
 
@@ -37,6 +39,12 @@ impl BlockReader<'_> {
     fn read(&self, block: u64, file_len: u64) -> Result<(Arc<[u8]>, usize), ReadError> {
         let (data, offset) = match self {
             BlockReader::Cache(cache) => (cache.get(block)?, 0),
+            BlockReader::CacheOnly(cache) => (
+                cache
+                    .try_get_cached(block)
+                    .ok_or(ReadError::NotCached { block })?,
+                0,
+            ),
             BlockReader::Memory(bytes) => ((*bytes).clone(), block_slot(block) * BLOCK_SIZE),
         };
         assert!(

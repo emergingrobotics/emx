@@ -1,0 +1,412 @@
+//! Draws a client's frame into a `Grid`: each window's text and modeline,
+//! then the echo area. Rendering reads only cached bytes, so it never
+//! blocks on I/O; text that is not cached yet draws blank and is returned
+//! as a prefetch request.
+
+use std::ops::{ControlFlow, Range};
+
+use emx_text::display_units;
+use emx_types::{Cell, Face, Grid};
+
+use crate::buffer::{Buffer, BufferId};
+use crate::editor::Editor;
+use crate::event::ClientId;
+use crate::window::{
+    CONTINUATION_GLYPH, CursorTracker, Fetch, Layout, LineEvent, Reader, ScreenLine, Window,
+    frame_layout, not_cached_block, unit_glyphs,
+};
+
+/// The start of Emacs 29's default modeline on a terminal: `-` from
+/// `mode-line-front-space`, then `mode-line-mule-info` for UTF-8 keyboard,
+/// terminal and buffer coding with Unix line ends.
+const MODELINE_FRONT: &str = "-UUU:";
+/// `mode-line-remote` for a local directory.
+const MODELINE_REMOTE: &str = "-";
+/// `mode-line-frame-identification` without terminal frame names.
+const MODELINE_FRAME_IDENTIFICATION: &str = "  ";
+/// `%12b`: the buffer name is padded to at least this many columns.
+const BUFFER_NAME_COLUMNS: usize = 12;
+const MODELINE_POSITION_GAP: &str = "   ";
+/// `(6 ...)` around `mode-line-position-line-format`: ` L%l` padded to
+/// this many columns.
+const LINE_NUMBER_COLUMNS: usize = 6;
+const MODELINE_MODES_GAP: &str = "  ";
+const MODELINE_MODES: &str = "(Fundamental) ";
+/// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
+const MODELINE_FILL: &str = "-";
+const UNKNOWN_LINE: &str = "?";
+/// `%p` computes differently above this size to avoid overflow.
+const LARGE_BUFFER: u64 = 1_000_000;
+const PERCENT: u64 = 100;
+/// `%p` never shows 100%, which would not fit in two digits.
+const MAX_PERCENT: u64 = 99;
+
+/// A cache block of `buffer` the renderer needed but could not read
+/// without I/O. Once it is cached, the frame should be rendered again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PrefetchRequest {
+    pub buffer: BufferId,
+    pub block: u64,
+}
+
+/// Renders `client`'s frame. Pure: the editor is not changed.
+pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>) {
+    let (cols, rows) = editor.client_size(client);
+    let mut grid = Grid::new(cols, rows);
+    let mut prefetch = Vec::new();
+    let layout = frame_layout(rows);
+    let frame = editor.frame(client);
+    // A single window fills the frame until the window tree arrives; each
+    // window draws into its own rectangle so more can be laid out later.
+    let area = WindowArea {
+        top: 0,
+        cols,
+        text_rows: layout.text_rows,
+        modeline_row: layout.modeline_row,
+    };
+    let cursor = draw_window(
+        editor,
+        frame.selected_window(),
+        &area,
+        &mut grid,
+        &mut prefetch,
+    );
+    if let Some(row) = layout.echo_row {
+        draw_echo(&mut grid, row, editor.echo(client), tab_width(editor));
+    }
+    grid.cursor = cursor;
+    (grid, prefetch)
+}
+
+/// The grid rows a window draws into.
+struct WindowArea {
+    top: u16,
+    cols: u16,
+    text_rows: u16,
+    modeline_row: Option<u16>,
+}
+
+fn tab_width(editor: &Editor) -> usize {
+    usize::try_from(editor.config().tab_width).expect("tab_width is validated small")
+}
+
+/// Draws the window's text and modeline; returns the cursor when point is
+/// shown.
+fn draw_window(
+    editor: &Editor,
+    window: &Window,
+    area: &WindowArea,
+    grid: &mut Grid,
+    prefetch: &mut Vec<PrefetchRequest>,
+) -> Option<(u16, u16)> {
+    let buffer = editor.buffer(window.buffer);
+    let point = buffer.marker_pos(window.point);
+    let start = ScreenLine {
+        line_start: buffer.marker_pos(window.start),
+        row: u64::from(window.start_row_skip),
+    };
+    let layout = Layout::new(
+        Reader::new(&buffer.text, Fetch::CachedOnly),
+        area.cols,
+        tab_width(editor),
+    );
+    let region = active_region(buffer, point);
+    let mut tracker = CursorTracker::new(point);
+    let mut first_shown = None;
+    let walk = layout.walk_window(start, area.text_rows, &mut |row, event| {
+        let row = area.top + row;
+        draw_event(grid, row, event, &region, &mut tracker);
+        if let LineEvent::Unit { pos, .. }
+        | LineEvent::End { pos, .. }
+        | LineEvent::Cell { unit: pos, .. } = event
+        {
+            first_shown.get_or_insert(*pos);
+        }
+        ControlFlow::Continue(())
+    });
+    let end_visible = match walk {
+        Ok(walk) => walk.end_visible,
+        Err(error) => {
+            prefetch.push(PrefetchRequest {
+                buffer: buffer.id,
+                block: not_cached_block(error),
+            });
+            false
+        }
+    };
+    if let Some(row) = area.modeline_row {
+        let line = match buffer.text.line_of_cached(point) {
+            Ok(Some(line)) => (line + 1).to_string(),
+            Ok(None) => UNKNOWN_LINE.to_string(),
+            Err(error) => {
+                prefetch.push(PrefetchRequest {
+                    buffer: buffer.id,
+                    block: not_cached_block(error),
+                });
+                UNKNOWN_LINE.to_string()
+            }
+        };
+        let window_start = first_shown.unwrap_or(start.line_start);
+        let position = position_indicator(window_start, buffer.text.len(), end_visible);
+        draw_modeline(grid, row, buffer, &position, &line, tab_width(editor));
+    }
+    let (row, col) = tracker.location()?;
+    let last_col = area.cols.checked_sub(1)?;
+    let col = u16::try_from(col).unwrap_or(u16::MAX).min(last_col);
+    Some((col, area.top + row))
+}
+
+/// The region Transient Mark mode highlights, between point and an
+/// active mark.
+fn active_region(buffer: &Buffer, point: u64) -> Option<Range<u64>> {
+    if !buffer.mark_active {
+        return None;
+    }
+    let mark = buffer.marker_pos(buffer.mark?);
+    Some(mark.min(point)..mark.max(point))
+}
+
+fn draw_event(
+    grid: &mut Grid,
+    row: u16,
+    event: &LineEvent,
+    region: &Option<Range<u64>>,
+    tracker: &mut CursorTracker,
+) {
+    let in_region = |pos: u64| region.as_ref().is_some_and(|range| range.contains(&pos));
+    match event {
+        LineEvent::Cell {
+            unit,
+            col,
+            text,
+            width,
+            escape,
+            ..
+        } => {
+            let face = if in_region(*unit) {
+                Face::Region
+            } else if *escape {
+                Face::EscapeGlyph
+            } else {
+                Face::Default
+            };
+            put_glyph(grid, row, *col, text, *width, face);
+        }
+        LineEvent::Continuation { col, .. } => {
+            put_glyph(grid, row, *col, CONTINUATION_GLYPH, 1, Face::EscapeGlyph);
+        }
+        LineEvent::Unit { pos, col, .. } => tracker.observe(*pos, row, *col),
+        LineEvent::End {
+            pos, col, newline, ..
+        } => {
+            tracker.observe(*pos, row, *col);
+            // The region face has `:extend t`: a selected newline lights
+            // the rest of its row.
+            if *newline && in_region(*pos) {
+                for fill in *col..usize::from(grid.cols) {
+                    put_glyph(grid, row, fill, " ", 1, Face::Region);
+                }
+            }
+        }
+    }
+}
+
+/// Writes a glyph if it fits entirely; a wide glyph's second column gets
+/// a width-0 cell.
+fn put_glyph(grid: &mut Grid, row: u16, col: usize, text: &str, width: usize, face: Face) {
+    let cols = usize::from(grid.cols);
+    if row >= grid.rows || col + width > cols {
+        return;
+    }
+    let col = u16::try_from(col).expect("inside the u16 grid width");
+    grid.set(
+        col,
+        row,
+        Cell {
+            text: text.to_string(),
+            width: u8::try_from(width).expect("glyphs are one or two columns"),
+            face,
+        },
+    );
+    for trailing in 1..width {
+        let trailing = u16::try_from(trailing).expect("glyphs are one or two columns");
+        grid.set(
+            col + trailing,
+            row,
+            Cell {
+                text: String::new(),
+                width: 0,
+                face,
+            },
+        );
+    }
+}
+
+/// Emacs `%p` limited to three columns by `(-3 "%p")`: where the window
+/// starts, or whether it shows the top or bottom of the buffer.
+fn position_indicator(window_start: u64, length: u64, end_visible: bool) -> String {
+    match (window_start == 0, end_visible) {
+        (true, true) => "All".to_string(),
+        (false, true) => "Bot".to_string(),
+        (true, false) => "Top".to_string(),
+        (false, false) => {
+            // Both round up, as decode_mode_spec's integer arithmetic does.
+            let percent = if length > LARGE_BUFFER {
+                window_start.div_ceil(length / PERCENT)
+            } else {
+                (window_start * PERCENT).div_ceil(length)
+            };
+            format!("{:>2}%", percent.min(MAX_PERCENT))
+        }
+    }
+}
+
+/// Writes glyphs left to right along one row, clipped at the right edge.
+struct RowWriter<'g> {
+    grid: &'g mut Grid,
+    row: u16,
+    col: usize,
+    tab_width: usize,
+}
+
+impl RowWriter<'_> {
+    /// Writes `bytes` with control and invalid bytes escaped; escape
+    /// notation gets `escape_face`.
+    fn write(&mut self, bytes: &[u8], face: Face, escape_face: Face) {
+        let cols = usize::from(self.grid.cols);
+        for (offset, unit) in display_units(bytes) {
+            let column = self.col as u64;
+            let flow = unit_glyphs(
+                &bytes[offset..],
+                unit,
+                column,
+                self.tab_width,
+                &mut |text, width, escape| {
+                    if self.col + width > cols {
+                        return ControlFlow::Break(());
+                    }
+                    let face = if escape { escape_face } else { face };
+                    put_glyph(self.grid, self.row, self.col, text, width, face);
+                    self.col += width;
+                    ControlFlow::Continue(())
+                },
+            );
+            if flow.is_break() {
+                self.col = cols;
+                return;
+            }
+        }
+    }
+
+    fn pad_to(&mut self, column: usize, face: Face) {
+        while self.col < column {
+            self.write(b" ", face, face);
+            if self.col >= usize::from(self.grid.cols) {
+                return;
+            }
+        }
+    }
+}
+
+/// Emacs 29's default `mode-line-format` for a Fundamental-mode buffer,
+/// as `format-mode-line` gives it in an `emacs -nw -Q` window, with the
+/// rest of the row filled with dashes.
+fn draw_modeline(
+    grid: &mut Grid,
+    row: u16,
+    buffer: &Buffer,
+    position: &str,
+    line: &str,
+    tab_width: usize,
+) {
+    let face = Face::ModeLine;
+    // `%1*%1+`: `%` for read-only, `*` for modified, `-` otherwise.
+    let flags = match (buffer.read_only, buffer.is_modified()) {
+        (true, true) => "%*",
+        (true, false) => "%%",
+        (false, true) => "**",
+        (false, false) => "--",
+    };
+    let mut writer = RowWriter {
+        grid,
+        row,
+        col: 0,
+        tab_width,
+    };
+    for part in [
+        MODELINE_FRONT,
+        flags,
+        MODELINE_REMOTE,
+        MODELINE_FRAME_IDENTIFICATION,
+    ] {
+        writer.write(part.as_bytes(), face, face);
+    }
+    let name_start = writer.col;
+    writer.write(buffer.name.as_bytes(), face, face);
+    writer.pad_to(name_start + BUFFER_NAME_COLUMNS, face);
+    writer.write(MODELINE_POSITION_GAP.as_bytes(), face, face);
+    writer.write(position.as_bytes(), face, face);
+    let line_start = writer.col;
+    writer.write(format!(" L{line}").as_bytes(), face, face);
+    writer.pad_to(line_start + LINE_NUMBER_COLUMNS, face);
+    writer.write(MODELINE_MODES_GAP.as_bytes(), face, face);
+    writer.write(MODELINE_MODES.as_bytes(), face, face);
+    while writer.col < usize::from(writer.grid.cols) {
+        writer.write(MODELINE_FILL.as_bytes(), face, face);
+    }
+}
+
+fn draw_echo(grid: &mut Grid, row: u16, echo: &str, tab_width: usize) {
+    let mut writer = RowWriter {
+        grid,
+        row,
+        col: 0,
+        tab_width,
+    };
+    writer.write(echo.as_bytes(), Face::Default, Face::EscapeGlyph);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_text(grid: &Grid, row: u16) -> String {
+        grid.row(row)
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn position_indicator_follows_decode_mode_spec() {
+        assert_eq!(position_indicator(0, 0, true), "All");
+        assert_eq!(position_indicator(0, 500, false), "Top");
+        assert_eq!(position_indicator(10, 500, true), "Bot");
+        assert_eq!(position_indicator(96, 160, false), "60%");
+        assert_eq!(position_indicator(32, 160, false), "20%");
+        assert_eq!(position_indicator(1, 1000, false), " 1%");
+        assert_eq!(position_indicator(999, 1000, false), "99%");
+        assert_eq!(position_indicator(2_000_000, 4_000_000, false), "50%");
+        assert_eq!(position_indicator(3_999_999, 4_000_000, false), "99%");
+    }
+
+    #[test]
+    fn echo_escapes_control_and_invalid_bytes() {
+        let mut grid = Grid::new(20, 1);
+        draw_echo(&mut grid, 0, "a\u{1b}b\u{9b}\tc", 8);
+        assert_eq!(row_text(&grid, 0), "a^[b\\233        c   ");
+        assert_eq!(grid.row(0)[1].face, Face::EscapeGlyph);
+        assert_eq!(grid.row(0)[0].face, Face::Default);
+    }
+
+    #[test]
+    fn echo_clips_a_wide_glyph_at_the_edge() {
+        let mut grid = Grid::new(3, 1);
+        draw_echo(&mut grid, 0, "a\u{4e2d}\u{4e2d}", 8);
+        assert_eq!(row_text(&grid, 0), "a\u{4e2d}");
+        let mut grid = Grid::new(2, 1);
+        draw_echo(&mut grid, 0, "a\u{4e2d}", 8);
+        assert_eq!(row_text(&grid, 0), "a ");
+    }
+}
