@@ -47,6 +47,8 @@ slotmap = "1"
 xattr = "1"
 crc32fast = "1"
 similar = "2"
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "perf", "unicode", "meta", "nfa", "dfa", "hybrid"] }
+regex-syntax = "0.8"
 
 [dependencies]
 anyhow = "1"

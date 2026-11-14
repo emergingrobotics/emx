@@ -54,6 +54,12 @@ pub(crate) enum HistoryKind {
     Command,
     /// `read-from-kill-ring-history`, which is the kill ring itself.
     KillRing,
+    /// The search ring, while the isearch string is edited.
+    Search,
+    /// `query-replace-history`.
+    QueryReplace,
+    /// `regexp-history`, which `occur` reads with.
+    Regexp,
 }
 
 /// Every history, newest entry first. Shared by all clients, as one Emacs
@@ -144,6 +150,8 @@ enum Command {
     DeleteChar,
     KillLine,
     Yank,
+    /// `quoted-insert` (`C-q`): the next key is inserted as a character.
+    QuotedInsert,
     PreviousHistory,
     NextHistory,
     Exit,
@@ -231,6 +239,7 @@ fn minibuffer_command(key: Key) -> Option<Command> {
         }
         (KeyCode::Char('k'), true, false, false) => Some(Command::KillLine),
         (KeyCode::Char('y'), true, false, false) => Some(Command::Yank),
+        (KeyCode::Char('q'), true, false, false) => Some(Command::QuotedInsert),
         (KeyCode::Char('p'), false, true, false) | (KeyCode::Up, false, false, false) => {
             Some(Command::PreviousHistory)
         }
@@ -268,6 +277,8 @@ pub(crate) struct Minibuffer {
     /// `RET` came while the directory listing was on its way: it takes the
     /// selected candidate once the listing arrives.
     accept_when_listed: bool,
+    /// `C-q` was typed: the next key is a character to insert.
+    quote_next: bool,
 }
 
 impl Minibuffer {
@@ -285,6 +296,7 @@ impl Minibuffer {
             completion: None,
             own_history: None,
             accept_when_listed: false,
+            quote_next: false,
         }
     }
 
@@ -433,6 +445,20 @@ impl Minibuffer {
         histories: &mut Histories,
         kill_ring: &mut KillRing,
     ) -> Outcome {
+        if self.quote_next {
+            self.quote_next = false;
+            let Some(character) = quoted_character(key) else {
+                return Outcome::Ding;
+            };
+            let before = self.input.clone();
+            let outcome = self.run(Command::Insert(character), histories, kill_ring);
+            if self.input != before
+                && let Some(completion) = self.completion.as_mut()
+            {
+                completion.update(&self.input);
+            }
+            return outcome;
+        }
         let command = if self.completion.is_some() {
             completion_command(key)
         } else {
@@ -507,6 +533,7 @@ impl Minibuffer {
                     .splice(self.cursor..self.cursor, text.iter().copied());
                 self.cursor += text.len();
             }
+            Command::QuotedInsert => self.quote_next = true,
             Command::PreviousHistory => self.move_in_history(1, histories),
             Command::NextHistory => self.move_in_history(-1, histories),
             Command::Exit => return self.exit(histories),
@@ -685,6 +712,24 @@ impl Minibuffer {
             }
             Mode::YOrN | Mode::Keys { .. } => unreachable!("single-key prompts exit on keys"),
         }
+    }
+}
+
+const CONTROL_MASK: u32 = 0x1F;
+
+/// The character `quoted-insert` (`C-q`) reads from `key`: a control key
+/// gives its control character.
+pub(crate) fn quoted_character(key: Key) -> Option<char> {
+    match key.code {
+        KeyCode::Char(character) if key.mods.ctrl => {
+            char::from_u32(u32::from(character.to_ascii_lowercase()) & CONTROL_MASK)
+        }
+        KeyCode::Char(character) => Some(character),
+        KeyCode::Enter => Some('\r'),
+        KeyCode::Tab => Some('\t'),
+        KeyCode::Backspace => Some('\x7f'),
+        KeyCode::Escape => Some('\x1b'),
+        _ => None,
     }
 }
 

@@ -12,6 +12,7 @@ use crate::io::{Loaded, SaveFailure, SavePlan, SavedFile};
 use crate::journal::{JournalOp, RecoveredBuffer};
 use crate::reload::{AppendRead, Observation, Reloaded};
 use crate::render::PrefetchRequest;
+use crate::search_job::{SearchJob, SearchOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientId(pub u64);
@@ -23,6 +24,11 @@ pub struct TimerId(pub u64);
 /// after the prompt moved on is recognized as stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ListingId(pub u64);
+
+/// Names one `Effect::StartSearch`, so a result that arrives after the
+/// search was superseded or cancelled is recognized as stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SearchId(pub u64);
 
 /// Input to the editor state machine. The server (or the test harness)
 /// turns sockets, worker results and timers into these.
@@ -145,6 +151,14 @@ pub enum Event {
         id: ListingId,
         result: Result<Vec<Candidate>, ListingError>,
     },
+    /// The result of an `Effect::StartSearch`, as
+    /// `search_job::run_search_job` reported it; `Err` holds the read
+    /// error that ended it.
+    SearchResult {
+        client: ClientId,
+        id: SearchId,
+        result: Result<SearchOutcome, String>,
+    },
 }
 
 /// Output of the editor state machine, carried out by the server.
@@ -220,6 +234,10 @@ pub enum Effect {
         id: ListingId,
         directory: PathBuf,
     },
+    /// Run the search with `search_job::run_search_job` off the editor
+    /// thread and deliver `Event::SearchResult`. The editor sets the job's
+    /// `cancel` flag when it no longer wants the result.
+    StartSearch(SearchJob),
     /// Report changes to `path`, a visited file, as `Event::FileChanged`
     /// and `Event::FileRenamed` (or `Event::FilePolled` when it can only be
     /// polled) until `Effect::Unwatch`. Each visited path is watched once,

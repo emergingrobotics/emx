@@ -123,7 +123,18 @@ Buffers and windows an earlier case made are removed."
         temporary-goal-column 0
         pending-undo-list nil
         undo-auto--last-boundary-cause nil
-        yank-undo-function nil)
+        yank-undo-function nil
+        ;; A fresh emx session has searched and replaced nothing yet.
+        search-ring nil
+        regexp-search-ring nil
+        search-ring-yank-pointer nil
+        regexp-search-ring-yank-pointer nil
+        isearch-case-fold-search t
+        query-replace-defaults nil
+        query-replace-history nil
+        regexp-history nil
+        occur-collect-regexp-history nil
+        recenter-last-op nil)
   (goto-char (1+ point))
   (setq buffer-undo-list nil)
   (set-buffer-modified-p nil))

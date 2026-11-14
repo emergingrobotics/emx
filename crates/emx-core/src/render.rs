@@ -5,6 +5,7 @@
 
 use std::ops::{ControlFlow, Range};
 
+use emx_text::search::matches_in_cached;
 use emx_text::{DisplayUnit, display_units, unit_width};
 use emx_types::{Cell, Face, Grid};
 
@@ -137,11 +138,21 @@ fn draw_window(
         row: u64::from(window.start_row_skip),
     };
     let layout = editor.window_layout(window_client, window_id, &buffer.text, Fetch::CachedOnly);
-    let region = active_region(buffer, point);
+    let marks = Marks {
+        region: active_region(buffer, point),
+        search: search_marks(
+            editor,
+            window_client,
+            window_id,
+            &layout,
+            start,
+            area.text_rows,
+        ),
+    };
     let mut tracker = CursorTracker::new(point);
     let mut first_shown = None;
     let walk = layout.walk_window(start, area.text_rows, &mut |row, event| {
-        draw_event(grid, area, row, event, &region, &mut tracker);
+        draw_event(grid, area, row, event, &marks, &mut tracker);
         if let LineEvent::Unit { pos, .. }
         | LineEvent::End { pos, .. }
         | LineEvent::Cell { unit: pos, .. } = event
@@ -211,6 +222,79 @@ fn draw_window(
     Some((area.left + col, area.top + row))
 }
 
+/// The parts of a window's text drawn in another face.
+struct Marks {
+    region: Option<Range<u64>>,
+    search: SearchMarks,
+}
+
+/// What an isearch or query-replace of the client highlights in a window:
+/// the current match (Emacs's `isearch` face) and, lazily, the other
+/// matches in view (`lazy-highlight`).
+#[derive(Default)]
+struct SearchMarks {
+    current: Option<Range<u64>>,
+    /// Sorted, without overlaps.
+    lazy: Vec<Range<u64>>,
+}
+
+impl SearchMarks {
+    fn current_contains(&self, pos: u64) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|range| range.contains(&pos))
+    }
+
+    fn lazy_contains(&self, pos: u64) -> bool {
+        let index = self.lazy.partition_point(|range| range.end <= pos);
+        self.lazy
+            .get(index)
+            .is_some_and(|range| range.contains(&pos))
+    }
+}
+
+/// The search highlights of a window. Only the text in view is searched,
+/// and only what is cached: lazy highlighting never waits for I/O, and
+/// text not cached yet is drawn without it until a later frame.
+fn search_marks(
+    editor: &Editor,
+    client: ClientId,
+    window_id: WindowId,
+    layout: &crate::window::Layout,
+    start: ScreenLine,
+    rows: u16,
+) -> SearchMarks {
+    let Some(highlights) = editor.search_highlights(client) else {
+        return SearchMarks::default();
+    };
+    let window = editor.window(client, window_id);
+    if window.buffer != highlights.buffer {
+        return SearchMarks::default();
+    }
+    let current = highlights
+        .current
+        .filter(|(searched, range)| *searched == window_id && !range.is_empty())
+        .map(|(_, range)| range);
+    let mut lazy = Vec::new();
+    if let Some(pattern) = &highlights.lazy
+        && let Ok(walk) = layout.walk_window(start, rows, &mut |_, _| ControlFlow::Continue(()))
+    {
+        let text = &editor.buffer(window.buffer).text;
+        let end = walk.end.min(text.len());
+        if start.line_start <= end
+            && let Ok(found) =
+                matches_in_cached(text, pattern, start.line_start..end, editor.match_cap())
+        {
+            lazy = found
+                .into_iter()
+                .filter(|found| !found.is_empty())
+                .map(|found| found.range())
+                .collect();
+        }
+    }
+    SearchMarks { current, lazy }
+}
+
 /// The region Transient Mark mode highlights, between point and an
 /// active mark.
 fn active_region(buffer: &Buffer, point: u64) -> Option<Range<u64>> {
@@ -228,11 +312,16 @@ fn draw_event(
     area: &WindowArea,
     window_row: u16,
     event: &LineEvent,
-    region: &Option<Range<u64>>,
+    marks: &Marks,
     tracker: &mut CursorTracker,
 ) {
     let row = area.top + window_row;
-    let in_region = |pos: u64| region.as_ref().is_some_and(|range| range.contains(&pos));
+    let in_region = |pos: u64| {
+        marks
+            .region
+            .as_ref()
+            .is_some_and(|range| range.contains(&pos))
+    };
     match event {
         LineEvent::Cell {
             unit,
@@ -242,7 +331,11 @@ fn draw_event(
             escape,
             ..
         } => {
-            let face = if in_region(*unit) {
+            let face = if marks.search.current_contains(*unit) {
+                Face::IsearchMatch
+            } else if marks.search.lazy_contains(*unit) {
+                Face::LazyHighlight
+            } else if in_region(*unit) {
                 Face::Region
             } else if *escape {
                 Face::EscapeGlyph

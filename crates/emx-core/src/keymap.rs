@@ -27,7 +27,7 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 61] = [
+const DEFAULT_BINDINGS: [(&str, &str); 69] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
@@ -86,11 +86,67 @@ const DEFAULT_BINDINGS: [(&str, &str); 61] = [
     ("C-x b", "switch-to-buffer"),
     ("C-x C-b", "list-buffers"),
     ("M-x", "execute-extended-command"),
+    ("C-s", "isearch-forward"),
+    ("C-r", "isearch-backward"),
+    ("C-M-s", "isearch-forward-regexp"),
+    ("C-M-r", "isearch-backward-regexp"),
+    ("M-%", "query-replace"),
+    ("C-M-%", "query-replace-regexp"),
+    ("M-s o", "occur"),
+    ("M-s M-o", "occur"),
     ("M--", NEGATIVE_ARGUMENT),
     ("C--", NEGATIVE_ARGUMENT),
     ("C-M--", NEGATIVE_ARGUMENT),
 ];
 const BUFFER_MENU_BINDINGS: [(&str, &str); 1] = [("RET", "Buffer-menu-this-window")];
+/// `occur-mode-map`.
+const OCCUR_BINDINGS: [(&str, &str); 8] = [
+    ("RET", "occur-mode-goto-occurrence"),
+    ("C-c C-c", "occur-mode-goto-occurrence"),
+    ("o", "occur-mode-goto-occurrence-other-window"),
+    ("C-o", "occur-mode-display-occurrence"),
+    ("M-n", "occur-next"),
+    ("M-p", "occur-prev"),
+    ("n", "next-error-no-select"),
+    ("p", "previous-error-no-select"),
+];
+/// `isearch-mode-map`: every other printing character runs
+/// `isearch-printing-char`.
+const ISEARCH_PRINTING_CHAR: &str = "isearch-printing-char";
+const ISEARCH_BINDINGS: [(&str, &str); 32] = [
+    ("C-s", "isearch-repeat-forward"),
+    ("C-r", "isearch-repeat-backward"),
+    ("C-M-s", "isearch-repeat-forward"),
+    ("C-M-r", "isearch-repeat-backward"),
+    ("DEL", "isearch-delete-char"),
+    ("C-g", "isearch-abort"),
+    ("ESC ESC ESC", "isearch-cancel"),
+    ("C-q", "isearch-quote-char"),
+    ("RET", "isearch-exit"),
+    ("C-j", ISEARCH_PRINTING_CHAR),
+    ("TAB", ISEARCH_PRINTING_CHAR),
+    ("C-w", "isearch-yank-word-or-char"),
+    ("C-M-d", "isearch-del-char"),
+    ("C-M-y", "isearch-yank-char"),
+    ("C-y", "isearch-yank-kill"),
+    ("M-s C-e", "isearch-yank-line"),
+    ("M-s M-<", "isearch-beginning-of-buffer"),
+    ("M-s M->", "isearch-end-of-buffer"),
+    ("M-n", "isearch-ring-advance"),
+    ("M-p", "isearch-ring-retreat"),
+    ("M-y", "isearch-yank-pop-only"),
+    ("M-c", "isearch-toggle-case-fold"),
+    ("M-s c", "isearch-toggle-case-fold"),
+    ("M-r", "isearch-toggle-regexp"),
+    ("M-s r", "isearch-toggle-regexp"),
+    ("M-e", "isearch-edit-string"),
+    ("M-s e", "isearch-edit-string"),
+    ("M-s SPC", "isearch-toggle-lax-whitespace"),
+    ("M-%", "isearch-query-replace"),
+    ("C-M-%", "isearch-query-replace-regexp"),
+    ("M-s o", "isearch-occur"),
+    ("M-s M-o", "isearch-occur"),
+];
 /// `ctl-x-map` and `mode-specific-map`; their bindings arrive with later
 /// commands, but the prefixes exist so `C-c z` reads as one sequence.
 const DEFAULT_PREFIXES: [&str; 2] = ["C-x", "C-c"];
@@ -151,6 +207,28 @@ impl Keymap {
     pub fn buffer_menu() -> Keymap {
         let mut keymap = Keymap::new();
         for (sequence, command) in BUFFER_MENU_BINDINGS {
+            keymap.bind_default(sequence, Binding::Command(command));
+        }
+        keymap
+    }
+
+    /// Emacs `occur-mode-map`, looked up before the global map in `*Occur*`.
+    pub fn occur() -> Keymap {
+        let mut keymap = Keymap::new();
+        for (sequence, command) in OCCUR_BINDINGS {
+            keymap.bind_default(sequence, Binding::Command(command));
+        }
+        keymap
+    }
+
+    /// Emacs `isearch-mode-map`, looked up first while a client isearches.
+    /// Its commands are isearch's own, not global commands.
+    pub(crate) fn isearch() -> Keymap {
+        let mut keymap = Keymap {
+            bindings: HashMap::new(),
+            printable: Some(ISEARCH_PRINTING_CHAR),
+        };
+        for (sequence, command) in ISEARCH_BINDINGS {
             keymap.bind_default(sequence, Binding::Command(command));
         }
         keymap

@@ -117,6 +117,27 @@ pub(crate) enum Purpose {
         prefix_arg: PrefixArg,
         last_command: Option<&'static str>,
     },
+    /// `isearch-edit-string`: the new search string.
+    IsearchEdit,
+    /// `query-replace`: what to replace.
+    QueryReplaceFrom(Box<super::replacing::ReplaceArguments>),
+    /// `query-replace`: what to replace the string with.
+    QueryReplaceTo(Box<super::replacing::ReplaceArguments>, Vec<u8>),
+    /// `e`/`E` during query-replace: the new replacement.
+    QueryReplaceEdit {
+        exact_case: bool,
+    },
+    /// `occur`: the regexp, with `default` taken for empty input.
+    OccurRegexp {
+        collect: bool,
+        context: i64,
+        default: Option<Vec<u8>>,
+    },
+    /// `occur`'s collect mode: what each match becomes.
+    OccurCollect {
+        regexp: String,
+        default: Option<Vec<u8>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,6 +442,14 @@ impl Editor {
     }
 
     pub(super) fn minibuffer_key(&mut self, client: ClientId, key: Key) {
+        let editing_search = self
+            .client(client)
+            .minibuffer
+            .as_ref()
+            .is_some_and(|minibuffer| matches!(minibuffer.purpose, Purpose::IsearchEdit));
+        if editing_search && self.isearch_edit_key(client, key) {
+            return;
+        }
         let mut minibuffer = self
             .client_mut(client)
             .minibuffer
@@ -440,7 +469,19 @@ impl Editor {
             Outcome::Quit => {
                 self.client_mut(client).exit_wait = None;
                 self.fit_frame(client);
-                self.signal(client, None, &CommandError::Quit);
+                match minibuffer.purpose {
+                    // Quitting the edit quits the search it edits.
+                    Purpose::IsearchEdit => {
+                        if let Err(error) = self.isearch_edit_quit(client) {
+                            self.signal(client, None, &error);
+                        }
+                    }
+                    Purpose::QueryReplaceEdit { .. } => {
+                        self.replace_edit_quit(client);
+                        self.signal(client, None, &CommandError::Quit);
+                    }
+                    _ => self.signal(client, None, &CommandError::Quit),
+                }
             }
             Outcome::Exit(answer) => {
                 if let (Mode::YOrN, Answer::Yes(yes)) = (&minibuffer.mode, &answer) {
@@ -623,6 +664,30 @@ impl Editor {
             ) => {
                 self.yank_chosen_kill(client, text, prefix_arg, last_command);
                 Ok(())
+            }
+            (Purpose::IsearchEdit, Answer::Line(string)) => {
+                self.isearch_edit_finished(client, string, None);
+                Ok(())
+            }
+            (Purpose::QueryReplaceFrom(arguments), Answer::Line(input)) => {
+                self.replace_from_answered(client, *arguments, input)
+            }
+            (Purpose::QueryReplaceTo(arguments, from), Answer::Line(to)) => {
+                self.replace_to_answered(client, *arguments, from, to)
+            }
+            (Purpose::QueryReplaceEdit { exact_case }, Answer::Line(replacement)) => {
+                self.replace_edit_answered(client, exact_case, replacement)
+            }
+            (
+                Purpose::OccurRegexp {
+                    collect,
+                    context,
+                    default,
+                },
+                Answer::Line(input),
+            ) => self.occur_regexp_answered(client, input, collect, context, default),
+            (Purpose::OccurCollect { regexp, default }, Answer::Line(input)) => {
+                self.occur_collect_answered(client, regexp, input, default)
             }
             (Purpose::KillModified { buffer }, Answer::Line(choice)) => {
                 if !self.buffers.contains_key(buffer) {
@@ -902,6 +967,9 @@ impl Editor {
     /// Removes the buffer; windows showing it show another buffer, and
     /// clients waiting for it are released.
     pub(super) fn kill_buffer(&mut self, buffer: BufferId) {
+        self.isearch_forget_buffer(buffer);
+        self.replace_forget_buffer(buffer);
+        self.occur_forget_buffer(buffer);
         self.buffer_killed(buffer);
         self.forget_reload_state(buffer);
         self.replace_buffer_in_windows(buffer);

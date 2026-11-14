@@ -4,14 +4,21 @@ mod kill;
 mod mark;
 mod misc;
 mod r#move;
+mod occur;
+mod replace;
+mod search;
 mod window;
-mod word_syntax;
 
 pub(crate) use kill::{xterm_paste, yank_from_kill_ring};
+pub(crate) use mark::push_mark;
 pub(crate) use misc::RecenterPosition;
+pub(crate) use r#move::{
+    char_after, char_before, forward_line, is_word, line_end, line_start, scan_words,
+};
+pub(crate) use search::isearch_command;
 
 use emx_text::ReadError;
-use emx_types::Key;
+use emx_types::{Key, KeyCode, Mods};
 
 use std::ops::Range;
 
@@ -22,6 +29,24 @@ use crate::killring::KillRing;
 use crate::marker::InsertionType;
 use crate::undo::UndoError;
 use crate::window::{Fetch, Layout, ScreenLine, WindowId};
+
+const fn control_key(character: char) -> Key {
+    Key {
+        code: KeyCode::Char(character),
+        mods: Mods {
+            ctrl: true,
+            meta: false,
+            shift: false,
+            super_: false,
+        },
+    }
+}
+
+/// The quit character: in Emacs it aborts any key sequence being read,
+/// whatever the keymaps say.
+pub(crate) const QUIT_KEY: Key = control_key('g');
+pub(crate) const CONTROL_S: Key = control_key('s');
+pub(crate) const CONTROL_R: Key = control_key('r');
 
 /// Emacs `user-error` from `region-beginning` and the region commands.
 const NO_REGION: &str = "The mark is not set now, so there is no region";
@@ -313,6 +338,62 @@ static COMMANDS: &[CommandSpec] = &[
         name: "Buffer-menu-this-window",
         run: window::buffer_menu_this_window,
     },
+    CommandSpec {
+        name: "isearch-forward",
+        run: search::isearch_forward,
+    },
+    CommandSpec {
+        name: "isearch-backward",
+        run: search::isearch_backward,
+    },
+    CommandSpec {
+        name: "isearch-forward-regexp",
+        run: search::isearch_forward_regexp,
+    },
+    CommandSpec {
+        name: "isearch-backward-regexp",
+        run: search::isearch_backward_regexp,
+    },
+    CommandSpec {
+        name: "query-replace",
+        run: replace::query_replace,
+    },
+    CommandSpec {
+        name: "query-replace-regexp",
+        run: replace::query_replace_regexp,
+    },
+    CommandSpec {
+        name: "occur",
+        run: occur::occur,
+    },
+    CommandSpec {
+        name: "occur-mode-goto-occurrence",
+        run: occur::goto_occurrence,
+    },
+    CommandSpec {
+        name: "occur-mode-goto-occurrence-other-window",
+        run: occur::goto_occurrence_other_window,
+    },
+    CommandSpec {
+        name: "occur-mode-display-occurrence",
+        run: occur::display_occurrence,
+    },
+    CommandSpec {
+        name: "occur-next",
+        run: occur::next,
+    },
+    CommandSpec {
+        name: "occur-prev",
+        run: occur::previous,
+    },
+    CommandSpec {
+        name: "next-error-no-select",
+        run: occur::next_error_no_select,
+    },
+    CommandSpec {
+        name: "previous-error-no-select",
+        run: occur::previous_error_no_select,
+    },
 ];
 
 pub fn lookup(name: &str) -> Option<&'static CommandSpec> {
@@ -576,7 +657,7 @@ impl<'a> CommandContext<'a> {
 }
 
 /// A failed edit as Emacs reports it: read-only names the buffer.
-fn read_only_error(buffer: &Buffer, error: EditError) -> CommandError {
+pub(crate) fn read_only_error(buffer: &Buffer, error: EditError) -> CommandError {
     match error {
         EditError::ReadOnly => CommandError::BufferReadOnly(buffer.name.clone()),
         other => other.into(),

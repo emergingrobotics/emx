@@ -127,6 +127,18 @@ pub(crate) struct BufferMenu {
     pub header: String,
 }
 
+/// What an `*Occur*` buffer lists: the buffer searched, for each of its
+/// lines the start of the match it shows (in that buffer), and where the
+/// matches are in its own text.
+#[derive(Debug, Clone)]
+pub(crate) struct OccurData {
+    pub source: BufferId,
+    pub targets: Vec<Option<MarkerId>>,
+    pub match_spans: Vec<Range<u64>>,
+    /// The source buffer was killed; its markers are gone.
+    pub source_killed: bool,
+}
+
 /// Emacs `mode-name` of a Fundamental-mode buffer.
 const FUNDAMENTAL_MODE: &str = "Fundamental";
 /// Emacs `mode-name` of `Buffer-menu-mode`.
@@ -165,6 +177,10 @@ pub struct Buffer {
     pub(crate) menu: Option<BufferMenu>,
     /// The buffer is the message log, `*Messages*`.
     pub(crate) messages: bool,
+    /// Set while the buffer is an `*Occur*` list.
+    pub(crate) occur: Option<OccurData>,
+    /// The mode name of a special buffer (`*Occur*`, `*Help*`).
+    pub(crate) special_mode: Option<&'static str>,
     /// Emacs `recent-auto-save-p`: auto-saved since last read or saved, so
     /// the auto-save file is this session's and a save may delete it.
     pub(crate) auto_saved_since_save: bool,
@@ -194,6 +210,8 @@ impl Buffer {
             last_window_start: 0,
             menu: None,
             messages: false,
+            occur: None,
+            special_mode: None,
             auto_saved_since_save: false,
             markers: SlotMap::with_key(),
             modified_tick: 0,
@@ -206,6 +224,8 @@ impl Buffer {
     pub(crate) fn mode_name(&self) -> &'static str {
         if self.menu.is_some() {
             BUFFER_MENU_MODE
+        } else if let Some(mode) = self.special_mode {
+            mode
         } else if self.messages {
             MESSAGES_MODE
         } else {
@@ -422,21 +442,70 @@ impl Buffer {
         point: u64,
         recorder: &mut dyn ChangeRecorder,
     ) -> Result<Vec<u8>, EditError> {
+        self.apply_delete_recording(range, point, recorder, true)
+    }
+
+    /// Emacs `replace_range`, which `replace-match` uses: `range` becomes
+    /// `bytes`. Markers at or after the end of `range` keep their distance
+    /// from its end (so one at an empty range's position ends up after the
+    /// new text), markers inside it go to its start, and undo records no
+    /// marker adjustments.
+    pub(crate) fn replace_range(
+        &mut self,
+        range: Range<u64>,
+        bytes: &[u8],
+        point: u64,
+        recorder: &mut dyn ChangeRecorder,
+    ) -> Result<(), EditError> {
+        self.check_editable()?;
+        self.check_range(&range)?;
+        let before: Vec<(MarkerId, u64)> = self
+            .markers
+            .iter()
+            .map(|(id, marker)| (id, marker.pos))
+            .collect();
+        self.apply_delete_recording(range.clone(), point, recorder, false)?;
+        self.apply_insert(range.start, bytes, recorder)?;
+        let removed = range.end - range.start;
+        let added = bytes.len() as u64;
+        for (id, position) in before {
+            let moved = if position >= range.end {
+                position - removed + added
+            } else if position > range.start {
+                range.start
+            } else {
+                position
+            };
+            self.markers[id].pos = moved;
+        }
+        Ok(())
+    }
+
+    fn apply_delete_recording(
+        &mut self,
+        range: Range<u64>,
+        point: u64,
+        recorder: &mut dyn ChangeRecorder,
+        record_markers: bool,
+    ) -> Result<Vec<u8>, EditError> {
         if range.is_empty() {
             return Ok(Vec::new());
         }
         let mut deleted = Vec::new();
         self.text.read(range.clone(), &mut deleted)?;
         let text = self.text.delete(range.clone())?;
-        let adjustments = self
-            .markers
-            .iter()
-            .filter_map(|(id, marker)| {
-                marker
-                    .deletion_adjustment(&range)
-                    .map(|adjustment| (id, adjustment))
-            })
-            .collect();
+        let adjustments = if record_markers {
+            self.markers
+                .iter()
+                .filter_map(|(id, marker)| {
+                    marker
+                        .deletion_adjustment(&range)
+                        .map(|adjustment| (id, adjustment))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let context = self.change_context();
         self.undo.record_delete(
             range.start,

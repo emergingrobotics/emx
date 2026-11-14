@@ -1,0 +1,72 @@
+{"name": "isearch-exit-pushes-mark", "text": "|one foo two foo", "keys": "C-s f o o RET", "tier": 1}
+{"name": "isearch-repeat", "text": "|one foo two foo", "keys": "C-s f o o C-s RET", "tier": 1}
+{"name": "isearch-wraps-after-failing", "text": "|one foo two foo", "keys": "C-s f o o C-s C-s C-s RET", "tier": 1}
+{"name": "isearch-overwraps", "text": "foo x|y foo", "keys": "C-s f o o C-s C-s C-s RET", "tier": 1}
+{"name": "isearch-del-undoes-steps", "text": "|fa fb fa", "keys": "C-s f a C-s DEL DEL RET", "tier": 1}
+{"name": "isearch-abort-when-successful", "text": "|one foo two foo", "keys": "C-s f o o C-g", "tier": 1}
+{"name": "isearch-abort-removes-failing-part", "text": "|ab ac", "keys": "C-s a c x y C-g RET", "tier": 1}
+{"name": "isearch-abort-twice", "text": "|ab ac", "keys": "C-s a c x y C-g C-g", "tier": 1}
+{"name": "isearch-other-command-exits-and-runs", "text": "|one foo two foo", "keys": "C-s f o o C-f C-f", "tier": 1}
+{"name": "isearch-other-command-self-inserts", "text": "|one foo two foo", "keys": "C-s f o o C-a x", "tier": 1}
+{"name": "isearch-backward-closest-start", "text": "aaaa|", "keys": "C-r a a RET", "tier": 1}
+{"name": "isearch-backward-repeat", "text": "aaaa|", "keys": "C-r a a C-r RET", "tier": 1}
+{"name": "isearch-backward-then-forward", "text": "ab ab ab|", "keys": "C-r a b C-r C-s RET", "tier": 1}
+{"name": "isearch-forward-then-backward", "text": "|ab ab ab", "keys": "C-s a b C-s C-r RET", "tier": 1}
+{"name": "isearch-regexp", "text": "|foo f1o f22o", "keys": "C-M-s f [ 0 - 9 ] + o RET", "tier": 1}
+{"name": "isearch-regexp-backward", "text": "f1o f22o foo|", "keys": "C-M-r f [ 0 - 9 ] + o RET", "tier": 1}
+{"name": "isearch-regexp-fallback-star", "text": "|abb aab ab", "keys": "C-M-s a b * RET", "tier": 1}
+{"name": "isearch-regexp-alternative", "text": "|xyz cat dog", "keys": "C-M-s d o g \\ | c a t RET", "tier": 1}
+{"name": "isearch-yank-word", "text": "|hello world hello world", "keys": "C-s h e C-w C-w C-s RET", "tier": 1}
+{"name": "isearch-case-fold-lower", "text": "|Foo foo", "keys": "C-s f o o C-s RET", "tier": 1}
+{"name": "isearch-case-sensitive-upper", "text": "|foo Foo", "keys": "C-s F o o RET", "tier": 1}
+{"name": "isearch-toggle-case-fold", "text": "|foo Foo", "keys": "C-s F o o M-c C-r C-r RET", "tier": 1}
+{"name": "isearch-search-ring", "text": "|one foo two foo", "keys": "C-s f o o RET C-s C-s RET", "tier": 1}
+{"name": "isearch-ring-empty", "text": "|one foo two foo", "keys": "C-s C-s RET", "tier": 1}
+{"name": "isearch-nonincremental", "text": "|one foo two foo", "keys": "C-s RET f o o RET", "tier": 1}
+{"name": "isearch-edit-string", "text": "|one foo two foo", "keys": "C-s f o M-e o RET C-s RET", "tier": 1}
+{"name": "isearch-lax-whitespace", "text": "|a\t b a b", "keys": "C-s a SPC b RET", "tier": 1}
+{"name": "isearch-prefix-argument-repeats-char", "text": "|xaaaa", "keys": "C-s C-u 3 a RET", "tier": 1}
+{"name": "isearch-yank-kill", "text": "|foo bar foo", "keys": "M-f C-SPC M-b M-w C-s C-y C-s RET", "tier": 1}
+{"name": "isearch-quote-newline", "text": "|a\nb\nc", "keys": "C-s C-q C-j C-s RET", "tier": 1}
+{"name": "isearch-yank-line", "text": "|abc def\nabc def", "keys": "C-s a M-s C-e C-s RET", "tier": 1}
+{"name": "isearch-query-replace", "text": "|foo bar foo", "keys": "C-s f o o M-% b a z RET !", "tier": 1}
+{"name": "isearch-mark-active-keeps-mark", "text": "^|foo foo", "keys": "C-SPC C-s f o o C-s RET", "tier": 1}
+{"name": "query-replace-bang", "text": "|a b a b a", "keys": "M-% a RET x RET y n !", "tier": 1}
+{"name": "query-replace-quit-with-q", "text": "|a b a b a", "keys": "M-% a RET x RET y y q", "tier": 1}
+{"name": "query-replace-dot", "text": "|a b a b a", "keys": "M-% a RET x RET n .", "tier": 1}
+{"name": "query-replace-backup", "text": "|a b a b a", "keys": "M-% a RET x RET y ^ n !", "tier": 1}
+{"name": "query-replace-undo-group", "text": "|a b a b a", "keys": "M-% a RET x RET y y q C-/", "tier": 1}
+{"name": "query-replace-undo-all-groups", "text": "|a b a b a", "keys": "M-% a RET x RET y y q C-/ C-/", "tier": 1}
+{"name": "query-replace-bang-one-group", "text": "|a b a b a", "keys": "M-% a RET x RET ! C-/", "tier": 1}
+{"name": "query-replace-c-g", "text": "|a b a b a", "keys": "M-% a RET x RET y C-g", "tier": 1}
+{"name": "query-replace-case-conversion", "text": "|foo Foo FOO", "keys": "M-% f o o RET b a r SPC x RET !", "tier": 1}
+{"name": "query-replace-upper-case-from-is-exact", "text": "|foo Foo FOO", "keys": "M-% F o o RET b a r RET !", "tier": 1}
+{"name": "query-replace-regexp-groups", "text": "|key=value name=x", "keys": "C-M-% \\ ( [ a - z ] + \\ ) = \\ ( [ a - z ] + \\ ) RET \\ 2 = \\ 1 RET !", "tier": 1}
+{"name": "query-replace-regexp-whole-and-count", "text": "|a a a", "keys": "C-M-% a RET < \\ & \\ # > RET !", "tier": 1}
+{"name": "query-replace-regexp-empty-matches", "text": "|axxb", "keys": "C-M-% x * RET - RET !", "tier": 1}
+{"name": "query-replace-in-region", "text": "a a| a a", "keys": "C-SPC C-e M-% a RET b RET !", "tier": 1}
+{"name": "query-replace-backward", "text": "a b a b a|", "keys": "M-- M-% a RET x RET y n !", "tier": 1}
+{"name": "query-replace-word", "text": "|foo foobar foo", "keys": "C-u M-% f o o RET x RET !", "tier": 1}
+{"name": "query-replace-default-pair", "text": "|a b a b a", "keys": "M-% a RET x RET q M-% RET !", "tier": 1}
+{"name": "query-replace-history-pair", "text": "|a b a b a", "keys": "M-% a RET x RET q M-% M-p RET !", "tier": 1}
+{"name": "query-replace-undo-one", "text": "|a b a b a", "keys": "M-% a RET x RET y y u q", "tier": 1}
+{"name": "query-replace-undo-all", "text": "|a b a b a", "keys": "M-% a RET x RET y y U q", "tier": 1}
+{"name": "query-replace-act-and-show", "text": "|a b a", "keys": "M-% a RET x RET , y q", "tier": 1}
+{"name": "query-replace-edit-replacement", "text": "|a b a b a", "keys": "M-% a RET x RET E y z RET !", "tier": 1}
+{"name": "query-replace-other-key-exits", "text": "|a b a", "keys": "M-% a RET x RET C-f C-f", "tier": 1}
+{"name": "query-replace-no-match", "text": "|a b a", "keys": "M-% z RET x RET", "tier": 1}
+{"name": "query-replace-invalid-replacement", "text": "|a b a", "keys": "C-M-% a RET \\ 0 RET", "tier": 1}
+{"name": "query-replace-invalid-regexp", "text": "|a b a", "keys": "C-M-% \\ ( RET x RET", "tier": 1}
+{"name": "query-replace-literal-backslash", "text": "|a b a", "keys": "M-% a RET \\ 1 RET !", "tier": 1}
+{"name": "occur-buffer-contents", "text": "|foo bar\nbaz\nfoo foo\nzap foo\n", "keys": "M-s o f o o RET C-x o", "tier": 1}
+{"name": "occur-next", "text": "|foo bar\nbaz\nfoo foo\nzap foo\n", "keys": "M-s o f o o RET C-x o M-n M-n M-p", "tier": 1}
+{"name": "occur-visit", "text": "|foo bar\nbaz\nfoo foo\nzap foo\n", "keys": "M-s o f o o RET C-x o M-n M-n RET", "tier": 1}
+{"name": "occur-context", "text": "|a1\nfoo\nb2\nc3\nd4\nfoo x\ne5\nf6\ng7\nh8\nfoo\n", "keys": "M-1 M-s o f o o RET C-x o", "tier": 1}
+{"name": "occur-before-context", "text": "|a1\nfoo\nb2\nc3\nd4\nfoo x\ne5\nf6\ng7\nh8\nfoo\n", "keys": "M-- M-2 M-s o f o o RET C-x o", "tier": 1}
+{"name": "occur-no-match", "text": "|foo\n", "keys": "M-s o z z z RET", "tier": 1}
+{"name": "occur-empty-regexp", "text": "|foo\n", "keys": "M-s o RET", "tier": 1}
+{"name": "occur-collect", "text": "|foo\nb2 fofoo\n", "keys": "C-u M-s o f o o RET C-x o", "tier": 1}
+{"name": "occur-default-regexp", "text": "|foo\nbar\nfoo\n", "keys": "M-s o b a r RET M-s o RET C-x o", "tier": 1}
+{"name": "occur-multi-line-match", "text": "|ab\ncd\nab\n", "keys": "M-s o b C-q C-j c RET C-x o", "tier": 1}
+{"name": "occur-case-fold", "text": "|Foo\nfoo\nFOO\n", "keys": "M-s o f o o RET C-x o", "tier": 1}
+{"name": "occur-no-occurrence-line", "text": "|foo\n", "keys": "M-s o f o o RET C-x o RET", "tier": 1}

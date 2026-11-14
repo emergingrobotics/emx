@@ -48,6 +48,12 @@ impl Editor {
                 found => return found,
             }
         }
+        if buffer.occur.is_some() {
+            match self.occur_keymap.lookup(keys) {
+                Lookup::Undefined => {}
+                found => return found,
+            }
+        }
         self.keymap.lookup(keys)
     }
 
@@ -66,7 +72,7 @@ impl Editor {
 
     /// Emacs `select-window`. The window left keeps its point; its
     /// buffer's point becomes that point, as Emacs's PT does.
-    fn select_window(&mut self, client: ClientId, window: WindowId) {
+    pub(super) fn select_window(&mut self, client: ClientId, window: WindowId) {
         let old = self.selected_window_id(client);
         if old != window {
             let left = *self.window(client, old);

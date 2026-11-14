@@ -2,8 +2,8 @@ use emx_text::{ReadError, Text, display_units, unit_width};
 
 use super::mark::push_mark;
 use super::misc::recenter_if_past_window_end;
-use super::word_syntax::{CHINESE, COMBINING_DIACRITIC, HIRAGANA, KATAKANA, SCRIPTS, WORD};
 use super::{CommandContext, CommandError, PrefixArg};
+use emx_text::word_syntax::{CHINESE, COMBINING_DIACRITIC, HIRAGANA, KATAKANA, SCRIPTS, WORD};
 
 /// Bytes read around point to find one display unit; doubled while a single
 /// unit fills the whole window.
@@ -331,7 +331,7 @@ pub(crate) fn move_to_column(
 
 /// Emacs `scan_words`: the position after COUNT words (before, when
 /// negative), or `None` when the buffer edge comes first.
-fn scan_words(text: &Text, from: u64, count: i64) -> Result<Option<u64>, ReadError> {
+pub(crate) fn scan_words(text: &Text, from: u64, count: i64) -> Result<Option<u64>, ReadError> {
     let mut position = from;
     let mut remaining = count;
     while remaining > 0 {
@@ -508,7 +508,7 @@ fn in_ranges(ranges: &[(u32, u32)], code: u32) -> bool {
 }
 
 /// Word syntax in Emacs's `standard-syntax-table`; raw bytes are words too.
-fn is_word(code: u32) -> bool {
+pub(crate) fn is_word(code: u32) -> bool {
     code > LARGEST_SCALAR || in_ranges(WORD, code)
 }
 

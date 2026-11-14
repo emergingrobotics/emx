@@ -1,11 +1,13 @@
 ;;; gen-word-syntax.el --- generate emx word-motion tables from Emacs  -*- lexical-binding: t; -*-
 
-;; Usage: emacs --batch -Q -l difftest/gen-word-syntax.el > crates/emx-core/src/command/word_syntax.rs
+;; Usage: emacs --batch -Q -l difftest/gen-word-syntax.el > crates/emx-text/src/word_syntax.rs
 ;;
 ;; Word motion (`forward-word') depends on the standard syntax table, on
 ;; `char-script-table', and on the character categories named in
 ;; `word-combining-categories' and `word-separating-categories'.  This dumps
-;; them as sorted inclusive code-point ranges.
+;; them as sorted inclusive code-point ranges.  Regexp syntax classes
+;; (`\w', `\s-', `[[:space:]]') need every character's syntax class, so
+;; the whole standard syntax table is dumped too.
 
 (defconst gen-word-syntax-max-char #x10FFFF)
 (defconst gen-word-syntax-per-line 4)
@@ -24,7 +26,7 @@
     (nreverse ranges)))
 
 (defun gen-word-syntax--emit (name doc ranges with-value)
-  (princ (format "\n/// %s\n#[rustfmt::skip]\npub(super) const %s: &[%s] = &[\n"
+  (princ (format "\n/// %s\n#[rustfmt::skip]\npub const %s: &[%s] = &[\n"
                  doc name (if with-value "(u32, u32, u16)" "(u32, u32)")))
   (let ((count 0))
     (dolist (range ranges)
@@ -46,6 +48,9 @@
     (gen-word-syntax--emit
      "WORD" "Word constituents in `standard-syntax-table`."
      (gen-word-syntax--ranges (lambda (code) (eq (char-syntax code) ?w))) nil)
+    (gen-word-syntax--emit
+     "SYNTAX" "`standard-syntax-table`: each run's syntax class, as the character `char-syntax` returns."
+     (gen-word-syntax--ranges (lambda (code) (char-syntax code))) t)
     (gen-word-syntax--emit
      "SCRIPTS" "`char-script-table`: each run's script, numbered in order of first appearance."
      (gen-word-syntax--ranges

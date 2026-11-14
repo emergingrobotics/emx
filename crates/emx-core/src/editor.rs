@@ -2,11 +2,14 @@ mod buffer_menu;
 mod completing;
 mod files;
 mod messages;
+mod occurring;
 mod reload;
+mod replacing;
 mod requests;
+mod searching;
 mod windows;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +23,7 @@ use crate::buffer::{Buffer, BufferId, ChangeRecorder};
 use crate::command::{self, CommandContext, CommandError, PrefixArg, RecenterPosition};
 use crate::config::{Config, ConfigError};
 use crate::event::{ClientId, Effect, Event, TimerId};
+use crate::isearch::{CaseFold, Isearch, QueuedInput};
 use crate::journal::{JournalId, JournalOutbox};
 use crate::keymap::{Keymap, Lookup, describe_keys, universal_argument_binding};
 use crate::killring::KillRing;
@@ -30,7 +34,9 @@ use crate::undo::{UndoLimits, outer_limit_warning};
 pub(crate) use files::Purpose;
 use files::{AutoSaveRequest, ExitWait, SaveFlow, SaveRequest};
 use reload::ReloadRequest;
+use replacing::QueryReplace;
 use requests::{GroupReply, OpenRequest, Reply};
+use searching::SearchWait;
 
 use crate::window::{Fetch, Frame, ScreenLine, Window, WindowArea, WindowId, not_cached_block};
 
@@ -60,17 +66,7 @@ pub enum Session {
 const PASTE_COMMAND: &str = "xterm-paste";
 /// How Emacs describes a bracketed-paste event in a key sequence.
 const PASTE_EVENT_DESCRIPTION: &str = "<xterm-paste>";
-/// The quit character: in Emacs it aborts any key sequence being read,
-/// whatever the keymaps say.
-const QUIT_KEY: Key = Key {
-    code: KeyCode::Char('g'),
-    mods: Mods {
-        ctrl: true,
-        meta: false,
-        shift: false,
-        super_: false,
-    },
-};
+const QUIT_KEY: Key = command::QUIT_KEY;
 
 /// Emacs's per-keyboard command-loop state.
 #[derive(Debug, Default)]
@@ -147,6 +143,10 @@ struct Client {
     cursor_timer: Option<TimerId>,
     /// Rows the minibuffer's candidate list takes from the windows.
     candidate_rows: u16,
+    isearch: Option<Isearch>,
+    query_replace: Option<QueryReplace>,
+    /// A search running on a worker for this client.
+    search_wait: Option<SearchWait>,
 }
 
 #[derive(Debug, Default)]
@@ -275,6 +275,22 @@ pub struct Editor {
     /// Saves waiting for a look at a target changed under the buffer's
     /// file-backed text, and who asked.
     save_verify: HashMap<BufferId, (ClientId, SaveFlow)>,
+    /// `isearch-mode-map` and `occur-mode-map`.
+    isearch_keymap: Keymap,
+    occur_keymap: Keymap,
+    /// Names the next `Effect::StartSearch`.
+    next_search: u64,
+    /// Emacs `search-ring` and `regexp-search-ring`, newest first.
+    search_ring: VecDeque<Vec<u8>>,
+    regexp_search_ring: VecDeque<Vec<u8>>,
+    /// The case folding the last isearch ended with, which the next one's
+    /// `C-s C-s` restores (`isearch-last-case-fold-search`).
+    isearch_case_fold: CaseFold,
+    /// Emacs `query-replace-history`, `query-replace-defaults` and
+    /// `occur-collect-regexp-history`, newest first.
+    query_replace_history: Vec<Vec<u8>>,
+    query_replace_defaults: Vec<(Vec<u8>, Vec<u8>)>,
+    occur_collect_history: Vec<Vec<u8>>,
     /// Visited paths the server watches (`Effect::Watch`).
     watched: BTreeSet<PathBuf>,
     /// Watched paths that are polled instead.
@@ -344,6 +360,15 @@ impl Editor {
             },
             window_select_count: 0,
             buffer_menu_keymap: Keymap::buffer_menu(),
+            isearch_keymap: Keymap::isearch(),
+            occur_keymap: Keymap::occur(),
+            next_search: 0,
+            search_ring: VecDeque::new(),
+            regexp_search_ring: VecDeque::new(),
+            isearch_case_fold: CaseFold::Smart,
+            query_replace_history: Vec::new(),
+            query_replace_defaults: Vec::new(),
+            occur_collect_history: Vec::new(),
             save_verify: HashMap::new(),
             watched: BTreeSet::new(),
             polled_paths: BTreeSet::new(),
@@ -420,6 +445,7 @@ impl Editor {
             Event::DirectoryListed { client, id, result } => {
                 self.directory_listed(client, id, result);
             }
+            Event::SearchResult { client, id, result } => self.search_result(client, id, result),
         }
         self.sync_watches();
         self.redisplay();
@@ -623,6 +649,9 @@ impl Editor {
                 cursor_reported: None,
                 cursor_timer: None,
                 candidate_rows: 0,
+                isearch: None,
+                query_replace: None,
+                search_wait: None,
             },
         );
         if kind == ClientKind::Tui {
@@ -634,10 +663,17 @@ impl Editor {
     }
 
     fn detach(&mut self, client: ClientId) {
-        let removed = self
+        self.cancel_search(client);
+        let mut removed = self
             .clients
             .remove(&client)
             .expect("the server detaches only attached clients");
+        if let Some(isearch) = removed.isearch.take() {
+            self.isearch_detach(isearch);
+        }
+        if let Some(session) = removed.query_replace.take() {
+            self.replace_detach(session);
+        }
         for (id, window) in &removed.frame.windows {
             let buffer = &mut self.buffers[window.buffer];
             buffer.delete_marker(window.point);
@@ -706,6 +742,11 @@ impl Editor {
     }
 
     fn handle_key(&mut self, client_id: ClientId, key: Key) {
+        // A key typed while isearch or query-replace waits for a search on
+        // a worker waits too, so it acts on the search's result.
+        if self.hold_input_for_search(client_id, QueuedInput::Key(key)) {
+            return;
+        }
         self.buffer_viewed(client_id);
         let client = self.client_mut(client_id);
         // Reading an input event wipes the echo area.
@@ -715,6 +756,11 @@ impl Editor {
             self.minibuffer_key(client_id, key);
             return;
         }
+        if self.query_replace_active(client_id) {
+            self.query_replace_key(client_id, key);
+            return;
+        }
+        let client = self.client_mut(client_id);
         let state = &mut client.command_loop;
         if !state.pending.is_empty() && key == QUIT_KEY {
             self.signal(client_id, None, &CommandError::Quit);
@@ -727,8 +773,17 @@ impl Editor {
                 return;
             }
         }
-        state.pending.push(key);
-        let pending = state.pending.clone();
+        if self.isearch_active(client_id) {
+            self.isearch_key(client_id, key);
+            return;
+        }
+        self.client_mut(client_id).command_loop.pending.push(key);
+        self.dispatch_pending(client_id, key);
+    }
+
+    /// Looks up the key sequence read so far, ending in `key`, and runs it.
+    fn dispatch_pending(&mut self, client_id: ClientId, key: Key) {
+        let pending = self.client(client_id).command_loop.pending.clone();
         match self.lookup_keys(client_id, &pending) {
             Lookup::Command(name) => self.run_key_command(client_id, name, key),
             Lookup::Prefix => self.continue_sequence(client_id),
@@ -835,6 +890,9 @@ impl Editor {
     }
 
     fn handle_paste(&mut self, client_id: ClientId, bytes: Vec<u8>) {
+        if self.hold_input_for_search(client_id, QueuedInput::Paste(bytes.clone())) {
+            return;
+        }
         let client = self.client_mut(client_id);
         client.echo.clear();
         client.signaled = false;
@@ -842,6 +900,16 @@ impl Editor {
             self.minibuffer_paste(client_id, &bytes);
             return;
         }
+        if self.query_replace_active(client_id) {
+            // A paste is not an answer: it ends query-replace and inserts.
+            self.query_replace_paste(client_id);
+        }
+        if self.isearch_active(client_id) && self.client(client_id).command_loop.pending.is_empty()
+        {
+            self.isearch_paste(client_id, bytes);
+            return;
+        }
+        let client = self.client_mut(client_id);
         if !client.command_loop.pending.is_empty() {
             let keys = describe_keys(&client.command_loop.pending);
             self.undefined(client_id, format!("{keys} {PASTE_EVENT_DESCRIPTION}"));

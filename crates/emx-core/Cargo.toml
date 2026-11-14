@@ -11,6 +11,7 @@ crc32fast.workspace = true
 emx-proto = { path = "../emx-proto" }
 emx-text = { path = "../emx-text" }
 emx-types = { path = "../emx-types" }
+memchr.workspace = true
 parking_lot.workspace = true
 rustix = { workspace = true, features = ["fs", "process", "rand"] }
 serde.workspace = true

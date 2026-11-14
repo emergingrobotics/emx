@@ -45,7 +45,7 @@ use crate::paths::{self, JournalMode};
 use client_conn::{Delivery, Outbox};
 use journal_writer::{JournalBackend, JournalFailure, JournalThread};
 use watcher::Watcher;
-use workers::{Deliver, Indexers, Job, Listers, Pool, PrefetchTracker, prefetch_cache};
+use workers::{Deliver, Indexers, Job, Listers, Pool, PrefetchTracker, Searchers, prefetch_cache};
 
 /// A server that finds the lock held retries for this long, so one
 /// started while the previous one is exiting still comes up.
@@ -299,6 +299,7 @@ pub struct Server {
     prefetches: PrefetchTracker,
     indexers: Indexers,
     listers: Listers,
+    searchers: Searchers,
     watcher: Watcher,
     deliver: Deliver,
     /// Events the server itself raised while carrying out effects.
@@ -372,6 +373,7 @@ impl Server {
             prefetches: PrefetchTracker::default(),
             indexers: Indexers::default(),
             listers: Listers::new(deliver.clone()),
+            searchers: Searchers::new(deliver.clone()),
             watcher,
             deliver,
             raised: VecDeque::new(),
@@ -625,6 +627,7 @@ impl Server {
                     id,
                     directory,
                 } => self.listers.submit(client, id, directory),
+                Effect::StartSearch(job) => self.searchers.submit(job),
                 Effect::Watch { path } => self.watcher.watch(path),
                 Effect::Unwatch { path } => self.watcher.unwatch(path),
                 Effect::Shutdown => self.shutdown = true,

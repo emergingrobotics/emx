@@ -5,13 +5,14 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use emx_core::completion::{Candidate, ListingError};
 use emx_core::diff::{self, DiffJob};
 use emx_core::io::{self, SaveFailure, SavePlan};
+use emx_core::search_job::{SearchJob, run_search_job};
 use emx_core::{
     AutoSaveJob, BufferId, ClientId, Config, Event, ListingId, PrefetchRequest, ReloadJob,
 };
@@ -29,6 +30,12 @@ pub const IO_THREADS: usize = 4;
 /// leaves plenty of room for. A request over the cap fails at once and the
 /// prompt says so, instead of queueing behind reads that may never end.
 pub const LISTINGS_IN_FLIGHT_MAX: usize = 64;
+/// The most searches (`Effect::StartSearch`) running at once. Each runs on a
+/// thread of its own and a search reading a hung network mount never
+/// returns, so they are capped; the editor runs one search per client at a
+/// time and cancels the one it replaces, so normal use stays far below.
+pub const SEARCHES_IN_FLIGHT_MAX: usize = 16;
+const TOO_MANY_SEARCHES: &str = "Too many searches in progress";
 /// The indexer reports its progress every this many blocks.
 pub const INDEX_PROGRESS_BLOCKS: u64 = 256;
 
@@ -489,6 +496,65 @@ impl Listers {
                 &Err(ListingError::Overloaded),
             );
         }
+    }
+}
+
+/// Runs searches (`Effect::StartSearch`), each on a thread of its own, so a
+/// search over a large file never holds up the editor, a save or another
+/// search, and one stuck on a hung mount holds only its own thread (the
+/// threads are never joined). The editor cancels a search it no longer
+/// wants through the job's flag; a cancelled search reports nothing.
+pub struct Searchers {
+    in_flight: Arc<AtomicUsize>,
+    deliver: Deliver,
+    cap: usize,
+}
+
+impl Searchers {
+    pub fn new(deliver: Deliver) -> Searchers {
+        Searchers::with(deliver, SEARCHES_IN_FLIGHT_MAX)
+    }
+
+    pub fn with(deliver: Deliver, cap: usize) -> Searchers {
+        Searchers {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            deliver,
+            cap,
+        }
+    }
+
+    pub fn submit(&self, job: SearchJob) {
+        if self.in_flight.fetch_add(1, Ordering::AcqRel) >= self.cap {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            self.refuse(job.client, job.id);
+            return;
+        }
+        let (client, id) = (job.client, job.id);
+        let in_flight = self.in_flight.clone();
+        let deliver = self.deliver.clone();
+        let spawned = thread::Builder::new()
+            .name("emx-search".to_string())
+            .spawn(move || {
+                let event = run_search_job(&job);
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+                if !job.cancel.load(Ordering::Relaxed) {
+                    deliver(event);
+                }
+            });
+        // A thread that cannot be started is the shortage the cap guards
+        // against; the editor still waits, so it is told.
+        if spawned.is_err() {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            self.refuse(client, id);
+        }
+    }
+
+    fn refuse(&self, client: ClientId, id: emx_core::SearchId) {
+        (self.deliver)(Event::SearchResult {
+            client,
+            id,
+            result: Err(TOO_MANY_SEARCHES.to_string()),
+        });
     }
 }
 

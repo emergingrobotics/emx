@@ -76,7 +76,7 @@ fn pop_to_mark_command(ctx: &mut CommandContext) -> Result<(), CommandError> {
 
 /// Emacs `push-mark`: the old mark goes onto the mark ring (dropping the
 /// oldest past `mark_ring_max`), and the mark moves to `location`.
-pub(super) fn push_mark(ctx: &mut CommandContext, location: u64, quiet: bool, activate: bool) {
+pub(crate) fn push_mark(ctx: &mut CommandContext, location: u64, quiet: bool, activate: bool) {
     let limit =
         usize::try_from(ctx.editor().config().mark_ring_max).expect("mark_ring_max fits in usize");
     if let Some(old) = ctx.mark() {

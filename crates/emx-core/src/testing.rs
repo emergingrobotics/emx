@@ -22,6 +22,7 @@ use crate::journal::{JournalError, JournalOp, JournalWriter, RecoveredBuffer, re
 use crate::marker::InsertionType;
 use crate::reload;
 use crate::render::{PrefetchRequest, render};
+use crate::search_job::{SearchJob, run_search_job};
 
 pub const HARNESS_COLS: u16 = 80;
 pub const HARNESS_ROWS: u16 = 24;
@@ -94,6 +95,8 @@ pub struct Harness {
     held_reloads: Vec<ReloadJob>,
     hold_listings: bool,
     held_listings: Vec<(ClientId, ListingId, PathBuf)>,
+    hold_searches: bool,
+    held_searches: Vec<SearchJob>,
     sinks: Option<Sinks>,
     /// Auto-save files that could not be deleted.
     io_errors: Vec<String>,
@@ -142,6 +145,8 @@ impl Harness {
             held_reloads: Vec::new(),
             hold_listings: false,
             held_listings: Vec::new(),
+            hold_searches: false,
+            held_searches: Vec::new(),
             sinks: None,
             io_errors: Vec::new(),
             journal_ops: Vec::new(),
@@ -537,6 +542,13 @@ impl Harness {
                     });
                 }
             }
+            Effect::StartSearch(job) => {
+                if self.hold_searches {
+                    self.held_searches.push(job);
+                } else {
+                    return Some(run_search_job(&job));
+                }
+            }
             Effect::Diff(job) => {
                 return Some(Event::DiffReady {
                     buffer: job.buffer,
@@ -572,6 +584,28 @@ impl Harness {
         Event::SaveFinished {
             buffer,
             result: result.map_err(|error| SaveFailure::from(&error)),
+        }
+    }
+
+    /// Searches started on a worker wait until `release_searches`, so
+    /// tests can see the editor while a search runs.
+    pub fn hold_searches(&mut self) {
+        self.hold_searches = true;
+    }
+
+    /// The searches held so far: whether each was cancelled.
+    pub fn held_searches(&self) -> Vec<bool> {
+        self.held_searches
+            .iter()
+            .map(|job| job.cancel.load(std::sync::atomic::Ordering::Relaxed))
+            .collect()
+    }
+
+    /// Runs the held searches, oldest first, and stops holding new ones.
+    pub fn release_searches(&mut self) {
+        self.hold_searches = false;
+        for job in std::mem::take(&mut self.held_searches) {
+            self.handle(run_search_job(&job));
         }
     }
 
