@@ -5,7 +5,7 @@
 
 use std::ops::{ControlFlow, Range};
 
-use emx_text::{DisplayUnit, ReadError, Text, display_units};
+use emx_text::{DisplayUnit, ReadError, Text, display_units, grapheme_text};
 use slotmap::SlotMap;
 
 use crate::buffer::BufferId;
@@ -27,6 +27,9 @@ const UTF8_MAX_LEN: usize = 4;
 /// so text never uses it except for the cursor at the end of a line.
 const CONTINUATION_COLUMNS: usize = 1;
 pub(crate) const CONTINUATION_GLYPH: &str = "\\";
+/// How a glyphless character shows: a blank, as Emacs's `thin-space`
+/// glyphless display is on a terminal.
+const GLYPHLESS_GLYPH: &str = " ";
 const CONTROL_CARET: char = '^';
 /// `^X` shows control character X - 0x40; DEL shows as `^?`.
 const CONTROL_TO_CARET: u8 = 0x40;
@@ -190,9 +193,9 @@ pub(crate) fn unit_glyphs(
 ) -> ControlFlow<()> {
     match unit {
         DisplayUnit::Grapheme { len, width } => {
-            let text = std::str::from_utf8(&bytes[..len])
+            let cluster = std::str::from_utf8(&bytes[..len])
                 .expect("display_units yields graphemes of valid UTF-8");
-            emit(text, usize::from(width), false)
+            emit(&grapheme_text(cluster), usize::from(width), false)
         }
         DisplayUnit::Tab => {
             let tab_width_u64 = tab_width as u64;
@@ -214,6 +217,7 @@ pub(crate) fn unit_glyphs(
             let notation: Vec<char> = format!("\\{byte:03o}").chars().collect();
             emit_chars(&notation, emit)
         }
+        DisplayUnit::Glyphless { .. } => emit(GLYPHLESS_GLYPH, 1, false),
         DisplayUnit::Newline => unreachable!("lines are laid out up to their newline"),
     }
 }

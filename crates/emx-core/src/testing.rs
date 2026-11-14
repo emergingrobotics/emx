@@ -9,7 +9,7 @@ use emx_types::{Grid, Key, parse_kbd};
 
 use crate::buffer::Buffer;
 use crate::config::Config;
-use crate::editor::Editor;
+use crate::editor::{Editor, Session};
 use crate::event::{ClientId, Effect, Event, TimerId};
 use crate::marker::InsertionType;
 use crate::render::{PrefetchRequest, render};
@@ -42,9 +42,15 @@ impl Harness {
         Harness::with_config(Config::default())
     }
 
-    /// Panics when the config's key overrides are invalid.
+    /// A `--no-server` editor. Panics when the config's key overrides are
+    /// invalid.
     pub fn with_config(config: Config) -> Harness {
-        let editor = Editor::new(config).expect("test config is valid");
+        Harness::with_session(config, Session::NoServer)
+    }
+
+    /// Panics when the config's key overrides are invalid.
+    pub fn with_session(config: Config, session: Session) -> Harness {
+        let editor = Editor::with_session(config, session).expect("test config is valid");
         let mut harness = Harness {
             editor,
             client: HARNESS_CLIENT,

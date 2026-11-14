@@ -16,19 +16,24 @@ use crate::window::{
     frame_layout, not_cached_block, unit_glyphs,
 };
 
-/// The start of Emacs 29's default modeline on a terminal: `-` from
-/// `mode-line-front-space`, then `mode-line-mule-info` for UTF-8 keyboard,
-/// terminal and buffer coding with Unix line ends.
-const MODELINE_FRONT: &str = "-UUU:";
+/// `mode-line-front-space` on a terminal.
+const MODELINE_FRONT: &str = "-";
+/// `mode-line-mule-info` for UTF-8 keyboard, terminal and buffer coding
+/// with Unix line ends.
+const MODELINE_MULE_INFO: &str = "UUU:";
+/// `mode-line-client` on a frame of a server client.
+const MODELINE_CLIENT: &str = "@";
 /// `mode-line-remote` for a local directory.
 const MODELINE_REMOTE: &str = "-";
-/// `mode-line-frame-identification` without terminal frame names.
-const MODELINE_FRAME_IDENTIFICATION: &str = "  ";
+/// The `min-width` of the mule-info, client, modified and remote group.
+const MODELINE_FLAGS_MIN_WIDTH: usize = 5;
+/// The `min-width` of `mode-line-percent-position`.
+const PERCENT_MIN_WIDTH: usize = 5;
 /// `%12b`: the buffer name is padded to at least this many columns.
 const BUFFER_NAME_COLUMNS: usize = 12;
 const MODELINE_POSITION_GAP: &str = "   ";
 /// `(6 ...)` around `mode-line-position-line-format`: ` L%l` padded to
-/// this many columns.
+/// this many columns, which is also its `min-width`.
 const LINE_NUMBER_COLUMNS: usize = 6;
 const MODELINE_MODES_GAP: &str = "  ";
 const MODELINE_MODES: &str = "(Fundamental) ";
@@ -66,6 +71,7 @@ pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>)
     };
     let cursor = draw_window(
         editor,
+        client,
         frame.selected_window(),
         &area,
         &mut grid,
@@ -94,6 +100,7 @@ fn tab_width(editor: &Editor) -> usize {
 /// shown.
 fn draw_window(
     editor: &Editor,
+    window_client: ClientId,
     window: &Window,
     area: &WindowArea,
     grid: &mut Grid,
@@ -148,7 +155,13 @@ fn draw_window(
         };
         let window_start = first_shown.unwrap_or(start.line_start);
         let position = position_indicator(window_start, buffer.text.len(), end_visible);
-        draw_modeline(grid, row, buffer, &position, &line, tab_width(editor));
+        let modeline = Modeline {
+            buffer,
+            frame: editor.frame_name(window_client),
+            position: &position,
+            line: &line,
+        };
+        draw_modeline(grid, row, &modeline, tab_width(editor));
     }
     let (row, col) = tracker.location()?;
     let last_col = area.cols.checked_sub(1)?;
@@ -193,7 +206,7 @@ fn draw_event(
             put_glyph(grid, row, *col, text, *width, face);
         }
         LineEvent::Continuation { col, .. } => {
-            put_glyph(grid, row, *col, CONTINUATION_GLYPH, 1, Face::EscapeGlyph);
+            put_glyph(grid, row, *col, CONTINUATION_GLYPH, 1, Face::Default);
         }
         LineEvent::Unit { pos, col, .. } => tracker.observe(*pos, row, *col),
         LineEvent::End {
@@ -308,18 +321,40 @@ impl RowWriter<'_> {
     }
 }
 
-/// Emacs 29's default `mode-line-format` for a Fundamental-mode buffer,
-/// as `format-mode-line` gives it in an `emacs -nw -Q` window, with the
-/// rest of the row filled with dashes.
-fn draw_modeline(
-    grid: &mut Grid,
-    row: u16,
-    buffer: &Buffer,
-    position: &str,
-    line: &str,
-    tab_width: usize,
-) {
+/// What one window's modeline shows.
+struct Modeline<'a> {
+    buffer: &'a Buffer,
+    /// The frame number and whether it is a server client's frame.
+    frame: (u64, bool),
+    position: &'a str,
+    line: &'a str,
+}
+
+impl RowWriter<'_> {
+    /// A segment with a `min-width` display property, as Emacs 29 draws it
+    /// on a terminal: padded with blanks up to the width, and followed by
+    /// one blank when wider (`emacs -nw` shows `-UUU:---  F1` and
+    /// `L15001   (` where `format-mode-line` gives `-UUU:--- F1` and
+    /// `L15001  (`).
+    fn min_width(&mut self, width: usize, face: Face, write: impl FnOnce(&mut Self)) {
+        let start = self.col;
+        write(self);
+        let written = self.col - start;
+        if written < width {
+            self.pad_to(start + width, face);
+        } else if written > width {
+            self.write(b" ", face, face);
+        }
+    }
+}
+
+/// Emacs 29's default `mode-line-format` for a Fundamental-mode buffer as
+/// `emacs -nw -Q` (or `emacsclient -t`) shows it on screen, the rest of the
+/// row filled with dashes.
+fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usize) {
     let face = Face::ModeLine;
+    let buffer = modeline.buffer;
+    let (frame_number, client_frame) = modeline.frame;
     // `%1*%1+`: `%` for read-only, `*` for modified, `-` otherwise.
     let flags = match (buffer.read_only, buffer.is_modified()) {
         (true, true) => "%*",
@@ -333,22 +368,29 @@ fn draw_modeline(
         col: 0,
         tab_width,
     };
-    for part in [
-        MODELINE_FRONT,
-        flags,
-        MODELINE_REMOTE,
-        MODELINE_FRAME_IDENTIFICATION,
-    ] {
-        writer.write(part.as_bytes(), face, face);
-    }
+    writer.write(MODELINE_FRONT.as_bytes(), face, face);
+    writer.min_width(MODELINE_FLAGS_MIN_WIDTH, face, |writer| {
+        writer.write(MODELINE_MULE_INFO.as_bytes(), face, face);
+        if client_frame {
+            writer.write(MODELINE_CLIENT.as_bytes(), face, face);
+        }
+        writer.write(flags.as_bytes(), face, face);
+        writer.write(MODELINE_REMOTE.as_bytes(), face, face);
+    });
+    // `mode-line-frame-identification` on a terminal: ` %F  `.
+    writer.write(format!(" F{frame_number}  ").as_bytes(), face, face);
     let name_start = writer.col;
     writer.write(buffer.name.as_bytes(), face, face);
     writer.pad_to(name_start + BUFFER_NAME_COLUMNS, face);
     writer.write(MODELINE_POSITION_GAP.as_bytes(), face, face);
-    writer.write(position.as_bytes(), face, face);
-    let line_start = writer.col;
-    writer.write(format!(" L{line}").as_bytes(), face, face);
-    writer.pad_to(line_start + LINE_NUMBER_COLUMNS, face);
+    writer.min_width(PERCENT_MIN_WIDTH, face, |writer| {
+        writer.write(modeline.position.as_bytes(), face, face);
+    });
+    writer.min_width(LINE_NUMBER_COLUMNS, face, |writer| {
+        let line_start = writer.col;
+        writer.write(format!(" L{}", modeline.line).as_bytes(), face, face);
+        writer.pad_to(line_start + LINE_NUMBER_COLUMNS, face);
+    });
     writer.write(MODELINE_MODES_GAP.as_bytes(), face, face);
     writer.write(MODELINE_MODES.as_bytes(), face, face);
     while writer.col < usize::from(writer.grid.cols) {

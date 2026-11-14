@@ -16,7 +16,7 @@ mod window;
 pub use buffer::{Buffer, BufferId, Change, ChangeRecorder, EditError, FileBinding};
 pub use command::{CommandContext, CommandError, CommandSpec, PrefixArg};
 pub use config::{Config, ConfigError, InvalidSetting, KeyboardEncoding};
-pub use editor::{Editor, JournalOutbox};
+pub use editor::{Editor, JournalOutbox, Session};
 pub use event::{ClientId, Effect, Event, TimerId};
 pub use keymap::{Binding, Keymap, Lookup, describe_keys};
 pub use killring::{KillRing, KillRingError};

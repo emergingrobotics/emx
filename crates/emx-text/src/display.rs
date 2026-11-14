@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::ops::RangeInclusive;
+
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -9,6 +12,49 @@ const MAX_GRAPHEME_WIDTH: usize = 2;
 const CONTROL_WIDTH: usize = 2;
 // Octal escape such as `\377`.
 const ESCAPE_WIDTH: usize = 4;
+const GLYPHLESS_WIDTH: usize = 1;
+const ZERO_WIDTH_JOINER: char = '\u{200d}';
+/// Tag characters spell out emoji subdivision flags.
+const EMOJI_TAGS: RangeInclusive<char> = '\u{e0020}'..='\u{e007f}';
+/// Emoji presentation, the only use of joiners and tags kept on screen.
+const EMOJI_WIDTH: usize = 2;
+
+/// Unicode 15.1 General_Category Cf (format), plus the line and paragraph
+/// separators (Zl, Zp). Sent raw, these move a terminal's cursor
+/// unpredictably or reorder the line (bidi embeddings and isolates).
+const FORMAT_CHARACTERS: [RangeInclusive<char>; 24] = [
+    '\u{ad}'..='\u{ad}',
+    '\u{600}'..='\u{605}',
+    '\u{61c}'..='\u{61c}',
+    '\u{6dd}'..='\u{6dd}',
+    '\u{70f}'..='\u{70f}',
+    '\u{890}'..='\u{891}',
+    '\u{8e2}'..='\u{8e2}',
+    '\u{180e}'..='\u{180e}',
+    '\u{200b}'..='\u{200f}',
+    '\u{2028}'..='\u{202e}',
+    '\u{2060}'..='\u{2064}',
+    '\u{2066}'..='\u{206f}',
+    '\u{feff}'..='\u{feff}',
+    '\u{fff9}'..='\u{fffb}',
+    '\u{110bd}'..='\u{110bd}',
+    '\u{110cd}'..='\u{110cd}',
+    '\u{13430}'..='\u{1343f}',
+    '\u{1bca0}'..='\u{1bca3}',
+    '\u{1d173}'..='\u{1d17a}',
+    '\u{e0001}'..='\u{e0001}',
+    '\u{e0020}'..='\u{e007f}',
+    // Unassigned in Unicode 15.1 but reserved for format controls.
+    '\u{2065}'..='\u{2065}',
+    '\u{fff0}'..='\u{fff8}',
+    '\u{e0000}'..='\u{e0000}',
+];
+
+fn is_format_character(character: char) -> bool {
+    FORMAT_CHARACTERS
+        .iter()
+        .any(|range| range.contains(&character))
+}
 
 /// One cell-producing unit of file bytes. The renderer never emits raw
 /// control or invalid bytes: `Control` draws as `^X`, and `InvalidByte` and
@@ -26,6 +72,34 @@ pub enum DisplayUnit {
     /// A validly encoded C1 code point (U+0080..U+009F), holding its low
     /// byte. Raw, U+009B is CSI on some terminals.
     C1(u8),
+    /// A cluster that starts with a format character (Cf, Zl, Zp) or has no
+    /// width, such as a lone combining mark. It occupies one blank cell,
+    /// like Emacs's terminal `thin-space` glyphless display, so it never
+    /// reaches the terminal raw.
+    Glyphless {
+        len: usize,
+    },
+}
+
+/// The text a terminal is sent for a `Grapheme` cluster: format characters
+/// joined onto a visible character (a zero-width non-joiner after a
+/// letter) are left out, except the joiners and tags of a wide emoji
+/// sequence, which form its picture.
+pub fn grapheme_text(cluster: &str) -> Cow<'_, str> {
+    if !cluster.chars().any(is_format_character) {
+        return Cow::Borrowed(cluster);
+    }
+    let emoji = cluster.width() == EMOJI_WIDTH;
+    Cow::Owned(
+        cluster
+            .chars()
+            .filter(|character| {
+                !is_format_character(*character)
+                    || (emoji
+                        && (*character == ZERO_WIDTH_JOINER || EMOJI_TAGS.contains(character)))
+            })
+            .collect(),
+    )
 }
 
 pub fn display_units(bytes: &[u8]) -> impl Iterator<Item = (usize, DisplayUnit)> + '_ {
@@ -88,14 +162,21 @@ impl Iterator for Units<'_> {
                             .graphemes(true)
                             .next()
                             .expect("non-empty text has a grapheme");
-                        let width = cluster.width().clamp(1, MAX_GRAPHEME_WIDTH);
-                        (
-                            cluster.len(),
-                            DisplayUnit::Grapheme {
-                                len: cluster.len(),
-                                width: u8::try_from(width).expect("clamped to at most 2"),
-                            },
-                        )
+                        let width = cluster.width();
+                        let starts_with_format =
+                            cluster.chars().next().is_some_and(is_format_character);
+                        if width == 0 || starts_with_format {
+                            (cluster.len(), DisplayUnit::Glyphless { len: cluster.len() })
+                        } else {
+                            let width = width.min(MAX_GRAPHEME_WIDTH);
+                            (
+                                cluster.len(),
+                                DisplayUnit::Grapheme {
+                                    len: cluster.len(),
+                                    width: u8::try_from(width).expect("clamped to at most 2"),
+                                },
+                            )
+                        }
                     }
                 }
             }
@@ -110,6 +191,7 @@ pub fn unit_width(unit: &DisplayUnit, column: usize, tab_width: usize) -> usize 
         DisplayUnit::Tab => tab_width - (column % tab_width),
         DisplayUnit::Control(_) => CONTROL_WIDTH,
         DisplayUnit::InvalidByte(_) | DisplayUnit::C1(_) => ESCAPE_WIDTH,
+        DisplayUnit::Glyphless { .. } => GLYPHLESS_WIDTH,
         DisplayUnit::Newline => 0,
         DisplayUnit::Grapheme { width, .. } => usize::from(*width),
     }
@@ -193,9 +275,45 @@ mod tests {
     }
 
     #[test]
-    fn lone_combining_mark_and_zwj_have_width_one() {
-        assert_eq!(units("\u{301}".as_bytes()), vec![(0, grapheme(2, 1))]);
-        assert_eq!(units("\u{200d}".as_bytes()), vec![(0, grapheme(3, 1))]);
+    fn zero_width_and_format_characters_are_glyphless() {
+        let mut characters: Vec<char> = vec!['\u{200b}', '\u{feff}', '\u{2028}', '\u{2029}'];
+        characters.extend('\u{200c}'..='\u{200f}');
+        characters.extend('\u{202a}'..='\u{202e}');
+        characters.extend('\u{2060}'..='\u{2064}');
+        characters.extend('\u{2066}'..='\u{2069}');
+        // Other format characters: soft hyphen, Arabic letter mark,
+        // interlinear annotation, a language tag.
+        characters.extend(['\u{ad}', '\u{61c}', '\u{fff9}', '\u{e0001}']);
+        // Zero-width clusters: a lone combining mark, a combining grapheme
+        // joiner, a lone variation selector.
+        characters.extend(['\u{301}', '\u{34f}', '\u{fe0f}']);
+        for character in characters {
+            let text = format!("{character}x");
+            let len = character.len_utf8();
+            assert_eq!(
+                units(text.as_bytes()),
+                vec![(0, DisplayUnit::Glyphless { len }), (len, grapheme(1, 1))],
+                "U+{:04X}",
+                u32::from(character)
+            );
+            assert_eq!(unit_width(&DisplayUnit::Glyphless { len }, 0, 8), 1);
+        }
+    }
+
+    #[test]
+    fn format_characters_inside_a_cluster_are_not_shown() {
+        // ZWNJ and ZWJ join the letter before them into one cluster.
+        assert_eq!(units("a\u{200c}".as_bytes()), vec![(0, grapheme(4, 1))]);
+        assert_eq!(grapheme_text("a\u{200c}"), "a");
+        assert_eq!(grapheme_text("a\u{200d}"), "a");
+        assert_eq!(grapheme_text("e\u{301}"), "e\u{301}");
+        // Emoji sequences need their joiners and tags.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(
+            units(family.as_bytes()),
+            vec![(0, grapheme(family.len(), 2))]
+        );
+        assert_eq!(grapheme_text(family), family);
     }
 
     #[test]
@@ -238,7 +356,7 @@ mod tests {
         for (offset, unit) in display_units(input) {
             assert_eq!(offset, expected_offset);
             expected_offset += match unit {
-                DisplayUnit::Grapheme { len, .. } => len,
+                DisplayUnit::Grapheme { len, .. } | DisplayUnit::Glyphless { len } => len,
                 DisplayUnit::C1(_) => 2,
                 _ => 1,
             };

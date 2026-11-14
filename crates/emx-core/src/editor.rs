@@ -21,6 +21,21 @@ use crate::window::{
 };
 
 const SCRATCH_BUFFER: &str = "*scratch*";
+/// The one terminal frame of `emx --no-server`, like `emacs -nw`'s.
+const NO_SERVER_FRAME: u64 = 1;
+/// A daemon's own frame is F1, so `emacsclient -t` frames start at F2.
+const FIRST_SERVER_FRAME: u64 = 2;
+
+/// How clients reach the editor, which decides how their terminal frames
+/// are named on the modeline, as Emacs names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Session {
+    /// `emx --no-server`: one terminal frame, F1, as `emacs -nw` has.
+    NoServer,
+    /// The session server: each terminal client is a frame like one from
+    /// `emacsclient -t`, shown with `@` and numbered in attach order.
+    Server,
+}
 const PASTE_COMMAND: &str = "xterm-paste";
 /// How Emacs describes a bracketed-paste event in a key sequence.
 const PASTE_EVENT_DESCRIPTION: &str = "<xterm-paste>";
@@ -112,6 +127,8 @@ struct Client {
     cols: u16,
     rows: u16,
     kind: ClientKind,
+    /// The `F<n>` frame name; only terminal clients have frames.
+    frame_number: Option<u64>,
     frame: Frame,
     /// The last grid sent, which the next frame is diffed against; `None`
     /// sends the next frame whole.
@@ -167,11 +184,19 @@ pub struct Editor {
     /// The one grace timer that may shut the daemon down; earlier ones were
     /// superseded by a later detach or cancelled by an attach.
     grace_timer: Option<TimerId>,
+    session: Session,
+    next_frame_number: u64,
 }
 
 impl Editor {
-    /// Fails when the `[keys]` overrides are invalid.
+    /// An editor for `--no-server` use. Fails when the `[keys]` overrides
+    /// are invalid.
     pub fn new(config: Config) -> Result<Editor, ConfigError> {
+        Editor::with_session(config, Session::NoServer)
+    }
+
+    /// Fails when the `[keys]` overrides are invalid.
+    pub fn with_session(config: Config, session: Session) -> Result<Editor, ConfigError> {
         let mut keymap = Keymap::emacs_default();
         keymap.apply_overrides(&config.keys)?;
         let kill_ring_max =
@@ -187,6 +212,8 @@ impl Editor {
             timers: HashMap::new(),
             next_timer: 0,
             grace_timer: None,
+            session,
+            next_frame_number: FIRST_SERVER_FRAME,
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -327,6 +354,15 @@ impl Editor {
             "the server attaches each client id once"
         );
         self.grace_timer = None;
+        let frame_number = match (kind, self.session) {
+            (ClientKind::Cli, _) => None,
+            (ClientKind::Tui, Session::NoServer) => Some(NO_SERVER_FRAME),
+            (ClientKind::Tui, Session::Server) => {
+                let number = self.next_frame_number;
+                self.next_frame_number += 1;
+                Some(number)
+            }
+        };
         let buffer_id = self.scratch;
         let buffer = &mut self.buffers[buffer_id];
         let window = Window {
@@ -342,6 +378,7 @@ impl Editor {
                 cols,
                 rows,
                 kind,
+                frame_number,
                 frame: Frame::new(window),
                 grid: None,
                 recenter_last_op: None,
@@ -666,6 +703,17 @@ impl Editor {
 
     pub(crate) fn frame(&self, client_id: ClientId) -> &Frame {
         &self.client(client_id).frame
+    }
+
+    /// The client's frame number, and whether its modeline marks it as a
+    /// client frame (Emacs `mode-line-client`). Only terminal clients have
+    /// frames to render.
+    pub(crate) fn frame_name(&self, client_id: ClientId) -> (u64, bool) {
+        let number = self
+            .client(client_id)
+            .frame_number
+            .expect("only terminal clients are rendered");
+        (number, self.session == Session::Server)
     }
 
     pub(crate) fn tab_width(&self) -> usize {

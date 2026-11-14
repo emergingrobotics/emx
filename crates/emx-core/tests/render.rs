@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use emx_core::testing::Harness;
-use emx_core::{ClientId, Config, Event, PrefetchRequest, render};
+use emx_core::{ClientId, Config, Event, PrefetchRequest, Session, render};
 use emx_proto::{ClientKind, ServerMsg};
 use emx_text::{BLOCK_SIZE, BlockCache, LineIndex, Sources, Text, index_file};
 use emx_types::{Face, parse_kbd};
@@ -61,8 +61,8 @@ fn render_basic_screen() {
             padded("world", 20),
             padded("", 20),
             padded("", 20),
-            // format-mode-line in a 20-column Emacs frame, cut at the edge.
-            "-UUU:---  *scratch* ".to_string(),
+            // emacs -nw -Q in a 20-column terminal, cut at the edge.
+            "-UUU:---  F1  *scrat".to_string(),
             padded("", 20),
         ]
     );
@@ -74,31 +74,72 @@ fn render_basic_screen() {
 }
 
 #[test]
-fn modeline_matches_emacs_format_mode_line() {
-    // `format-mode-line' of the default `mode-line-format' in an 80-column
-    // `emacs -nw -Q' frame, with `mode-line-frame-identification' "  ".
-    let mut harness = Harness::with_text("|hello\nworld");
-    harness.keys("C-f C-b");
-    assert_eq!(
-        harness.screen()[22],
-        modeline("-UUU:---  *scratch*      All L1     (Fundamental) ", 80)
-    );
-    harness.keys("x");
-    assert_eq!(
-        harness.screen()[22],
-        modeline("-UUU:**-  *scratch*      All L1     (Fundamental) ", 80)
-    );
-    harness.buffer_mut().read_only = true;
+fn modeline_matches_the_emacs_nw_screen() {
+    // The modeline row of `emacs -nw -Q` in a UTF-8 tmux terminal of each
+    // width, for the same buffer and keys.
+    for cols in [40, 80, 120] {
+        let mut harness = Harness::with_text("|hello\nworld");
+        harness.resize(cols, 24);
+        let width = usize::from(cols);
+        let modeline = |harness: &Harness| harness.screen()[22].clone();
+        let expected = |prefix: &str| {
+            let mut line = format!("{prefix:-<width$}");
+            line.truncate(width);
+            line
+        };
+        assert_eq!(
+            modeline(&harness),
+            expected("-UUU:---  F1  *scratch*      All   L1     (Fundamental) ")
+        );
+        harness.keys("x");
+        assert_eq!(
+            modeline(&harness),
+            expected("-UUU:**-  F1  *scratch*      All   L1     (Fundamental) ")
+        );
+        harness.buffer_mut().read_only = true;
+        harness.keys("C-f");
+        assert_eq!(
+            modeline(&harness),
+            expected("-UUU:%*-  F1  *scratch*      All   L1     (Fundamental) ")
+        );
+        harness.buffer_mut().set_unmodified();
+        harness.keys("C-n");
+        assert_eq!(
+            modeline(&harness),
+            expected("-UUU:%%-  F1  *scratch*      All   L2     (Fundamental) ")
+        );
+    }
+}
+
+#[test]
+fn server_client_frames_show_at_and_their_frame_number() {
+    // emacsclient -t frames of a daemon, as `emacs --daemon' and two
+    // `emacsclient -t' in tmux show them.
+    let mut harness = Harness::with_session(Config::default(), Session::Server);
     harness.keys("C-f");
     assert_eq!(
         harness.screen()[22],
-        modeline("-UUU:%*-  *scratch*      All L1     (Fundamental) ", 80)
+        modeline(
+            "-UUU:@---  F2  *scratch*      All   L1     (Fundamental) ",
+            80
+        )
     );
-    harness.buffer_mut().set_unmodified();
-    harness.keys("C-n");
+    let second = ClientId(2);
+    harness.handle(Event::ClientAttached {
+        client: second,
+        cols: 80,
+        rows: 24,
+        kind: ClientKind::Tui,
+    });
+    harness.handle(Event::Key(second, parse_kbd("x").expect("valid kbd")[0]));
+    let (grid, _) = render(harness.editor(), second);
+    let row: String = grid.row(22).iter().map(|cell| cell.text.as_str()).collect();
     assert_eq!(
-        harness.screen()[22],
-        modeline("-UUU:%%-  *scratch*      All L2     (Fundamental) ", 80)
+        row,
+        modeline(
+            "-UUU:@**-  F3  *scratch*      All   L1     (Fundamental) ",
+            80
+        )
     );
 }
 
@@ -114,7 +155,7 @@ fn modeline_position_follows_emacs_percent_rules() {
     assert_eq!(
         harness.screen()[10],
         modeline(
-            "-UUU:---  a-very-long-buffer-name.txt   Top L1     (Fundamental) ",
+            "-UUU:---  F1  a-very-long-buffer-name.txt   Top   L1     (Fundamental) ",
             80
         )
     );
@@ -123,7 +164,7 @@ fn modeline_position_follows_emacs_percent_rules() {
     assert_eq!(
         harness.screen()[10],
         modeline(
-            "-UUU:---  a-very-long-buffer-name.txt    8% L9     (Fundamental) ",
+            "-UUU:---  F1  a-very-long-buffer-name.txt    8%   L9     (Fundamental) ",
             80
         )
     );
@@ -131,7 +172,42 @@ fn modeline_position_follows_emacs_percent_rules() {
     assert_eq!(
         harness.screen()[10],
         modeline(
-            "-UUU:---  a-very-long-buffer-name.txt   Bot L101   (Fundamental) ",
+            "-UUU:---  F1  a-very-long-buffer-name.txt   Bot   L101   (Fundamental) ",
+            80
+        )
+    );
+}
+
+#[test]
+fn modeline_at_other_widths_and_wide_line_numbers() {
+    let mut text = String::from("|");
+    for line in 0..100 {
+        text.push_str(&format!("line {line}\n"));
+    }
+    let mut harness = sized(40, 10, &text);
+    harness.buffer_mut().name = "a-very-long-buffer-name.txt".to_string();
+    harness.keys("C-v");
+    assert_eq!(
+        harness.screen()[10],
+        "-UUU:---  F1  a-very-long-buffer-name.tx"
+    );
+    harness.resize(120, 12);
+    harness.keys("M->");
+    assert_eq!(
+        harness.screen()[10],
+        modeline(
+            "-UUU:---  F1  a-very-long-buffer-name.txt   Bot   L101   (Fundamental) ",
+            120
+        )
+    );
+    // A line number wider than its min-width gets one more blank on a
+    // terminal, as emacs -nw shows after M-> in 15000 lines.
+    let mut harness = sized(80, 10, &format!("|{}", "x\n".repeat(15_000)));
+    harness.keys("M->");
+    assert_eq!(
+        harness.screen()[10],
+        modeline(
+            "-UUU:---  F1  *scratch*      Bot   L15001   (Fundamental) ",
             80
         )
     );
@@ -151,7 +227,10 @@ fn modeline_shows_unknown_line_number() {
     assert_eq!(screen[0].trim_end(), "one");
     assert_eq!(
         screen[22],
-        modeline("-UUU:---  *scratch*      All L?     (Fundamental) ", 80)
+        modeline(
+            "-UUU:---  F1  *scratch*      All   L?     (Fundamental) ",
+            80
+        )
     );
 }
 
@@ -180,7 +259,8 @@ fn wrap_with_backslash() {
     ];
     assert_eq!(&screen[..14], &expected);
     let grid = harness.grid();
-    assert_eq!(grid.row(0)[9].face, Face::EscapeGlyph);
+    // emacs -nw draws the continuation glyph in the default face.
+    assert_eq!(grid.row(0)[9].face, Face::Default);
     assert_eq!(grid.row(4)[8].text, "\\");
     assert_eq!(grid.row(5)[0].width, 2);
     assert_eq!(grid.row(5)[1].width, 0);
@@ -247,7 +327,7 @@ fn region_uses_region_face_extended_to_the_edge() {
     assert!(faces(1).iter().all(|face| *face == Face::Region));
     let mut third = vec![Face::Default; 10];
     third[..4].fill(Face::Region);
-    third[9] = Face::EscapeGlyph;
+
     assert_eq!(faces(2), third);
     assert_eq!(harness.cursor(), Some((4, 2)));
 }
@@ -567,4 +647,42 @@ fn notcached_block_requests_prefetch() {
 
     harness.keys("C-n");
     assert!(harness.take_prefetches().is_empty());
+}
+
+#[test]
+fn zero_width_and_format_characters_render_as_one_blank() {
+    let mut characters: Vec<char> = vec!['\u{200b}', '\u{feff}', '\u{2028}', '\u{2029}'];
+    characters.extend('\u{200c}'..='\u{200f}');
+    characters.extend('\u{202a}'..='\u{202e}');
+    characters.extend('\u{2060}'..='\u{2064}');
+    characters.extend('\u{2066}'..='\u{2069}');
+    characters.extend([
+        '\u{ad}',
+        '\u{61c}',
+        '\u{fff9}',
+        '\u{e0001}',
+        '\u{301}',
+        '\u{34f}',
+    ]);
+    for character in characters {
+        let mut harness = Harness::with_text(&format!("|{character}x"));
+        harness.keys("C-f");
+        let grid = harness.grid();
+        let label = format!("U+{:04X}", u32::from(character));
+        assert_eq!(grid.row(0)[0].text, " ", "{label}");
+        assert_eq!(grid.row(0)[0].face, Face::Default, "{label}");
+        assert_eq!(grid.row(0)[1].text, "x", "{label}");
+        assert_eq!(harness.cursor(), Some((1, 0)), "{label}: no cursor drift");
+        assert!(
+            grid.cells.iter().all(|cell| !cell.text.contains(character)),
+            "{label} reached a cell raw"
+        );
+    }
+    // A non-joiner after a letter joins its cluster but is not sent.
+    let mut harness = Harness::with_text("|a\u{200c}b");
+    harness.keys("C-e");
+    let grid = harness.grid();
+    assert_eq!(grid.row(0)[0].text, "a");
+    assert_eq!(grid.row(0)[1].text, "b");
+    assert_eq!(harness.cursor(), Some((2, 0)));
 }
