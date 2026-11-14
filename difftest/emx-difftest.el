@@ -156,10 +156,19 @@ Buffers and windows an earlier case made are removed."
                 (emx-difftest--parse-text (gethash "text" case)))
                (error-message nil))
     (emx-difftest--fresh-buffer content point mark)
-    (condition-case failure
-        (execute-kbd-macro (kbd keys))
-      ((error quit)
-       (setq error-message (error-message-string failure))))
+    ;; File commands (`find-file', `save-buffer', `write-file') must act in
+    ;; a private, empty directory so they neither read nor overwrite another
+    ;; case's files nor the repository, and so each side of the differential
+    ;; starts from an identical empty directory. emx's harness does the same.
+    (let ((case-directory (file-name-as-directory
+                           (make-temp-file "emx-difftest-case-" t))))
+      (setq default-directory case-directory)
+      (unwind-protect
+          (condition-case failure
+              (execute-kbd-macro (kbd keys))
+            ((error quit)
+             (setq error-message (error-message-string failure))))
+        (delete-directory (directory-file-name case-directory) t)))
     (let ((mark-position (mark t)))
       `((name . ,name)
         (text . ,(buffer-substring-no-properties (point-min) (point-max)))

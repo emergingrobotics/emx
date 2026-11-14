@@ -1,0 +1,10 @@
+{"name": "find-file-new-is-empty", "text": "|scratch", "keys": "C-x C-f f o o RET", "tier": 1}
+{"name": "find-file-new-then-type", "text": "|scratch", "keys": "C-x C-f f o o RET x y z", "tier": 1}
+{"name": "find-file-two-files", "text": "|scratch", "keys": "C-x C-f f o o RET a C-x C-f b a r RET b", "tier": 1}
+{"name": "save-buffer-clears-modified", "text": "|scratch", "keys": "C-x C-f f o o RET x y z C-x C-s", "tier": 1}
+{"name": "save-buffer-new-unmodified-writes", "text": "|scratch", "keys": "C-x C-f f o o RET C-x C-s", "tier": 1}
+{"name": "save-buffer-no-changes", "text": "|scratch", "keys": "C-x C-f f o o RET x C-x C-s C-x C-s", "tier": 1}
+{"name": "save-buffer-edit-save-again", "text": "|scratch", "keys": "C-x C-f f o o RET x C-x C-s y C-x C-s", "tier": 1}
+{"name": "write-file-clears-modified", "text": "a|bc", "keys": "C-x C-w b a z RET", "tier": 1}
+{"name": "write-file-then-edit", "text": "a|bc", "keys": "C-x C-w q u x RET d", "tier": 1}
+{"name": "write-file-then-save", "text": "a|bc", "keys": "C-x C-w q u x RET d C-x C-s", "tier": 1}

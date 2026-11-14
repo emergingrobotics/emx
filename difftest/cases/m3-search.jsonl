@@ -70,3 +70,6 @@
 {"name": "occur-multi-line-match", "text": "|ab\ncd\nab\n", "keys": "M-s o b C-q C-j c RET C-x o", "tier": 1}
 {"name": "occur-case-fold", "text": "|Foo\nfoo\nFOO\n", "keys": "M-s o f o o RET C-x o", "tier": 1}
 {"name": "occur-no-occurrence-line", "text": "|foo\n", "keys": "M-s o f o o RET C-x o RET", "tier": 1}
+{"name": "isearch-backward-regexp-digit", "text": "a1 b2 c3|", "keys": "C-M-r [ 0 - 9 ] RET", "tier": 1}
+{"name": "isearch-backward-regexp-repeat", "text": "foo1 foo2 foo3|", "keys": "C-M-r f o o C-M-r RET", "tier": 1}
+{"name": "isearch-backward-regexp-word", "text": "cat dog cat|", "keys": "C-M-r c a t RET", "tier": 1}

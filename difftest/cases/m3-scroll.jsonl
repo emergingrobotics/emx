@@ -1,0 +1,9 @@
+{"name": "scroll-up-small-buffer-errors", "text": "|abc\ndef\nghi", "keys": "C-v", "tier": 1}
+{"name": "scroll-up-count-moves-point", "text": "|abc\ndef\nghi", "keys": "C-u 2 C-v", "tier": 1}
+{"name": "scroll-up-at-eob-errors", "text": "abc\ndef\ngh|i", "keys": "C-v", "tier": 1}
+{"name": "scroll-down-small-buffer-errors", "text": "|abc\ndef\nghi", "keys": "M-v", "tier": 1}
+{"name": "scroll-down-at-eob-errors", "text": "abc\ndef\nghi|", "keys": "M-v", "tier": 1}
+{"name": "scroll-down-count-errors", "text": "a\nb\nc\nd\ne|", "keys": "C-u 2 M-v", "tier": 1}
+{"name": "recenter-plain", "text": "a|bc\ndef", "keys": "C-l", "tier": 1}
+{"name": "recenter-cycle", "text": "a|bc\ndef", "keys": "C-l C-l C-l", "tier": 1}
+{"name": "recenter-argument", "text": "a|bc\ndef", "keys": "C-u C-l", "tier": 1}

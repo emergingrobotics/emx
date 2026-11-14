@@ -162,7 +162,13 @@ fn run_emacs(root: &Path, file: &Path) -> Vec<EmacsResult> {
 /// Feeds the keys one at a time; like a keyboard macro in Emacs, the run
 /// stops at the first command that signals an error.
 fn run_emx(case: &Case) -> Outcome {
+    // File commands act in a private, empty directory, as the Emacs side of
+    // the differential does, so each case neither reads nor overwrites
+    // another case's files nor the repository. The directory is removed when
+    // `directory` is dropped at the end of the case.
+    let directory = tempfile::tempdir().expect("temporary directory for the case");
     let mut harness = Harness::with_text(&case.text);
+    harness.set_default_directory(directory.path());
     let keys = parse_kbd(&case.keys)
         .unwrap_or_else(|error| panic!("{}: invalid keys {:?}: {error}", case.name, case.keys));
     let mut error = None;

@@ -1,0 +1,12 @@
+{"name": "undo-underscore-twice-errors", "text": "a|bc", "keys": "x y C-_ C-_", "tier": 1}
+{"name": "undo-underscore-single-insert", "text": "|ab", "keys": "z C-_", "tier": 1}
+{"name": "undo-cx-u-twice-errors", "text": "a|bc", "keys": "x y C-x u C-x u", "tier": 1}
+{"name": "undo-cx-u-after-redo", "text": "a|bc", "keys": "x C-/ C-x u", "tier": 1}
+{"name": "undo-redo-question-twice-errors", "text": "a|b", "keys": "x y C-/ C-/ C-? C-?", "tier": 1}
+{"name": "undo-redo-question-single", "text": "a|b", "keys": "x C-/ C-?", "tier": 1}
+{"name": "undo-redo-cm-underscore-twice-errors", "text": "a|b", "keys": "x y C-/ C-/ C-M-_ C-M-_", "tier": 1}
+{"name": "undo-redo-cm-underscore-single", "text": "a|b", "keys": "x C-/ C-M-_", "tier": 1}
+{"name": "goto-line-mg-mg-line-3", "text": "|a\nb\nc\nd", "keys": "M-g M-g 3 RET", "tier": 1}
+{"name": "goto-line-mg-mg-line-1", "text": "a\nb\n|c", "keys": "M-g M-g 1 RET", "tier": 1}
+{"name": "macro-call-no-macro-count", "text": "|abc", "keys": "C-u 2 C-x e", "tier": 1}
+{"name": "macro-call-no-macro-twice", "text": "|abc", "keys": "C-x e C-x e", "tier": 1}

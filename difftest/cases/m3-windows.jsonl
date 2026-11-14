@@ -26,3 +26,8 @@
 {"name": "buffer-list-files-only", "text": "|", "keys": "C-x b f o o RET C-x b RET C-u C-x C-b C-x o", "tier": 1}
 {"name": "buffer-list-in-other-window", "text": "|", "keys": "C-x 2 C-x C-b C-x o", "tier": 1}
 {"name": "truncated-window-motion", "text": "|short\nabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\nend\n", "keys": "C-x 3 C-n C-e C-p C-n C-b C-b C-x o C-n C-e", "tier": 1}
+{"name": "delete-window-other-keeps-edit", "text": "a|bc", "keys": "C-x 2 C-x o x C-x 0", "tier": 1}
+{"name": "delete-other-windows-after-splits", "text": "a|bc", "keys": "C-x 2 C-x 3 C-x 1 y", "tier": 1}
+{"name": "delete-other-windows-sole-noop", "text": "a|bc", "keys": "C-x 1 y", "tier": 1}
+{"name": "kill-buffer-current-default", "text": "|a", "keys": "C-x b f o o RET x y C-x k RET", "tier": 1}
+{"name": "kill-buffer-by-name", "text": "|a", "keys": "C-x b f o o RET C-x b b a r RET C-x k f o o RET z", "tier": 1}

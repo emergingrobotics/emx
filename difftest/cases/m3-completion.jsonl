@@ -6,3 +6,6 @@
 {"name": "yank-from-kill-ring-empty", "text": "a|bc", "keys": "M-y", "tier": 1}
 {"name": "execute-extended-command-prefix-argument", "text": "|abcdef", "keys": "C-u 3 M-x f o r w a r d - c h a r C-j", "tier": 1}
 {"name": "execute-extended-command-kill-line", "text": "a|bc\nd", "keys": "M-x k i l l - l i n e C-j C-y C-y", "tier": 1}
+{"name": "execute-extended-command-forward-word", "text": "|one two", "keys": "M-x f o r w a r d - w o r d C-j", "tier": 1}
+{"name": "execute-extended-command-upcase-word", "text": "|abc def", "keys": "M-x u p c a s e - w o r d C-j", "tier": 1}
+{"name": "execute-extended-command-end-of-buffer", "text": "|a\nb\nc", "keys": "M-x e n d - o f - b u f f e r C-j", "tier": 1}
