@@ -78,6 +78,9 @@ pub(crate) enum Purpose {
     KillModified {
         buffer: BufferId,
     },
+    KillRecovered {
+        buffer: BufferId,
+    },
     SaveSome {
         session: SaveSession,
         buffer: BufferId,
@@ -482,6 +485,12 @@ impl Editor {
                     Ok(())
                 }
             }
+            (Purpose::KillRecovered { buffer }, Answer::Yes(yes)) => {
+                if yes && self.buffers.contains_key(buffer) {
+                    self.kill_buffer(buffer);
+                }
+                Ok(())
+            }
             (Purpose::SaveSome { session, buffer }, Answer::Key(key)) => {
                 self.answer_save_some(client, session, buffer, key)
             }
@@ -740,6 +749,14 @@ impl Editor {
                 mode,
                 Purpose::KillModified { buffer },
             );
+            return Ok(());
+        }
+        if target.recovered && target.file.is_none() && target.is_modified() {
+            let question = format!(
+                "Buffer {} holds recovered text saved nowhere else; kill anyway? ",
+                target.name
+            );
+            self.yes_or_no_p(client, question, Purpose::KillRecovered { buffer });
             return Ok(());
         }
         self.kill_buffer(buffer);
@@ -1387,6 +1404,7 @@ impl Editor {
         }
         let target = &mut self.buffers[buffer];
         let base = target.text.clone();
+        target.recovered = false;
         if target.auto_saved_since_save {
             target.auto_saved_since_save = false;
             self.effects.push(Effect::RemoveAutoSave { file: path });
@@ -1822,6 +1840,8 @@ impl Editor {
         let target = &mut self.buffers[buffer];
         target.text = Text::from_original(Sources::memory(content.into()));
         target.read_only = true;
+        target.recovered = true;
+        target.mark_modified();
         let header = self.journal_header(buffer);
         let base = self.buffers[buffer].text.clone();
         match journal {
@@ -1831,6 +1851,7 @@ impl Editor {
                 self.journal_outbox.open(buffer);
             }
         }
+        self.journal_outbox.mark_rescue(buffer);
         buffer
     }
 
@@ -1859,8 +1880,15 @@ impl Editor {
                         saving: false,
                     });
                     target.mark_modified();
+                    // Without a file, the journal is the only copy; one with
+                    // a file is offered for saving like any modified buffer.
+                    let rescue = target.file.is_none();
+                    target.recovered = rescue;
                     let header = self.journal_header(buffer);
                     self.journal_outbox.adopt(buffer, journal, header, text);
+                    if rescue {
+                        self.journal_outbox.mark_rescue(buffer);
+                    }
                     if needs_index {
                         self.effects.push(Effect::StartIndex { buffer });
                     }

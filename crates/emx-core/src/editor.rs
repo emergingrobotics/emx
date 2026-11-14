@@ -14,7 +14,7 @@ use crate::buffer::{Buffer, BufferId, ChangeRecorder};
 use crate::command::{self, CommandContext, CommandError, PrefixArg, RecenterPosition};
 use crate::config::{Config, ConfigError};
 use crate::event::{ClientId, Effect, Event, TimerId};
-use crate::journal::JournalOutbox;
+use crate::journal::{JournalId, JournalOutbox};
 use crate::keymap::{Keymap, Lookup, describe_keys, universal_argument_binding};
 use crate::killring::KillRing;
 use crate::marker::InsertionType;
@@ -360,11 +360,38 @@ impl Editor {
     }
 
     /// A buffer visiting a file has edits not yet saved. Like Emacs on exit,
-    /// buffers without a file do not count.
+    /// buffers without a file do not count, except ones holding recovered
+    /// text that exists nowhere else.
     pub fn has_unsaved(&self) -> bool {
         self.buffers
             .values()
-            .any(|buffer| buffer.file.is_some() && buffer.is_modified())
+            .any(|buffer| (buffer.file.is_some() || buffer.recovered) && buffer.is_modified())
+    }
+
+    /// The journal writer failed to write `journal` (Task 13's journal thread
+    /// reports it): the writer refuses that journal's records until a new
+    /// epoch, so one starts from the buffer's current text, and every client
+    /// is told its edits were briefly unprotected.
+    pub fn journal_write_failed(&mut self, journal: JournalId, reason: &str) {
+        let Some(buffer) = self.journal_outbox.buffer_of(journal) else {
+            return;
+        };
+        let target = &self.buffers[buffer];
+        let message = format!(
+            "Journal write failed for {}; edits are unprotected until it recovers: {reason}",
+            target.name
+        );
+        // A damaged buffer's text reads a corrupt file; a snapshot of it
+        // would only replace good journaled edits with garbage.
+        if !target.damaged {
+            let text = target.text.clone();
+            self.journal_outbox.restart(buffer, text);
+        }
+        let clients: Vec<ClientId> = self.clients.keys().copied().collect();
+        for client in clients {
+            self.set_echo(client, message.clone());
+        }
+        self.flush_journal();
     }
 
     pub fn client_count(&self) -> usize {

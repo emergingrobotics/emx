@@ -80,6 +80,9 @@ pub struct Buffer {
     /// An in-place save failed part way through the file this buffer reads
     /// its unchanged text from: the text is no longer what was visited.
     pub damaged: bool,
+    /// Holds text rescued or recovered from the edit journal that is saved
+    /// nowhere else, so it counts as unsaved work though it visits no file.
+    pub recovered: bool,
     /// Where point was when the buffer last left a window, so showing it
     /// again puts point back, as Emacs's buffer point does.
     pub(crate) last_point: Option<MarkerId>,
@@ -107,6 +110,7 @@ impl Buffer {
             loading: false,
             coding: CodingMnemonic::Utf8,
             damaged: false,
+            recovered: false,
             last_point: None,
             auto_saved_since_save: false,
             markers: SlotMap::with_key(),

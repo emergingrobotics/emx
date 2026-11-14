@@ -7,12 +7,13 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use emx_core::journal::{Header, JournalError};
 use emx_core::journal::{
     JournalEdit, JournalId, JournalOp, JournalWriter, Record, RecoveredBuffer, render_edits,
     replay_dir,
 };
 use emx_core::testing::{Harness, apply_journal, fail_after, write_and_replay, write_journal};
-use emx_core::{Config, Event};
+use emx_core::{Config, Event, Session};
 use emx_text::{FileIdentity, Original};
 use proptest::prelude::*;
 
@@ -942,4 +943,232 @@ proptest! {
         actions.push(Action::Type("q".to_string()));
         run_replay_equals_live_buffer(initial.into_bytes(), actions, identity_bases, cut)?;
     }
+}
+
+/// Replays a journal whose base file changed: the edits come back only as
+/// a `*recovered: big.txt*` listing. Returns the replay and the journal id.
+fn recover_edits_only(directory: &Path) -> (Vec<RecoveredBuffer>, JournalId) {
+    let path = directory.join("big.txt");
+    write_file(&path, &big_content());
+    let mut harness = harness_in(identity_config(), directory);
+    visit(&mut harness, &path);
+    harness.type_text("typed");
+    let ops = harness.journal_ops();
+    let id = journal_id(&ops);
+    let journal = directory.join(JOURNAL_DIRECTORY);
+    // kill -9: the journal is all that is left.
+    write_journal(&journal, ops).expect("write journal");
+    write_file(&path, b"rewritten by an agent\n");
+    let recovered = replay_dir(&journal, &identity_config()).expect("replay");
+    assert!(
+        matches!(recovered.as_slice(), [RecoveredBuffer::EditsOnly { .. }]),
+        "{recovered:?}"
+    );
+    (recovered, id)
+}
+
+#[test]
+fn rescued_text_keeps_the_daemon_and_its_journal() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (recovered, id) = recover_edits_only(directory.path());
+    let journal = directory.path().join(JOURNAL_DIRECTORY);
+    let mut writer = JournalWriter::new(&journal).expect("writer");
+    let mut session = Harness::with_session(Config::default(), Session::Server);
+    session.handle(Event::Recovered(recovered));
+    assert!(session.editor().has_unsaved());
+    let client = session.client();
+    session.handle(Event::ClientDetached(client));
+    session.fire_timers();
+    assert!(
+        !session.shutdown_requested(),
+        "rescued text keeps the daemon"
+    );
+    apply_journal(&mut writer, session.journal_ops()).expect("write journal");
+    assert_eq!(only_journal_file(&journal), journal.join(id.file_name()));
+    let again = replay_dir(&journal, &Config::default()).expect("replay");
+    assert_eq!(rebuilt(&again).0, "*recovered: big.txt*");
+}
+
+#[test]
+fn exit_asks_about_rescued_text_and_keeps_its_journal() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (recovered, id) = recover_edits_only(directory.path());
+    let journal = directory.path().join(JOURNAL_DIRECTORY);
+    let mut writer = JournalWriter::new(&journal).expect("writer");
+    let mut session = Harness::new();
+    session.handle(Event::Recovered(recovered));
+    session.keys("C-x C-c");
+    assert_eq!(
+        session.echo_line(),
+        "Modified buffers exist; exit anyway? (yes or no) "
+    );
+    assert!(!session.shutdown_requested());
+    session.type_text("yes");
+    session.keys("RET");
+    assert!(session.shutdown_requested());
+    let ops = session.journal_ops();
+    assert!(
+        !ops.contains(&JournalOp::Close { buffer: id }),
+        "the rescued text's journal is never closed at exit: {ops:?}"
+    );
+    apply_journal(&mut writer, ops).expect("write journal");
+    assert_eq!(only_journal_file(&journal), journal.join(id.file_name()));
+}
+
+#[test]
+fn killing_rescued_text_asks_then_deletes_its_journal() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (recovered, _) = recover_edits_only(directory.path());
+    let journal = directory.path().join(JOURNAL_DIRECTORY);
+    let mut writer = JournalWriter::new(&journal).expect("writer");
+    let mut session = Harness::new();
+    session.handle(Event::Recovered(recovered));
+    session.keys("C-x k");
+    session.type_text("*recovered: big.txt*");
+    session.keys("RET");
+    assert_eq!(
+        session.echo_line(),
+        "Buffer *recovered: big.txt* holds recovered text saved nowhere else; kill anyway? (yes or no) "
+    );
+    session.type_text("yes");
+    session.keys("RET");
+    assert!(
+        session
+            .editor()
+            .find_buffer("*recovered: big.txt*")
+            .is_none()
+    );
+    apply_journal(&mut writer, session.journal_ops()).expect("write journal");
+    assert_eq!(journal_files(&journal), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn saving_rescued_text_to_a_file_ends_its_journal() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (recovered, _) = recover_edits_only(directory.path());
+    let journal = directory.path().join(JOURNAL_DIRECTORY);
+    let mut writer = JournalWriter::new(&journal).expect("writer");
+    let mut session = harness_in(Config::default(), directory.path());
+    session.handle(Event::Recovered(recovered));
+    session.keys("C-x k");
+    session.type_text("*scratch*");
+    session.keys("RET");
+    // The recovered buffer is shown in place of the killed *scratch*.
+    assert_eq!(session.buffer().name, "*recovered: big.txt*");
+    let saved = directory.path().join("rescued.txt");
+    session.keys("C-x C-w C-a C-k");
+    session.type_text(saved.to_str().expect("utf-8"));
+    session.keys("RET");
+    assert!(!session.editor().has_unsaved());
+    apply_journal(&mut writer, session.journal_ops()).expect("write journal");
+    assert_eq!(journal_files(&journal), Vec::<PathBuf>::new());
+    assert!(
+        String::from_utf8(fs::read(&saved).expect("read"))
+            .expect("utf-8")
+            .contains("insert at 0, 1 bytes:\nt\n")
+    );
+}
+
+#[test]
+fn zero_filled_tail_ends_the_journal() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    write_file(&path, b"base\n");
+    let mut harness = harness_in(Config::default(), directory.path());
+    visit(&mut harness, &path);
+    harness.type_text("ab");
+    let ops = harness.journal_ops();
+    let id = journal_id(&ops);
+    let journal = directory.path().join(JOURNAL_DIRECTORY);
+    write_journal(&journal, ops).expect("write journal");
+    let file = only_journal_file(&journal);
+    let good = fs::read(&file).expect("read journal");
+    let mut zeroed = good.clone();
+    zeroed.extend(std::iter::repeat_n(0u8, 4096));
+    fs::write(&file, &zeroed).expect("append zeros");
+    let recovered = replay_dir(&journal, &Config::default()).expect("replay");
+    assert_eq!(rebuilt(&recovered).3, b"abbase\n");
+
+    write_journal(
+        &journal,
+        vec![
+            JournalOp::Open {
+                buffer: id,
+                header: Header {
+                    path: Some(path.clone()),
+                    name: "a.txt".to_string(),
+                },
+            },
+            JournalOp::Record {
+                buffer: id,
+                record: Record::Insert {
+                    at: 2,
+                    bytes: b"c".to_vec(),
+                },
+            },
+        ],
+    )
+    .expect("reopen and append");
+    let reopened = fs::read(&file).expect("read journal");
+    assert_eq!(
+        &reopened[..good.len()],
+        good.as_slice(),
+        "the zeros are cut"
+    );
+    assert!(reopened.len() < good.len() + 4096, "the zeros are cut");
+    let recovered = replay_dir(&journal, &Config::default()).expect("replay");
+    assert_eq!(rebuilt(&recovered).3, b"abcbase\n");
+}
+
+#[test]
+fn failed_write_poisons_the_journal_until_a_new_epoch() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("big.log");
+    let content: Vec<u8> = (0..200_000u32)
+        .map(|index| b'a' + (index % 26) as u8)
+        .collect();
+    write_file(&path, &content);
+    let config = Config {
+        in_memory_max: 1024,
+        ..Config::default()
+    };
+    let mut harness = harness_in(config.clone(), directory.path());
+    visit(&mut harness, &path);
+    harness.type_text("a");
+    let ops = harness.journal_ops();
+    let id = journal_id(&ops);
+    let journal = directory.path().join(JOURNAL_DIRECTORY);
+    let mut writer = JournalWriter::new(&journal).expect("writer");
+    // The snapshot cannot be read: the file was truncated under the buffer.
+    write_file(&path, b"");
+    let mut results = ops.into_iter().map(|op| writer.apply(op));
+    assert!(results.next().expect("open").is_ok());
+    assert!(matches!(
+        results.next().expect("snapshot"),
+        Err(JournalError::Write { .. })
+    ));
+    assert!(matches!(
+        results.next().expect("insert"),
+        Err(JournalError::Poisoned { journal }) if journal == id
+    ));
+    drop(results);
+    harness.type_text("b");
+    for op in harness.journal_ops() {
+        assert!(
+            matches!(writer.apply(op), Err(JournalError::Poisoned { .. })),
+            "no record lands after the gap"
+        );
+    }
+
+    write_file(&path, &content);
+    harness.journal_write_failed(id, "Read error");
+    assert_eq!(
+        harness.echo(),
+        "Journal write failed for big.log; edits are unprotected until it recovers: Read error"
+    );
+    harness.type_text("c");
+    apply_journal(&mut writer, harness.journal_ops()).expect("restarted journal");
+    let recovered = replay_dir(&journal, &config).expect("replay");
+    assert_eq!(rebuilt(&recovered).3, harness.text().as_bytes());
+    assert!(harness.text().starts_with("abc"));
 }

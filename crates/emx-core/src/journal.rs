@@ -6,7 +6,7 @@
 //! `MAGIC`, followed by records, each framed as
 //!
 //! ```text
-//! u32 LE payload length | u32 LE CRC-32 of the payload | payload
+//! u32 LE payload length | u32 LE CRC-32 of (length bytes, payload) | payload
 //! ```
 //!
 //! and each payload is a kind byte followed by little-endian fields:
@@ -23,8 +23,10 @@
 //!
 //! A journal is a sequence of epochs; each starts with a base (a snapshot
 //! of the text, or the identity of the file the text reads) followed by
-//! byte-offset edits. Replay stops at the first frame that is cut short or
-//! fails its CRC, which is what a write torn by a crash leaves.
+//! byte-offset edits. Replay stops at the first frame that is cut short,
+//! fails its CRC, or has length zero (every payload has a kind byte; a tail
+//! of zeros is what power loss often leaves), which is what a write torn by
+//! a crash leaves.
 
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
@@ -42,7 +44,7 @@ use crate::io;
 
 /// Identifies the format and its version; a journal from a different
 /// version is reported unreadable rather than misread.
-const MAGIC: &[u8; 8] = b"EMXJNL\x00\x01";
+const MAGIC: &[u8; 8] = b"EMXJNL\x00\x02";
 const LENGTH_BYTES: usize = 4;
 const CRC_BYTES: usize = 4;
 const FRAME_HEADER_BYTES: usize = LENGTH_BYTES + CRC_BYTES;
@@ -331,6 +333,17 @@ pub enum JournalError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("writing journal {}: {source}", .path.display())]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("journal {} is not open", .journal.file_name())]
+    NotOpen { journal: JournalId },
+    /// An earlier write to this journal failed: what follows would leave a
+    /// gap, so records are refused until a new epoch restarts it.
+    #[error("journal {} lost a write; waiting for a new epoch", .journal.file_name())]
+    Poisoned { journal: JournalId },
 }
 
 /// The name of the read-only buffer that lists a buffer's edits.
@@ -385,9 +398,20 @@ fn push_identity(out: &mut Vec<u8>, identity: &FileIdentity) {
     out.extend_from_slice(&identity.mtime_ns.to_le_bytes());
 }
 
+/// The CRC covers the length too, so a corrupt length is caught instead of
+/// framing the rest of the file wrongly.
+fn frame_crc(length: &[u8], payload: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(length);
+    hasher.update(payload);
+    hasher.finalize()
+}
+
 fn push_frame(out: &mut Vec<u8>, payload: &[u8]) -> std::io::Result<()> {
+    let start = out.len();
     push_length(out, payload.len())?;
-    out.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+    let crc = frame_crc(&out[start..], payload);
+    out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(payload);
     Ok(())
 }
@@ -470,7 +494,8 @@ fn encode(record: &Record) -> std::io::Result<Vec<u8>> {
 // ---- Decoding ------------------------------------------------------------
 
 /// The CRC-valid payloads of a journal, in order, and the offset just past
-/// the last of them. Reading stops at a frame cut short or failing its CRC.
+/// the last of them. Reading stops at a frame cut short, failing its CRC,
+/// or of length zero.
 /// A file that is not a journal at all is an error.
 fn scan(bytes: &[u8]) -> Result<(Vec<&[u8]>, usize), String> {
     if bytes.len() < MAGIC.len() {
@@ -487,22 +512,20 @@ fn scan(bytes: &[u8]) -> Result<(Vec<&[u8]>, usize), String> {
     let mut payloads = Vec::new();
     let mut position = MAGIC.len();
     while bytes.len() - position >= FRAME_HEADER_BYTES {
-        let length = u32::from_le_bytes(
-            bytes[position..position + LENGTH_BYTES]
-                .try_into()
-                .expect("slice of LENGTH_BYTES"),
-        ) as usize;
+        let length_bytes = &bytes[position..position + LENGTH_BYTES];
+        let length =
+            u32::from_le_bytes(length_bytes.try_into().expect("slice of LENGTH_BYTES")) as usize;
         let crc = u32::from_le_bytes(
             bytes[position + LENGTH_BYTES..position + FRAME_HEADER_BYTES]
                 .try_into()
                 .expect("slice of CRC_BYTES"),
         );
         let start = position + FRAME_HEADER_BYTES;
-        if length > bytes.len() - start {
+        if length == 0 || length > bytes.len() - start {
             break;
         }
         let payload = &bytes[start..start + length];
-        if crc32fast::hash(payload) != crc {
+        if frame_crc(length_bytes, payload) != crc {
             break;
         }
         payloads.push(payload);
@@ -617,6 +640,8 @@ struct OpenJournal {
     /// The length of the complete records; a failed append is cut back to
     /// it so later records are not hidden behind a torn one.
     length: u64,
+    /// The last append failed and may have left part of a frame.
+    torn: bool,
 }
 
 /// Applies journal operations to files. It holds no threads: the session
@@ -627,6 +652,8 @@ pub struct JournalWriter {
     journals: HashMap<JournalId, OpenJournal>,
     dirty: BTreeSet<JournalId>,
     directory_dirty: bool,
+    /// Journals whose last write failed; see `JournalError::Poisoned`.
+    poisoned: BTreeSet<JournalId>,
 }
 
 impl JournalWriter {
@@ -640,23 +667,43 @@ impl JournalWriter {
             journals: HashMap::new(),
             dirty: BTreeSet::new(),
             directory_dirty: false,
+            poisoned: BTreeSet::new(),
         })
     }
 
-    pub fn apply(&mut self, op: JournalOp) -> std::io::Result<()> {
+    /// A failure poisons the buffer's journal: its later edit records are
+    /// refused, never written after a gap, until the editor starts a new
+    /// epoch (`Editor::journal_write_failed`). A header may still be
+    /// written; a new epoch clears the poison.
+    pub fn apply(&mut self, op: JournalOp) -> Result<(), JournalError> {
         match op {
-            JournalOp::Open { buffer, header } => {
-                if !self.journals.contains_key(&buffer) {
-                    let journal = self.open_journal(buffer)?;
-                    self.journals.insert(buffer, journal);
+            JournalOp::Open { buffer, header } => self.guarded(buffer, |writer| {
+                if !writer.journals.contains_key(&buffer) {
+                    let journal = writer.open_journal(buffer)?;
+                    writer.journals.insert(buffer, journal);
                 }
-                self.append(buffer, &Record::Header(header))
+                writer.append(buffer, &Record::Header(header))
+            }),
+            JournalOp::Record { buffer, record } => {
+                let epoch = matches!(
+                    record,
+                    Record::EpochSnapshot { .. } | Record::EpochIdentity { .. }
+                );
+                if self.poisoned.contains(&buffer) && !epoch {
+                    return Err(JournalError::Poisoned { journal: buffer });
+                }
+                self.guarded(buffer, |writer| writer.append(buffer, &record))?;
+                if epoch {
+                    self.poisoned.remove(&buffer);
+                }
+                Ok(())
             }
-            JournalOp::Record { buffer, record } => self.append(buffer, &record),
             JournalOp::Close { buffer } => {
                 self.journals.remove(&buffer);
                 self.dirty.remove(&buffer);
-                fs::remove_file(self.directory.join(buffer.file_name()))?;
+                self.poisoned.remove(&buffer);
+                let path = self.journal_path(buffer);
+                fs::remove_file(&path).map_err(|source| JournalError::Write { path, source })?;
                 self.directory_dirty = true;
                 Ok(())
             }
@@ -665,30 +712,63 @@ impl JournalWriter {
 
     /// Makes everything applied so far durable: the journals written to,
     /// and the directory entries created or removed.
-    pub fn flush_and_sync(&mut self) -> std::io::Result<()> {
+    pub fn flush_and_sync(&mut self) -> Result<(), JournalError> {
         for id in std::mem::take(&mut self.dirty) {
             if let Some(journal) = self.journals.get(&id) {
-                journal.file.sync_data()?;
+                journal
+                    .file
+                    .sync_data()
+                    .map_err(|source| JournalError::Write {
+                        path: self.journal_path(id),
+                        source,
+                    })?;
             }
         }
         if self.directory_dirty {
-            File::open(&self.directory)?.sync_all()?;
+            File::open(&self.directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|source| JournalError::Write {
+                    path: self.directory.clone(),
+                    source,
+                })?;
             self.directory_dirty = false;
         }
         Ok(())
     }
 
+    fn journal_path(&self, id: JournalId) -> PathBuf {
+        self.directory.join(id.file_name())
+    }
+
+    /// Runs one write to journal `id`; a failure poisons it.
+    fn guarded(
+        &mut self,
+        id: JournalId,
+        write: impl FnOnce(&mut Self) -> Result<(), JournalError>,
+    ) -> Result<(), JournalError> {
+        let result = write(self);
+        if result.is_err() {
+            self.poisoned.insert(id);
+        }
+        result
+    }
+
     /// Opens the journal for appending. An existing one (a recovered
     /// buffer's) keeps its complete records and loses any torn tail.
-    fn open_journal(&mut self, id: JournalId) -> std::io::Result<OpenJournal> {
-        let path = self.directory.join(id.file_name());
+    fn open_journal(&mut self, id: JournalId) -> Result<OpenJournal, JournalError> {
+        let path = self.journal_path(id);
+        self.open_journal_file(id, &path)
+            .map_err(|source| JournalError::Write { path, source })
+    }
+
+    fn open_journal_file(&mut self, id: JournalId, path: &Path) -> std::io::Result<OpenJournal> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .mode(FILE_MODE)
             .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-            .open(&path)?;
+            .open(path)?;
         let mut existing = Vec::new();
         file.read_to_end(&mut existing)?;
         let (_, end) = scan(&existing).map_err(|reason| {
@@ -706,19 +786,37 @@ impl JournalWriter {
         }
         self.directory_dirty = true;
         self.dirty.insert(id);
-        Ok(OpenJournal { file, length })
+        Ok(OpenJournal {
+            file,
+            length,
+            torn: false,
+        })
     }
 
-    fn append(&mut self, id: JournalId, record: &Record) -> std::io::Result<()> {
-        let frames = encode(record)?;
+    /// Appends after the last complete record. A write that failed part way
+    /// is cut back first, so nothing is hidden behind a torn frame.
+    fn append(&mut self, id: JournalId, record: &Record) -> Result<(), JournalError> {
+        let path = self.journal_path(id);
+        let write_error = |source| JournalError::Write {
+            path: path.clone(),
+            source,
+        };
         let journal = self
             .journals
             .get_mut(&id)
-            .ok_or_else(|| invalid_input(format!("journal {} is not open", id.file_name())))?;
-        if let Err(error) = journal.file.write_all(&frames) {
-            journal.file.set_len(journal.length)?;
-            journal.file.seek(SeekFrom::Start(journal.length))?;
-            return Err(error);
+            .ok_or(JournalError::NotOpen { journal: id })?;
+        let frames = encode(record).map_err(write_error)?;
+        if journal.torn {
+            journal
+                .file
+                .set_len(journal.length)
+                .and_then(|()| journal.file.seek(SeekFrom::Start(journal.length)))
+                .map_err(write_error)?;
+            journal.torn = false;
+        }
+        if let Err(source) = journal.file.write_all(&frames) {
+            journal.torn = true;
+            return Err(write_error(source));
         }
         journal.length += frames.len() as u64;
         self.dirty.insert(id);
@@ -915,6 +1013,9 @@ struct BufferJournal {
     /// Edits since `base`, kept only when the base reads its file: only such
     /// a buffer can be damaged and need them listed.
     edits: Option<Vec<JournalEdit>>,
+    /// Rescued or recovered text that exists nowhere else: ending the
+    /// session leaves the journal for the next one.
+    rescue: bool,
 }
 
 impl BufferJournal {
@@ -1069,8 +1170,40 @@ impl JournalOutbox {
                 base,
                 open: false,
                 edits,
+                rescue: false,
             },
         );
+    }
+
+    /// The buffer holds rescued or recovered text: its journal outlives the
+    /// session until the buffer is saved to a file or killed.
+    pub(crate) fn mark_rescue(&mut self, buffer: BufferId) {
+        if let Some(journal) = self.journals.get_mut(&buffer) {
+            journal.rescue = true;
+        }
+    }
+
+    /// The buffer whose journal is `id`.
+    pub(crate) fn buffer_of(&self, id: JournalId) -> Option<BufferId> {
+        self.journals
+            .iter()
+            .find(|(_, journal)| journal.id == id)
+            .map(|(buffer, _)| *buffer)
+    }
+
+    /// The writer lost a write to the buffer's journal: start over from
+    /// `text` with the header and a new epoch, which the writer accepts.
+    pub(crate) fn restart(&mut self, buffer: BufferId, text: Text) {
+        let Some(journal) = self.journals.get_mut(&buffer) else {
+            return;
+        };
+        journal.base = text;
+        journal.open = true;
+        self.ops.push(JournalOp::Open {
+            buffer: journal.id,
+            header: journal.header.clone(),
+        });
+        journal.start_epoch(&mut self.ops, self.snapshot_max);
     }
 
     /// Journals `buffer` in the journal `id` from now on, writing its text
@@ -1115,6 +1248,7 @@ impl JournalOutbox {
             self.ops.push(JournalOp::Close { buffer: journal.id });
             journal.open = false;
         }
+        journal.rescue = false;
         journal.edits = reads_file(&base).then(Vec::new);
         journal.base = base;
     }
@@ -1151,11 +1285,13 @@ impl JournalOutbox {
     }
 
     /// The session ends with the user's consent to drop unsaved text.
+    /// Rescued text is never dropped this way: its journal stays for the
+    /// next session.
     pub(crate) fn close_all(&mut self) {
         let mut open: Vec<JournalId> = self
             .journals
             .values_mut()
-            .filter(|journal| journal.open)
+            .filter(|journal| journal.open && !journal.rescue)
             .map(|journal| {
                 journal.open = false;
                 journal.id
@@ -1301,7 +1437,7 @@ mod tests {
         );
         assert_eq!(scan(&MAGIC[..3]).expect("torn magic").1, 0);
         assert!(scan(b"XYZ").is_err());
-        assert!(scan(b"EMXJNL\x00\x02").is_err());
+        assert!(scan(b"EMXJNL\x00\x01").is_err());
     }
 
     #[test]

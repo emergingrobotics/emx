@@ -313,6 +313,16 @@ impl Harness {
         std::mem::take(&mut self.index_requests)
     }
 
+    /// The journal thread reports that writing `journal` failed.
+    pub fn journal_write_failed(&mut self, journal: crate::journal::JournalId, reason: &str) {
+        self.editor.journal_write_failed(journal, reason);
+        for effect in self.editor.take_effects() {
+            if let Some(result) = self.run_effect(effect) {
+                self.handle(result);
+            }
+        }
+    }
+
     /// Journal operations the editor emitted since the last call.
     pub fn journal_ops(&mut self) -> Vec<JournalOp> {
         std::mem::take(&mut self.journal_ops)
@@ -454,7 +464,7 @@ impl Harness {
 
 /// Applies `ops` in order and syncs, as the server's journal thread does
 /// with each batch.
-pub fn apply_journal(writer: &mut JournalWriter, ops: Vec<JournalOp>) -> std::io::Result<()> {
+pub fn apply_journal(writer: &mut JournalWriter, ops: Vec<JournalOp>) -> Result<(), JournalError> {
     for op in ops {
         writer.apply(op)?;
     }
@@ -463,8 +473,12 @@ pub fn apply_journal(writer: &mut JournalWriter, ops: Vec<JournalOp>) -> std::io
 
 /// Applies `ops` with a new `JournalWriter` over `directory`, as a session
 /// server does from its start.
-pub fn write_journal(directory: &Path, ops: Vec<JournalOp>) -> std::io::Result<()> {
-    apply_journal(&mut JournalWriter::new(directory)?, ops)
+pub fn write_journal(directory: &Path, ops: Vec<JournalOp>) -> Result<(), JournalError> {
+    let mut writer = JournalWriter::new(directory).map_err(|source| JournalError::Write {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    apply_journal(&mut writer, ops)
 }
 
 /// Writes `ops`, then replays the directory as a restarted server would:
@@ -473,15 +487,7 @@ pub fn write_and_replay(
     directory: &Path,
     ops: Vec<JournalOp>,
     config: &Config,
-) -> Result<Vec<RecoveredBuffer>, ReplayError> {
-    write_journal(directory, ops).map_err(ReplayError::Write)?;
-    Ok(replay_dir(directory, config)?)
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ReplayError {
-    #[error("writing the journal: {0}")]
-    Write(std::io::Error),
-    #[error(transparent)]
-    Replay(#[from] JournalError),
+) -> Result<Vec<RecoveredBuffer>, JournalError> {
+    write_journal(directory, ops)?;
+    replay_dir(directory, config)
 }
