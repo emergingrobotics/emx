@@ -43,30 +43,65 @@ const RELOAD_SUMMARY_SEPARATOR: &str = ", ";
 const RELOAD_SUMMARY_MORE: &str = ", ...";
 const RELOAD_SUMMARY_ELLIPSIS: &str = "...";
 
-/// The automatic reloads of one settle round, summarized when it ends.
+/// The automatic reloads of one settle round, and the conflicts found in
+/// it, summarized when it ends.
 #[derive(Debug)]
 pub(super) struct ReloadRound {
-    names: Vec<String>,
+    reloaded: Vec<String>,
+    conflicts: Vec<String>,
     timer: TimerId,
     extensions: u32,
 }
 
-/// `Reloaded N files changed on disk: a, b, ...`, cut to `width` columns:
-/// the names that fit are listed, then `...` if any did not.
-pub(crate) fn reload_summary(names: &[String], width: usize, tab_width: usize) -> String {
-    let fits = |text: &str| crate::render::text_width(text.as_bytes(), tab_width) <= width;
-    let prefix = format!("Reloaded {} files changed on disk: ", names.len());
-    for listed in (1..=names.len()).rev() {
-        let mut message = prefix.clone() + &names[..listed].join(RELOAD_SUMMARY_SEPARATOR);
-        if listed < names.len() {
-            message.push_str(RELOAD_SUMMARY_MORE);
-        }
-        if fits(&message) {
-            return message;
-        }
+/// `names` cut to its first `shown`: `...` stands for the rest.
+fn listing(names: &[String], shown: usize) -> String {
+    if shown == 0 {
+        return RELOAD_SUMMARY_ELLIPSIS.to_string();
     }
-    // Not even one name fits; the echo area clips a prefix too wide.
-    format!("{prefix}{RELOAD_SUMMARY_ELLIPSIS}")
+    let mut text = names[..shown].join(RELOAD_SUMMARY_SEPARATOR);
+    if shown < names.len() {
+        text.push_str(RELOAD_SUMMARY_MORE);
+    }
+    text
+}
+
+/// `Reloaded N files changed on disk: a, b; M conflicts: x, y`, cut to
+/// `width` columns. Reloaded names give way first, as a conflict is what
+/// the user has to act on; then conflict names; the counts always stay.
+pub(crate) fn reload_summary(
+    reloaded: &[String],
+    conflicts: &[String],
+    width: usize,
+    tab_width: usize,
+) -> String {
+    let fits = |text: &str| crate::render::text_width(text.as_bytes(), tab_width) <= width;
+    let conflict_label = match conflicts.len() {
+        1 => "; 1 conflict: ".to_string(),
+        count => format!("; {count} conflicts: "),
+    };
+    let compose = |shown_reloaded: usize, shown_conflicts: usize| {
+        let mut message = format!(
+            "Reloaded {} files changed on disk: {}",
+            reloaded.len(),
+            listing(reloaded, shown_reloaded)
+        );
+        if !conflicts.is_empty() {
+            message.push_str(&conflict_label);
+            message.push_str(&listing(conflicts, shown_conflicts));
+        }
+        message
+    };
+    let mut choices: Vec<(usize, usize)> = (0..=reloaded.len())
+        .rev()
+        .map(|shown| (shown, conflicts.len()))
+        .collect();
+    choices.extend((0..conflicts.len()).rev().map(|shown| (0, shown)));
+    choices
+        .into_iter()
+        .map(|(shown_reloaded, shown_conflicts)| compose(shown_reloaded, shown_conflicts))
+        .find(|message| fits(message))
+        // Not even the counts fit; the echo area clips what is too wide.
+        .unwrap_or_else(|| compose(0, 0))
 }
 
 /// Why a buffer is being read again.
@@ -380,6 +415,8 @@ impl Editor {
         };
         self.notify_all(message);
         self.external_change_event(buffer, ExternalKind::Conflict);
+        // A summary of the same round must not hide this echo.
+        self.join_reload_round(buffer, true);
     }
 
     /// The buffer's text with every range that can no longer be read
@@ -836,7 +873,7 @@ impl Editor {
         }
         self.external_change_event(buffer, ExternalKind::Reloaded);
         if request.reason == ReloadReason::Automatic {
-            self.join_reload_round(buffer);
+            self.join_reload_round(buffer, false);
         }
     }
 
@@ -1056,20 +1093,26 @@ impl Editor {
 
     /// One message for the automatic reloads of a settle round: a
     /// checkout or a multi-file agent edit is reported once, not per file.
-    fn join_reload_round(&mut self, buffer: BufferId) {
+    fn join_reload_round(&mut self, buffer: BufferId, conflict: bool) {
         let name = self.buffers[buffer].name.clone();
-        if let Some(round) = self.reload_round.as_mut() {
-            if !round.names.contains(&name) {
-                round.names.push(name);
-            }
-            return;
+        if self.reload_round.is_none() {
+            let timer = self.set_timer(TimerPurpose::ReloadSummary, self.config.settle_window_ms);
+            self.reload_round = Some(ReloadRound {
+                reloaded: Vec::new(),
+                conflicts: Vec::new(),
+                timer,
+                extensions: 0,
+            });
         }
-        let timer = self.set_timer(TimerPurpose::ReloadSummary, self.config.settle_window_ms);
-        self.reload_round = Some(ReloadRound {
-            names: vec![name],
-            timer,
-            extensions: 0,
-        });
+        let round = self.reload_round.as_mut().expect("started above");
+        let names = if conflict {
+            &mut round.conflicts
+        } else {
+            &mut round.reloaded
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
     }
 
     /// The round ends once no other file of it is still settling or being
@@ -1103,11 +1146,13 @@ impl Editor {
         let Some(mut round) = self.reload_round.take() else {
             return;
         };
-        // A single reload stays silent (DESIGN section 3).
-        if round.names.len() < 2 {
+        // A single reload stays silent (DESIGN section 3), and a conflict
+        // has said so on its own already.
+        if round.reloaded.len() < 2 {
             return;
         }
-        round.names.sort();
+        round.reloaded.sort();
+        round.conflicts.sort();
         let tab_width = usize::try_from(self.config.tab_width).expect("tab_width is bounded");
         let clients: Vec<(ClientId, u16)> = self
             .clients
@@ -1115,7 +1160,12 @@ impl Editor {
             .map(|(id, client)| (*id, client.cols))
             .collect();
         for (client, cols) in clients {
-            let message = reload_summary(&round.names, usize::from(cols), tab_width);
+            let message = reload_summary(
+                &round.reloaded,
+                &round.conflicts,
+                usize::from(cols),
+                tab_width,
+            );
             self.set_echo(client, message);
         }
     }
@@ -1206,22 +1256,49 @@ mod tests {
     fn summary_lists_every_name_that_fits() {
         let all = names(&["a.rs", "b.rs", "c.rs"]);
         let full = "Reloaded 3 files changed on disk: a.rs, b.rs, c.rs";
-        assert_eq!(reload_summary(&all, 80, TAB_WIDTH), full);
-        assert_eq!(reload_summary(&all, full.len(), TAB_WIDTH), full);
+        assert_eq!(reload_summary(&all, &[], 80, TAB_WIDTH), full);
+        assert_eq!(reload_summary(&all, &[], full.len(), TAB_WIDTH), full);
     }
 
     #[test]
     fn summary_is_cut_to_the_echo_width() {
         let all = names(&["alpha.rs", "beta.rs", "gamma.rs", "delta.rs"]);
-        let cut = reload_summary(&all, 56, TAB_WIDTH);
+        let cut = reload_summary(&all, &[], 56, TAB_WIDTH);
         assert_eq!(
             cut,
             "Reloaded 4 files changed on disk: alpha.rs, beta.rs, ..."
         );
         assert!(cut.len() <= 56);
         assert_eq!(
-            reload_summary(&all, 10, TAB_WIDTH),
+            reload_summary(&all, &[], 10, TAB_WIDTH),
             "Reloaded 4 files changed on disk: ..."
+        );
+    }
+
+    #[test]
+    fn summary_names_conflicts_and_cuts_reloads_first() {
+        let reloaded = names(&["alpha.rs", "beta.rs", "gamma.rs"]);
+        let one = names(&["x.rs"]);
+        assert_eq!(
+            reload_summary(&reloaded, &one, 80, TAB_WIDTH),
+            "Reloaded 3 files changed on disk: alpha.rs, beta.rs, gamma.rs; 1 conflict: x.rs"
+        );
+        assert_eq!(
+            reload_summary(&reloaded, &one, 74, TAB_WIDTH),
+            "Reloaded 3 files changed on disk: alpha.rs, beta.rs, ...; 1 conflict: x.rs"
+        );
+        let two = names(&["x.rs", "y.rs"]);
+        assert_eq!(
+            reload_summary(&reloaded, &two, 62, TAB_WIDTH),
+            "Reloaded 3 files changed on disk: ...; 2 conflicts: x.rs, y.rs"
+        );
+        assert_eq!(
+            reload_summary(&reloaded, &two, 61, TAB_WIDTH),
+            "Reloaded 3 files changed on disk: ...; 2 conflicts: x.rs, ..."
+        );
+        assert_eq!(
+            reload_summary(&reloaded, &two, 20, TAB_WIDTH),
+            "Reloaded 3 files changed on disk: ...; 2 conflicts: ..."
         );
     }
 
@@ -1230,9 +1307,9 @@ mod tests {
         let all = names(&["\u{4e2d}\u{6587}.rs", "b.rs"]);
         let full = "Reloaded 2 files changed on disk: \u{4e2d}\u{6587}.rs, b.rs";
         let columns = full.chars().count() + 2;
-        assert_eq!(reload_summary(&all, columns, TAB_WIDTH), full);
+        assert_eq!(reload_summary(&all, &[], columns, TAB_WIDTH), full);
         assert_eq!(
-            reload_summary(&all, columns - 1, TAB_WIDTH),
+            reload_summary(&all, &[], columns - 1, TAB_WIDTH),
             "Reloaded 2 files changed on disk: \u{4e2d}\u{6587}.rs, ..."
         );
     }

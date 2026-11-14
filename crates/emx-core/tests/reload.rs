@@ -1385,3 +1385,37 @@ fn a_new_file_buffer_shows_the_file_from_the_top_once_it_appears() {
     assert_eq!(screen[0].trim_end(), "appeared", "{screen:?}");
     assert_eq!(harness.point(), 0);
 }
+
+#[test]
+fn summary_keeps_the_conflicts_of_its_round() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut harness = harness_in(directory.path());
+    let names = ["a.txt", "b.txt", "x.txt"];
+    let paths: Vec<PathBuf> = names
+        .iter()
+        .map(|name| {
+            let path = directory.path().join(name);
+            fs::write(&path, format!("{name} before\n")).expect("write");
+            visit(&mut harness, &path);
+            path
+        })
+        .collect();
+    // x.txt is modified and then hidden: only the echo tells of its
+    // conflict.
+    harness.type_text("mine ");
+    visit(&mut harness, &paths[0]);
+    for (serial, path) in (1..).zip(&paths) {
+        replace_by_rename(path, b"after\n", serial);
+        harness.handle(Event::FileChanged { path: path.clone() });
+    }
+    harness.fire_timers();
+    harness.fire_timers();
+    assert_eq!(
+        harness.echo(),
+        "Reloaded 2 files changed on disk: a.txt, b.txt; 1 conflict: x.txt"
+    );
+    assert_eq!(
+        harness.buffer_text("x.txt").as_deref(),
+        Some("mine x.txt before\n")
+    );
+}

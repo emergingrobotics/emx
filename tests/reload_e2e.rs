@@ -15,6 +15,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{ROWS, RawClient, TestEnv, WAIT};
+// The network-filesystem seam exists in debug builds only.
+#[cfg(debug_assertions)]
 use emx::server::watcher::NETWORK_FS_ENV;
 use emx_proto::{ClientKind, EditorEvent, ExternalKind, Request, Response, ServerMsg, WirePath};
 use serde_json::{Value, json};
@@ -534,6 +536,7 @@ fn diff_external_cli_prints_diff() {
     assert!(stdout.contains(" keep\n"), "context lines: {stdout}");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn polling_used_when_fs_is_network() {
     let env = TestEnv::new();
@@ -569,4 +572,68 @@ fn watch_error_degrades_to_polling() {
     fs::write(&path, "appeared\n").expect("create the file");
     session.terminal.wait_text("appeared");
     session.events.wait(&path, &ExternalKind::Reloaded);
+}
+
+#[test]
+fn deleted_directory_is_watched_again_once_recreated() {
+    let mut session = Session::start();
+    let directory = session.env.work.join("gen");
+    fs::create_dir(&directory).expect("create the directory");
+    let path = directory.join("out.txt");
+    fs::write(&path, "generation 1\n").expect("write");
+    session.terminal.open(&path);
+    session.wait_modeline("out.txt");
+    session.terminal.wait_text("generation 1");
+    // `rm -rf gen/ && regenerate`.
+    fs::remove_dir_all(&directory).expect("remove the directory");
+    session.wait_modeline_with("[DELETED]");
+    session
+        .terminal
+        .wait_screen(|screen| echo(screen).starts_with("Polling files in"));
+    fs::create_dir(&directory).expect("recreate the directory");
+    fs::write(&path, "generation 2\n").expect("regenerate");
+    session.terminal.wait_text("generation 2");
+    session.events.wait(&path, &ExternalKind::Reloaded);
+    // Watched again: the poll badge goes, and a file visited there now
+    // is watched too.
+    session
+        .terminal
+        .wait_screen(|screen| !screen[usize::from(ROWS) - 2].contains("[poll]"));
+    let other = directory.join("other.txt");
+    fs::write(&other, "other 1\n").expect("write");
+    session.terminal.open(&other);
+    session.wait_modeline("other.txt");
+    session.terminal.wait_text("other 1");
+    assert!(!session.terminal.modeline().contains("[poll]"));
+    atomic_replace(&other, "other 2\n");
+    session.terminal.wait_text("other 2");
+    session.events.wait(&other, &ExternalKind::Reloaded);
+}
+
+#[test]
+fn renamed_directory_is_watched_again_once_recreated() {
+    let mut session = Session::start();
+    let directory = session.env.work.join("src-dir");
+    fs::create_dir(&directory).expect("create the directory");
+    let path = directory.join("kept.txt");
+    fs::write(&path, "before\n").expect("write");
+    session.terminal.open(&path);
+    session.wait_modeline("kept.txt");
+    session.terminal.wait_text("before");
+    let moved = session.env.work.join("moved-away");
+    fs::rename(&directory, &moved).expect("rename the directory");
+    session.wait_modeline_with("[DELETED]");
+    // Writes in the moved directory are not this buffer's file.
+    fs::write(moved.join("kept.txt"), "moved and changed\n").expect("write");
+    fs::create_dir(&directory).expect("recreate the directory");
+    fs::write(&path, "after\n").expect("write");
+    session.terminal.wait_text("after");
+    session.events.wait(&path, &ExternalKind::Reloaded);
+    assert!(
+        !session
+            .terminal
+            .screen()
+            .iter()
+            .any(|row| row.contains("moved and changed"))
+    );
 }

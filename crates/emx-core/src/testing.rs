@@ -538,12 +538,12 @@ impl Harness {
         }
     }
 
-    /// Journal operations the editor emitted since the last call.
     /// The paths being watched.
     pub fn watched(&self) -> &BTreeSet<PathBuf> {
         &self.watched
     }
 
+    /// Journal operations the editor emitted since the last call.
     pub fn journal_ops(&mut self) -> Vec<JournalOp> {
         std::mem::take(&mut self.journal_ops)
     }

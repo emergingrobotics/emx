@@ -72,6 +72,11 @@ pub enum Event {
         path: PathBuf,
         notice: Option<String>,
     },
+    /// `path`, polled since an `Event::FilePolled`, is watched again (its
+    /// directory came back).
+    FileWatched {
+        path: PathBuf,
+    },
     /// The result of an `Effect::Observe`, as `reload::observe` returned it.
     Observed {
         buffer: BufferId,

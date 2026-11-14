@@ -377,6 +377,9 @@ impl Editor {
             Event::FileChanged { path } => self.file_changed(&path),
             Event::FileRenamed { from, to } => self.file_renamed(&from, &to),
             Event::FilePolled { path, notice } => self.file_polled(path, notice),
+            Event::FileWatched { path } => {
+                self.polled_paths.remove(&path);
+            }
             Event::Observed { buffer, result } => self.observed(buffer, result),
             Event::Reloaded { buffer, result } => self.reloaded(buffer, result),
             Event::AppendRead { buffer, result } => self.append_read(buffer, result),
