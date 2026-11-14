@@ -7,3 +7,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+emx-text = { path = "../emx-text" }
+parking_lot.workspace = true
+serde.workspace = true
+slotmap.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

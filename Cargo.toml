@@ -33,6 +33,8 @@ proptest = "1"
 tempfile = "3"
 unicode-segmentation = "1"
 unicode-width = "0.2"
+toml = "0.8"
+slotmap = "1"
 
 [dependencies]
 clap = { workspace = true }
