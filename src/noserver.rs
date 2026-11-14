@@ -1,0 +1,341 @@
+//! `emx --no-server`: the same editor and terminal client in one process,
+//! joined by an in-process link instead of a socket (DESIGN section 2).
+//!
+//! Edits are journaled in `noserver-<pid>/` under the state directory,
+//! which this process locks for as long as it runs. A process that died
+//! without exiting leaves its directory unlocked; the next `--no-server`
+//! moves those journals into its own directory and recovers them, so a
+//! crash loses nothing here either.
+
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, JoinHandle};
+
+use anyhow::{Context, bail};
+use emx_core::journal::{JournalWriter, replay_dir};
+use emx_core::{Event, Session};
+use emx_proto::ClientMsg;
+use rustix::fs::{CWD, FlockOperation, RenameFlags};
+
+use crate::client::{self, Link, UiEvent};
+use crate::paths::{self, JournalMode, NO_SERVER_JOURNALS_PREFIX};
+use crate::server::local::LocalLink;
+use crate::server::{self, Input, Server};
+
+const LOCK_NAME: &str = "lock";
+const JOURNAL_EXTENSION: &str = "jnl";
+/// A journal being replaced; the `.jnl` it would replace is the valid one.
+const REPLACEMENT_SUFFIX: &str = ".jnl.new";
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+const PRIVATE_FILE_MODE: u32 = 0o600;
+/// Claiming the directory is retried while another process recovering a
+/// crashed session removes it under us; each retry means it made progress.
+const CLAIM_ATTEMPTS: usize = 16;
+
+pub fn run(files: &[OsString]) -> anyhow::Result<ExitCode> {
+    let files = client::parse_file_arguments(files);
+    let (sender, events) = mpsc::channel();
+    let mut started = None;
+    let outcome = client::run_tui(
+        |sender: &Sender<UiEvent>| -> anyhow::Result<Box<dyn Link>> {
+            let (link, editor) = start(sender)?;
+            started = Some(editor);
+            Ok(Box::new(link))
+        },
+        sender,
+        events,
+        &files,
+        false,
+    );
+    let finished = match started {
+        Some(editor) => editor.finish(),
+        None => Ok(()),
+    };
+    let code = outcome?;
+    finished?;
+    Ok(code)
+}
+
+/// The editor thread and the journal directory it writes.
+struct EditorThread {
+    inputs: Sender<Input>,
+    thread: JoinHandle<anyhow::Result<()>>,
+    journals: JournalDir,
+}
+
+impl EditorThread {
+    /// Waits for the editor to stop (asking it to, if the client ended
+    /// without its `Exit`), then removes the journal directory unless
+    /// journals were kept in it.
+    fn finish(self) -> anyhow::Result<()> {
+        // Already stopped is fine: the editor ended the session itself.
+        drop(self.inputs.send(Input::Terminate));
+        let outcome = match self.thread.join() {
+            Ok(outcome) => outcome,
+            Err(_) => bail!("the editor thread panicked"),
+        };
+        self.journals.release()?;
+        outcome
+    }
+}
+
+fn start(sender: &Sender<UiEvent>) -> anyhow::Result<(LocalClient, EditorThread)> {
+    let config = server::load_config()?;
+    let state = paths::state_dir()?;
+    let journals = JournalDir::claim(&state, std::process::id())?;
+    journals.recover_orphans(&state)?;
+    let writer = JournalWriter::new(&journals.path)
+        .with_context(|| format!("opening the journal directory {}", journals.path.display()))?;
+    let recovered = replay_dir(&journals.path, &config)?;
+    let (inputs, receiver) = mpsc::channel();
+    let editor_inputs = inputs.clone();
+    let thread = thread::Builder::new()
+        .name("emx-editor".to_string())
+        .spawn(move || {
+            let mut server = Server::new(
+                config,
+                Session::NoServer,
+                Box::new(writer),
+                editor_inputs,
+                receiver,
+            )?;
+            server.handle(Event::Recovered(recovered));
+            server.run()
+        })
+        .context("starting the editor thread")?;
+    let deliver_to = sender.clone();
+    let link = LocalLink::new(
+        inputs.clone(),
+        Box::new(move |message| {
+            let event = match message {
+                Some(message) => UiEvent::Server {
+                    generation: 0,
+                    message,
+                },
+                None => UiEvent::ServerClosed {
+                    generation: 0,
+                    error: None,
+                },
+            };
+            // The client is gone only when it has ended.
+            drop(deliver_to.send(event));
+        }),
+    )
+    .context("connecting to the editor")?;
+    Ok((
+        LocalClient { link },
+        EditorThread {
+            inputs,
+            thread,
+            journals,
+        },
+    ))
+}
+
+struct LocalClient {
+    link: LocalLink,
+}
+
+impl Link for LocalClient {
+    fn send(&mut self, message: ClientMsg) -> io::Result<()> {
+        self.link.send(message)
+    }
+
+    fn generation(&self) -> u64 {
+        0
+    }
+
+    fn reconnect(&mut self) -> Option<anyhow::Result<()>> {
+        None
+    }
+
+    fn terminate(&mut self) -> bool {
+        self.link.terminate().is_ok()
+    }
+}
+
+/// This process's journal directory, locked while it runs.
+struct JournalDir {
+    path: PathBuf,
+    lock: File,
+}
+
+impl JournalDir {
+    /// Creates (or takes over, after a crashed process with the same pid)
+    /// `noserver-<pid>/` and locks it. A process recovering crashed
+    /// sessions may remove the directory between our creating and locking
+    /// it, so the lock is trusted only while its file is still the one in
+    /// the directory.
+    fn claim(state: &Path, pid: u32) -> anyhow::Result<JournalDir> {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(state)
+            .with_context(|| format!("creating {}", state.display()))?;
+        let path = paths::journal_dir(JournalMode::NoServer { pid })?;
+        for _ in 0..CLAIM_ATTEMPTS {
+            match DirBuilder::new().mode(PRIVATE_DIRECTORY_MODE).create(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("creating {}", path.display()));
+                }
+            }
+            let lock_path = path.join(LOCK_NAME);
+            let lock = match open_lock(&lock_path, true) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("opening {}", lock_path.display()));
+                }
+            };
+            rustix::fs::flock(&lock, FlockOperation::LockExclusive)
+                .with_context(|| format!("locking {}", lock_path.display()))?;
+            if still_linked(&lock, &lock_path)? {
+                return Ok(JournalDir { path, lock });
+            }
+        }
+        bail!(
+            "could not lock the journal directory {}: it kept being removed",
+            path.display()
+        )
+    }
+
+    /// Moves the journals of every crashed `--no-server` session (its
+    /// directory's lock is free) into this one, so replaying this
+    /// directory recovers them, then removes the emptied directories. A
+    /// directory still locked belongs to a running process and is left
+    /// alone.
+    fn recover_orphans(&self, state: &Path) -> anyhow::Result<()> {
+        let entries =
+            fs::read_dir(state).with_context(|| format!("reading {}", state.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {}", state.display()))?;
+            let orphan = entry.path();
+            let is_session = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(NO_SERVER_JOURNALS_PREFIX));
+            if !is_session || orphan == self.path {
+                continue;
+            }
+            let real_directory = fs::symlink_metadata(&orphan).is_ok_and(|meta| meta.is_dir());
+            if real_directory {
+                self.adopt(&orphan)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn adopt(&self, orphan: &Path) -> anyhow::Result<()> {
+        let lock_path = orphan.join(LOCK_NAME);
+        let lock = match open_lock(&lock_path, false) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // Created by a process that died before locking it (it
+                // holds no journals then), or being created right now: an
+                // empty directory is removed, its creator retries.
+                drop(fs::remove_dir(orphan));
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("opening {}", lock_path.display()));
+            }
+        };
+        match rustix::fs::flock(&lock, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) => return Ok(()),
+            Err(error) => {
+                return Err(io::Error::from(error))
+                    .with_context(|| format!("locking {}", lock_path.display()));
+            }
+        }
+        if !still_linked(&lock, &lock_path)? {
+            return Ok(());
+        }
+        let mut others = false;
+        let entries =
+            fs::read_dir(orphan).with_context(|| format!("reading {}", orphan.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {}", orphan.display()))?;
+            let name = entry.file_name();
+            let from = entry.path();
+            if Path::new(&name).extension() == Some(OsStr::new(JOURNAL_EXTENSION)) {
+                let to = self.path.join(&name);
+                rustix::fs::renameat_with(CWD, &from, CWD, &to, RenameFlags::NOREPLACE)
+                    .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+            } else if name
+                .as_encoded_bytes()
+                .ends_with(REPLACEMENT_SUFFIX.as_bytes())
+            {
+                fs::remove_file(&from).with_context(|| format!("removing {}", from.display()))?;
+            } else if name != LOCK_NAME {
+                others = true;
+            }
+        }
+        // The moves are durable before the source can disappear.
+        sync_directory(&self.path)?;
+        sync_directory(orphan)?;
+        if !others {
+            fs::remove_file(&lock_path)
+                .with_context(|| format!("removing {}", lock_path.display()))?;
+            fs::remove_dir(orphan).with_context(|| format!("removing {}", orphan.display()))?;
+        }
+        Ok(())
+    }
+
+    /// At exit: a directory with no journals left is removed. One that
+    /// keeps journals (text the user chose not to drop, or a journal that
+    /// could not be read) keeps its lock file, so the next `--no-server`
+    /// recovers it.
+    fn release(self) -> anyhow::Result<()> {
+        let entries =
+            fs::read_dir(&self.path).with_context(|| format!("reading {}", self.path.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("reading {}", self.path.display()))?;
+            if entry.file_name() != LOCK_NAME {
+                return Ok(());
+            }
+        }
+        let lock_path = self.path.join(LOCK_NAME);
+        fs::remove_file(&lock_path).with_context(|| format!("removing {}", lock_path.display()))?;
+        fs::remove_dir(&self.path).with_context(|| format!("removing {}", self.path.display()))?;
+        drop(self.lock);
+        Ok(())
+    }
+}
+
+fn open_lock(path: &Path, create: bool) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(path)
+}
+
+/// Whether the locked `file` is still the file at `path`: a lock on a
+/// file someone removed protects nothing.
+fn still_linked(file: &File, path: &Path) -> anyhow::Result<bool> {
+    let held = file
+        .metadata()
+        .with_context(|| format!("inspecting {}", path.display()))?;
+    match fs::symlink_metadata(path) {
+        Ok(current) => Ok(current.dev() == held.dev() && current.ino() == held.ino()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("syncing {}", path.display()))
+}

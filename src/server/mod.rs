@@ -14,6 +14,7 @@
 
 pub mod client_conn;
 pub mod journal_writer;
+pub mod local;
 pub mod workers;
 
 use std::cmp::Reverse;
@@ -21,8 +22,9 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
@@ -47,7 +49,6 @@ pub const LOCK_WAIT_MS: u64 = 2000;
 const LOCK_RETRY_MS: u64 = 20;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
-const DEV_NULL: &str = "/dev/null";
 const EXIT_SHUTDOWN: &str = "the emx server is exiting";
 const EXIT_TERMINATED: &str = "the emx server was terminated";
 
@@ -76,14 +77,28 @@ pub enum Input {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerOptions {
-    /// Started in the background by a client: own session, no terminal.
+    /// Start a server in the background (as clients do) and return once it
+    /// listens.
     pub detach: bool,
+    /// Lead a new session, away from any terminal; how `--detach` starts
+    /// the server it leaves running.
+    pub new_session: bool,
 }
 
-/// Runs the session server until it exits.
+/// How long `--detach` waits for the server it started to listen.
+pub const DETACH_WAIT_MS: u64 = 2000;
+const DETACH_POLL_MS: u64 = 20;
+
+/// Runs the session server until it exits; with `detach`, starts one in
+/// the background instead.
 pub fn run(options: ServerOptions) -> anyhow::Result<()> {
     if options.detach {
-        detach_from_terminal()?;
+        return start_detached();
+    }
+    if options.new_session {
+        // A child spawned normally is never a process-group leader, so
+        // this succeeds; the terminal's hangup then cannot reach the server.
+        rustix::process::setsid().context("starting a new session")?;
     }
     let config = load_config()?;
     let euid = rustix::process::geteuid().as_raw();
@@ -109,7 +124,7 @@ pub fn run(options: ServerOptions) -> anyhow::Result<()> {
     let (inputs, receiver) = mpsc::channel();
     start_signal_thread(inputs.clone())?;
     start_accept_thread(listener, euid, inputs.clone())?;
-    let mut server = Server::new(config, Box::new(writer), inputs, receiver)?;
+    let mut server = Server::new(config, Session::Server, Box::new(writer), inputs, receiver)?;
     server.handle(Event::Recovered(recovered));
     let outcome = server.run();
     if let Err(error) = fs::remove_file(&socket_path)
@@ -120,28 +135,22 @@ pub fn run(options: ServerOptions) -> anyhow::Result<()> {
     outcome
 }
 
-fn load_config() -> anyhow::Result<Config> {
+pub fn load_config() -> anyhow::Result<Config> {
     let path = paths::config_path()?;
     let exists = fs::exists(&path)
         .with_context(|| format!("checking for the config file {}", path.display()))?;
     Ok(Config::load(exists.then_some(path.as_path()))?)
 }
 
-/// A client starts the server in the background: it gets its own session,
-/// so the terminal's hangup does not reach it, and its output goes to the
-/// log in the state directory.
-fn detach_from_terminal() -> anyhow::Result<()> {
-    rustix::process::setsid().context(
-        "starting a new session (a process-group leader cannot; start the server from emx \
-         or with setsid(1))",
-    )?;
-    let null = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(DEV_NULL)
-        .context("opening /dev/null")?;
-    rustix::stdio::dup2_stdin(&null).context("redirecting stdin")?;
-    rustix::stdio::dup2_stdout(&null).context("redirecting stdout")?;
+/// Starts `emx server --new-session` with no terminal (stdin and stdout
+/// on /dev/null, stderr appended to the log in the state directory) and
+/// waits until a server listens. Re-spawning rather than detaching in
+/// place works from an interactive shell too, where this process leads
+/// its process group and so cannot call `setsid`. Racing starters are
+/// safe: the server lock admits one, and every starter sees it listen.
+fn start_detached() -> anyhow::Result<()> {
+    let euid = rustix::process::geteuid().as_raw();
+    let socket_path = paths::socket_path(&paths::socket_dir(euid)?);
     let state = paths::state_dir()?;
     DirBuilder::new()
         .recursive(true)
@@ -155,8 +164,28 @@ fn detach_from_terminal() -> anyhow::Result<()> {
         .mode(PRIVATE_FILE_MODE)
         .open(&log_path)
         .with_context(|| format!("opening the log {}", log_path.display()))?;
-    rustix::stdio::dup2_stderr(&log).context("redirecting stderr")?;
-    Ok(())
+    let program = std::env::current_exe().context("finding the emx program")?;
+    let mut child = Command::new(program)
+        .args(["server", "--new-session"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log)
+        .spawn()
+        .context("starting the emx server")?;
+    let deadline = Instant::now() + Duration::from_millis(DETACH_WAIT_MS);
+    loop {
+        if UnixStream::connect(&socket_path).is_ok() {
+            return Ok(());
+        }
+        let exited = child
+            .try_wait()
+            .context("checking on the emx server")?
+            .is_some();
+        if exited || Instant::now() >= deadline {
+            bail!("the emx server did not start; see {}", log_path.display());
+        }
+        thread::sleep(Duration::from_millis(DETACH_POLL_MS));
+    }
 }
 
 /// One server per user: the lock is held for the server's lifetime.
@@ -270,6 +299,7 @@ pub struct Server {
     raised: VecDeque<Event>,
     shutdown: bool,
     prefetch_reads: u64,
+    session: Session,
 }
 
 /// Whether the server goes on after a `Server::step`.
@@ -282,6 +312,7 @@ pub enum Step {
 impl Server {
     pub fn new(
         config: Config,
+        session: Session,
         journal: Box<dyn JournalBackend>,
         inputs: Sender<Input>,
         receiver: Receiver<Input>,
@@ -306,7 +337,7 @@ impl Server {
             journal.progress(),
             deliver.clone(),
         );
-        let editor = Editor::with_session(config, Session::Server)?;
+        let editor = Editor::with_session(config, session)?;
         Ok(Server {
             editor,
             receiver,
@@ -321,6 +352,7 @@ impl Server {
             raised: VecDeque::new(),
             shutdown: false,
             prefetch_reads: 0,
+            session,
         })
     }
 
@@ -335,7 +367,13 @@ impl Server {
     pub fn step(&mut self, limit: Option<Duration>) -> anyhow::Result<Step> {
         self.fire_due_timers();
         if self.shutdown {
-            self.finish(EXIT_SHUTDOWN);
+            // `--no-server` shuts down only when its user exits: nothing to
+            // explain.
+            let reason = match self.session {
+                Session::Server => EXIT_SHUTDOWN,
+                Session::NoServer => "",
+            };
+            self.finish(reason);
             return Ok(Step::Exit);
         }
         let now = Instant::now();

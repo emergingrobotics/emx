@@ -107,7 +107,7 @@ pub struct Outbox {
 }
 
 /// What the writer thread takes from the outbox.
-enum Next {
+pub(super) enum Next {
     Line(Vec<u8>),
     /// The queue drained after frames were dropped.
     Resync,
@@ -206,7 +206,7 @@ impl Outbox {
         (messages, resync)
     }
 
-    fn next(&self) -> Next {
+    pub(super) fn next(&self) -> Next {
         let mut state = self.state.lock().expect("outbox lock");
         loop {
             if let Some(encoded) = state.queue.pop_front() {
@@ -337,7 +337,7 @@ fn read_hello(reader: &mut LineReader<&UnixStream>) -> Result<Option<Hello>, Str
     }))
 }
 
-fn check_size(cols: u16, rows: u16) -> Result<(), String> {
+pub(super) fn check_size(cols: u16, rows: u16) -> Result<(), String> {
     if cols > MAX_TERMINAL_COLS || rows > MAX_TERMINAL_ROWS {
         return Err(format!(
             "terminal size {cols}x{rows} exceeds {MAX_TERMINAL_COLS}x{MAX_TERMINAL_ROWS}"
@@ -362,7 +362,7 @@ fn refuse(stream: &UnixStream, reason: &str) {
 
 /// A client message as an editor event; paths in requests are made
 /// absolute against the client's directory.
-fn to_event(client: ClientId, message: ClientMsg, cwd: &Path) -> Result<Event, String> {
+pub(super) fn to_event(client: ClientId, message: ClientMsg, cwd: &Path) -> Result<Event, String> {
     Ok(match message {
         ClientMsg::Hello { .. } => return Err("hello sent twice".to_string()),
         ClientMsg::Key { key } => Event::Key(client, key),

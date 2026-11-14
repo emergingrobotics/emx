@@ -12,6 +12,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::pty::SessionReaper;
 use common::{ServerProcess, TestEnv, WAIT};
 use emx::server::client_conn::{AdmitError, Outbox, admit, peer_uid};
 use emx::server::journal_writer::{JOURNAL_IDLE_SYNC_MS, JournalBackend, JournalThread};
@@ -21,7 +22,7 @@ use emx_core::config::DAEMON_GRACE_MS;
 use emx_core::journal::{
     JournalError, JournalOp, JournalWriter, RecoveredBuffer, SyncFailure, replay_dir,
 };
-use emx_core::{ClientId, Config, Event};
+use emx_core::{ClientId, Config, Event, Session};
 use emx_proto::{ClientKind, Request, Response, ServerMsg, WirePath};
 use emx_types::parse_kbd;
 
@@ -38,36 +39,41 @@ fn signal(server: &ServerProcess, signal: rustix::process::Signal) {
     rustix::process::kill_process(pid, signal).expect("signal the server");
 }
 
-#[test]
-fn autostart_and_attach() {
-    let env = TestEnv::new();
-    let child = env
-        .emx()
+/// `emx server --detach` from `starter`: it returns once the server
+/// listens, and the server it leaves is checked to be detached.
+fn detach_and_attach(env: &TestEnv, mut starter: std::process::Command) {
+    let mut child = starter
         .args(["server", "--detach"])
         .spawn()
         .expect("spawn emx server --detach");
-    let server = ServerProcess::adopt(child);
-    env.wait_for_socket(&server);
+    let starter_pid = child.id();
+    let status = child.wait().expect("wait for the starter");
+    assert!(status.success(), "{status}");
     let mut client = env.connect(ClientKind::Tui);
-    assert_eq!(client.server_pid, server.pid());
+    let server = client.server_pid;
+    assert_ne!(server, starter_pid, "the starter re-spawns the server");
     let screen = client.wait_text("*scratch*");
     assert!(
-        screen[screen.len() - 2].starts_with("-UUU:@---  F2  *scratch*"),
+        screen[screen.len() - 2].contains(":@---  F2  *scratch*"),
         "{screen:?}"
     );
     // setsid: the server leads its own session, away from the terminal.
-    let stat = fs::read_to_string(format!("/proc/{}/stat", server.pid())).expect("stat");
+    let stat = fs::read_to_string(format!("/proc/{server}/stat")).expect("stat");
     let fields: Vec<&str> = stat
         .rsplit(')')
         .next()
         .expect("fields")
         .split_whitespace()
         .collect();
-    assert_eq!(fields[3], server.pid().to_string(), "session id is the pid");
-    assert!(
-        env.state_home.join("emx").join("server.log").exists(),
-        "stderr goes to the log"
-    );
+    assert_eq!(fields[3], server.to_string(), "session id is the pid");
+    let log = env.state_home.join("emx").join("server.log");
+    assert!(log.exists(), "stderr goes to the log");
+    let descriptor = |number: u32| {
+        fs::read_link(format!("/proc/{server}/fd/{number}")).expect("server descriptor")
+    };
+    assert_eq!(descriptor(0), Path::new("/dev/null"));
+    assert_eq!(descriptor(1), Path::new("/dev/null"));
+    assert_eq!(descriptor(2), log);
     let mode = fs::metadata(&env.socket_dir)
         .expect("socket dir")
         .permissions();
@@ -75,6 +81,24 @@ fn autostart_and_attach() {
         std::os::unix::fs::PermissionsExt::mode(&mode) & 0o7777,
         0o700
     );
+}
+
+#[test]
+fn autostart_and_attach() {
+    let env = TestEnv::new();
+    let _reaper = SessionReaper::new(&env);
+    detach_and_attach(&env, env.emx());
+}
+
+#[test]
+fn detach_works_from_a_process_group_leader() {
+    let env = TestEnv::new();
+    let _reaper = SessionReaper::new(&env);
+    // What an interactive shell does to every job: `setsid` would fail in
+    // this process, so the server must be a new child.
+    let mut starter = env.emx();
+    std::os::unix::process::CommandExt::process_group(&mut starter, 0);
+    detach_and_attach(&env, starter);
 }
 
 #[test]
@@ -405,7 +429,8 @@ struct Harness {
 impl Harness {
     fn new(config: Config, backend: Box<dyn JournalBackend>) -> Harness {
         let (inputs, receiver) = mpsc::channel();
-        let mut server = Server::new(config, backend, inputs, receiver).expect("server");
+        let mut server =
+            Server::new(config, Session::Server, backend, inputs, receiver).expect("server");
         server.handle(Event::Recovered(Vec::new()));
         let outbox = Arc::new(Outbox::default());
         let client = ClientId(1);

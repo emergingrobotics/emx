@@ -7,6 +7,8 @@
 // be reported as dead code in that test crate.
 #![allow(dead_code)]
 
+pub mod pty;
+
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::os::unix::net::UnixStream;
