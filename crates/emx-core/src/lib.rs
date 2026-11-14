@@ -8,6 +8,7 @@ mod editor;
 mod event;
 pub mod inplace;
 pub mod io;
+pub mod journal;
 mod keymap;
 mod killring;
 mod marker;
@@ -22,8 +23,9 @@ pub use buffer::{
 };
 pub use command::{CommandContext, CommandError, CommandSpec, PrefixArg};
 pub use config::{Config, ConfigError, InvalidSetting, KeyboardEncoding};
-pub use editor::{Editor, JournalOutbox, Session};
+pub use editor::{Editor, Session};
 pub use event::{AutoSaveJob, ClientId, Effect, Event, TimerId};
+pub use journal::JournalOutbox;
 pub use keymap::{Binding, Keymap, Lookup, describe_keys};
 pub use killring::{KillRing, KillRingError};
 pub use marker::{InsertionType, MarkerId};

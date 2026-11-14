@@ -10,10 +10,11 @@ use emx_text::{ReadError, Sources, Text};
 use emx_types::{Grid, Key, KeyCode, Mods};
 use slotmap::SlotMap;
 
-use crate::buffer::{Buffer, BufferId, Change, ChangeRecorder};
+use crate::buffer::{Buffer, BufferId, ChangeRecorder};
 use crate::command::{self, CommandContext, CommandError, PrefixArg, RecenterPosition};
 use crate::config::{Config, ConfigError};
 use crate::event::{ClientId, Effect, Event, TimerId};
+use crate::journal::JournalOutbox;
 use crate::keymap::{Keymap, Lookup, describe_keys, universal_argument_binding};
 use crate::killring::KillRing;
 use crate::marker::InsertionType;
@@ -57,38 +58,6 @@ const QUIT_KEY: Key = Key {
         super_: false,
     },
 };
-
-/// Every change made to every buffer, in order, waiting for the journal.
-/// It is a separate field so commands can borrow a buffer and the recorder
-/// at the same time.
-#[derive(Debug, Default)]
-pub struct JournalOutbox {
-    changes: Vec<(BufferId, Change)>,
-}
-
-impl JournalOutbox {
-    pub fn len(&self) -> usize {
-        self.changes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
-    }
-
-    pub fn drain(&mut self) -> Vec<(BufferId, Change)> {
-        std::mem::take(&mut self.changes)
-    }
-
-    fn buffers_since(&self, start: usize) -> impl Iterator<Item = BufferId> + '_ {
-        self.changes[start..].iter().map(|(buffer, _)| *buffer)
-    }
-}
-
-impl ChangeRecorder for JournalOutbox {
-    fn record(&mut self, buffer: BufferId, change: &Change) {
-        self.changes.push((buffer, change.clone()));
-    }
-}
 
 /// Emacs's per-keyboard command-loop state.
 #[derive(Debug, Default)]
@@ -238,7 +207,7 @@ impl Editor {
             scratch: BufferId::default(),
             clients: BTreeMap::new(),
             kill_ring: KillRing::new(kill_ring_max),
-            journal_outbox: JournalOutbox::default(),
+            journal_outbox: JournalOutbox::new(config.journal_snapshot_max),
             effects: Vec::new(),
             timers: HashMap::new(),
             next_timer: 0,
@@ -260,6 +229,7 @@ impl Editor {
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
+        editor.track_journal(editor.scratch);
         Ok(editor)
     }
 
@@ -276,6 +246,7 @@ impl Editor {
     }
 
     pub fn handle(&mut self, event: Event) {
+        self.journal_outbox.begin_event();
         match event {
             Event::ClientAttached {
                 client,
@@ -296,8 +267,10 @@ impl Editor {
             Event::SaveFinished { buffer, result } => self.save_finished(buffer, result),
             Event::AutoSaved { buffer, result } => self.auto_saved(buffer, result),
             Event::AutoSaveRead { buffer, result } => self.auto_save_read(buffer, result),
+            Event::Recovered(buffers) => self.recovered(buffers),
         }
         self.redisplay();
+        self.flush_journal();
     }
 
     /// Emacs redisplay after every input event: every window is scrolled to
@@ -367,9 +340,23 @@ impl Editor {
         std::mem::take(&mut self.effects)
     }
 
-    /// Changes waiting for the journal writer.
-    pub fn take_journal_changes(&mut self) -> Vec<(BufferId, Change)> {
-        self.journal_outbox.drain()
+    /// Ends the session. Unsaved text is dropped only with the user's
+    /// consent or when no file buffer has any, so the journals go too.
+    pub(super) fn shutdown(&mut self) {
+        self.journal_outbox.close_all();
+        self.flush_journal();
+        self.effects.push(Effect::Shutdown);
+    }
+
+    /// Moves the journal operations recorded so far into the effects.
+    pub(super) fn flush_journal(&mut self) {
+        let ops = self.journal_outbox.take_ops();
+        self.effects.extend(ops.into_iter().map(Effect::Journal));
+    }
+
+    /// The buffer named `name`.
+    pub fn find_buffer(&self, name: &str) -> Option<&Buffer> {
+        self.buffers.values().find(|buffer| buffer.name == name)
     }
 
     /// A buffer visiting a file has edits not yet saved. Like Emacs on exit,
@@ -490,7 +477,7 @@ impl Editor {
                 if self.grace_timer == Some(id) {
                     self.grace_timer = None;
                     if self.clients.is_empty() && !self.has_unsaved() {
-                        self.effects.push(Effect::Shutdown);
+                        self.shutdown();
                     }
                 }
             }
@@ -987,16 +974,29 @@ mod tests {
     }
 
     #[test]
-    fn journal_outbox_records_every_change() {
+    fn journal_records_every_change() {
+        use crate::journal::{JournalOp, Record};
+
         let mut editor = Editor::new(Config::default()).expect("valid config");
         attach(&mut editor, FIRST);
         type_keys(&mut editor, FIRST, "a C-u 2 b");
         editor.handle(Event::Paste(FIRST, b"xy".to_vec()));
-        let changes = editor.take_journal_changes();
-        let inserted: Vec<(u64, Vec<u8>)> = changes
+        let records: Vec<Record> = editor
+            .take_effects()
             .into_iter()
-            .map(|(_, change)| match change {
-                Change::Insert { at, bytes } => (at, bytes),
+            .filter_map(|effect| match effect {
+                Effect::Journal(JournalOp::Record { record, .. }) => Some(record),
+                _ => None,
+            })
+            .collect();
+        let inserted: Vec<(u64, Vec<u8>)> = records
+            .into_iter()
+            .filter_map(|record| match record {
+                Record::Insert { at, bytes } => Some((at, bytes)),
+                Record::EpochSnapshot { content } => {
+                    assert!(content.is_empty(), "the base is the empty buffer");
+                    None
+                }
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
@@ -1004,7 +1004,12 @@ mod tests {
             inserted,
             vec![(0, b"a".to_vec()), (1, b"bb".to_vec()), (3, b"xy".to_vec())]
         );
-        assert!(editor.take_journal_changes().is_empty());
+        assert!(
+            !editor
+                .take_effects()
+                .iter()
+                .any(|effect| matches!(effect, Effect::Journal(_)))
+        );
     }
 
     #[test]

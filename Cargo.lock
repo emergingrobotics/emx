@@ -210,6 +210,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32fast"
+version = "1.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "crossterm"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -245,6 +254,7 @@ version = "0.0.1"
 name = "emx-core"
 version = "0.0.1"
 dependencies = [
+ "crc32fast",
  "emx-proto",
  "emx-text",
  "emx-types",

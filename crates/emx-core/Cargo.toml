@@ -7,11 +7,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+crc32fast.workspace = true
 emx-proto = { path = "../emx-proto" }
 emx-text = { path = "../emx-text" }
 emx-types = { path = "../emx-types" }
 parking_lot.workspace = true
-rustix = { workspace = true, features = ["fs", "process"] }
+rustix = { workspace = true, features = ["fs", "process", "rand"] }
 serde.workspace = true
 slotmap.workspace = true
 thiserror.workspace = true

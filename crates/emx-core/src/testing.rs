@@ -16,6 +16,7 @@ use crate::config::Config;
 use crate::editor::{Editor, Session};
 use crate::event::{ClientId, Effect, Event, TimerId};
 use crate::io::{self, SaveFailure, SavePlan, SaveSink, SinkFactory};
+use crate::journal::{JournalError, JournalOp, JournalWriter, RecoveredBuffer, replay_dir};
 use crate::marker::InsertionType;
 use crate::render::{PrefetchRequest, render};
 
@@ -88,6 +89,7 @@ pub struct Harness {
     sinks: Option<Sinks>,
     /// Auto-save files that could not be deleted.
     io_errors: Vec<String>,
+    journal_ops: Vec<JournalOp>,
 }
 
 impl Default for Harness {
@@ -123,6 +125,7 @@ impl Harness {
             held_saves: Vec::new(),
             sinks: None,
             io_errors: Vec::new(),
+            journal_ops: Vec::new(),
         };
         harness.handle(Event::ClientAttached {
             client: HARNESS_CLIENT,
@@ -222,6 +225,7 @@ impl Harness {
             Effect::SetTimer { id, .. } => self.timers.push(id),
             Effect::Prefetch(request) => self.prefetches.push(request),
             Effect::Shutdown => self.shutdown = true,
+            Effect::Journal(op) => self.journal_ops.push(op),
             Effect::StartIndex { buffer } => self.index_requests.push(buffer),
             Effect::Load { buffer, path } => {
                 let result =
@@ -307,6 +311,11 @@ impl Harness {
     /// Buffers whose line index was asked for, since the last call.
     pub fn take_index_requests(&mut self) -> Vec<BufferId> {
         std::mem::take(&mut self.index_requests)
+    }
+
+    /// Journal operations the editor emitted since the last call.
+    pub fn journal_ops(&mut self) -> Vec<JournalOp> {
+        std::mem::take(&mut self.journal_ops)
     }
 
     /// Failures of effects that report no event, such as deleting an
@@ -441,4 +450,38 @@ impl Harness {
     pub fn echo(&self) -> String {
         self.editor.echo(self.client).to_string()
     }
+}
+
+/// Applies `ops` in order and syncs, as the server's journal thread does
+/// with each batch.
+pub fn apply_journal(writer: &mut JournalWriter, ops: Vec<JournalOp>) -> std::io::Result<()> {
+    for op in ops {
+        writer.apply(op)?;
+    }
+    writer.flush_and_sync()
+}
+
+/// Applies `ops` with a new `JournalWriter` over `directory`, as a session
+/// server does from its start.
+pub fn write_journal(directory: &Path, ops: Vec<JournalOp>) -> std::io::Result<()> {
+    apply_journal(&mut JournalWriter::new(directory)?, ops)
+}
+
+/// Writes `ops`, then replays the directory as a restarted server would:
+/// edit, crash, replay, compare.
+pub fn write_and_replay(
+    directory: &Path,
+    ops: Vec<JournalOp>,
+    config: &Config,
+) -> Result<Vec<RecoveredBuffer>, ReplayError> {
+    write_journal(directory, ops).map_err(ReplayError::Write)?;
+    Ok(replay_dir(directory, config)?)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReplayError {
+    #[error("writing the journal: {0}")]
+    Write(std::io::Error),
+    #[error(transparent)]
+    Replay(#[from] JournalError),
 }

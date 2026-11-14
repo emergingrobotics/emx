@@ -1507,7 +1507,7 @@ fn automatic_in_place_asks_and_a_failure_marks_the_buffer_damaged() {
     assert_eq!(
         harness.echo(),
         format!(
-            "Write error: {ENOSPC_MESSAGE}, {}; {} is left partly rewritten; buffer big.log read that file and is damaged",
+            "Write error: {ENOSPC_MESSAGE}, {}; {} is left partly rewritten; buffer big.log read that file and is damaged; its edits are in *recovered: big.log*",
             path.display(),
             path.display()
         )

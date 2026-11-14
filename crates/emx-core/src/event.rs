@@ -7,6 +7,7 @@ use emx_types::Key;
 
 use crate::buffer::BufferId;
 use crate::io::{Loaded, SaveFailure, SavePlan};
+use crate::journal::{JournalOp, RecoveredBuffer};
 use crate::render::PrefetchRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -53,6 +54,9 @@ pub enum Event {
         buffer: BufferId,
         result: Result<Vec<u8>, String>,
     },
+    /// What `journal::replay_dir` rebuilt from the previous session's
+    /// journals, delivered once at startup.
+    Recovered(Vec<RecoveredBuffer>),
 }
 
 /// Output of the editor state machine, carried out by the server.
@@ -96,6 +100,11 @@ pub enum Effect {
         buffer: BufferId,
         file: PathBuf,
     },
+    /// Apply the operation with `JournalWriter::apply`. Journal effects
+    /// must be applied in order, before the effects that follow them are
+    /// carried out: a snapshot reads the buffer text, which a later save
+    /// may rewrite.
+    Journal(JournalOp),
     Shutdown,
 }
 

@@ -17,6 +17,10 @@ use crate::command::CommandError;
 use crate::event::{AutoSaveJob, ClientId, Effect};
 use crate::inplace::Move;
 use crate::io::{self, Loaded, SaveFailure, SavePlan, abbreviate, expand_file_name, strerror};
+use crate::journal::{
+    CHANGED_ON_DISK, Header, JournalId, LEFT_PARTLY_REWRITTEN, RecoveredBuffer,
+    recovered_buffer_name, render_edits,
+};
 use crate::marker::InsertionType;
 use crate::minibuffer::{
     Answer, BACKSPACE, ESCAPE, HistoryKind, KeyChoice, Minibuffer, Mode, Outcome, Overlay, RETURN,
@@ -617,6 +621,7 @@ impl Editor {
         if loaded.needs_index {
             self.effects.push(Effect::StartIndex { buffer });
         }
+        self.track_journal(buffer);
         if let (Some(client), Some(message)) = (client, message) {
             self.message_to(client, message);
         }
@@ -671,7 +676,9 @@ impl Editor {
             Some(buffer) => buffer,
             None => {
                 let name = self.unique_buffer_name(SCRATCH_BUFFER, Path::new(""), None);
-                self.create_buffer(&name)
+                let buffer = self.create_buffer(&name);
+                self.track_journal(buffer);
+                buffer
             }
         }
     }
@@ -758,6 +765,7 @@ impl Editor {
             self.show_buffer(client, window, replacement);
         }
         self.recency.retain(|id| *id != buffer);
+        self.journal_outbox.killed(buffer);
         self.pending_loads.remove(&buffer);
         self.pending_reads.remove(&buffer);
         self.auto_saves.remove(&buffer);
@@ -892,6 +900,8 @@ impl Editor {
         if write_file {
             target.mark_modified();
         }
+        let header = self.journal_header(buffer);
+        self.journal_outbox.set_header(buffer, header);
     }
 
     /// Runs the checks `basic-save-buffer` makes, asking where Emacs asks,
@@ -1184,6 +1194,9 @@ impl Editor {
         if !flow.quiet {
             self.set_echo(client, format!("Saving file {}...", path.display()));
         }
+        // The journal reads snapshots of the text, which the save may
+        // rewrite: its operations go first.
+        self.flush_journal();
         self.effects.push(Effect::Save { buffer, plan });
         Ok(())
     }
@@ -1208,8 +1221,17 @@ impl Editor {
             let path = binding.path.clone();
             match &result {
                 Ok(identity) => {
-                    self.adopt_saved_file(buffer, *identity, &request);
-                    if !request.quiet {
+                    let rescue = self.adopt_saved_file(buffer, *identity, &request);
+                    if let Some(rescue) = rescue {
+                        let name = self.buffers[buffer].name.clone();
+                        self.message_to(
+                            client,
+                            format!(
+                                "Wrote {}; buffer {name} read that file and is damaged; its edits are in {rescue}",
+                                path.display()
+                            ),
+                        );
+                    } else if !request.quiet {
                         self.message_to(client, format!("Wrote {}", path.display()));
                     }
                     if request.after == AfterSave::Kill && !self.buffers[buffer].is_modified() {
@@ -1219,11 +1241,14 @@ impl Editor {
                 Err(failure) => {
                     let mut message = failure.message.clone();
                     if failure.file_damaged && request.rewrites_original {
-                        self.mark_damaged(buffer);
+                        let rescue = self.mark_damaged(buffer);
                         message.push_str(&format!(
                             "; buffer {} read that file and is damaged",
                             self.buffers[buffer].name
                         ));
+                        if let Some(rescue) = rescue {
+                            message.push_str(&format!("; its edits are in {rescue}"));
+                        }
                     }
                     // Not `fail`: a waiting exit must learn of the failure.
                     if self.clients.contains_key(&client) {
@@ -1270,13 +1295,26 @@ impl Editor {
 
     /// The buffer's unchanged text came from a file an in-place save left
     /// partly rewritten: nothing it shows can be trusted, so it says so and
-    /// can be neither edited nor saved.
-    fn mark_damaged(&mut self, buffer: BufferId) {
+    /// can be neither edited nor saved. What was typed is still in the
+    /// journal's edits; they go to a read-only `*recovered: NAME*` buffer,
+    /// whose name is returned.
+    fn mark_damaged(&mut self, buffer: BufferId) -> Option<String> {
         let target = &mut self.buffers[buffer];
+        if target.damaged {
+            return None;
+        }
         if let Original::File(cache) = &target.text.sources().original {
             cache.invalidate_from(0);
         }
         target.damaged = true;
+        let name = target.name.clone();
+        let content = render_edits(
+            &name,
+            LEFT_PARTLY_REWRITTEN,
+            self.journal_outbox.edits(buffer),
+        );
+        let rescue = self.create_recovered_buffer(&recovered_buffer_name(&name), content, None);
+        Some(self.buffers[rescue].name.clone())
     }
 
     /// After a save the buffer remembers the file version it wrote. If the
@@ -1285,12 +1323,14 @@ impl Editor {
     /// changed, nor keep a replaced file alive. If it changed, it stays
     /// modified with its own text; text an in-place save pulled from under
     /// it is marked damaged.
+    /// Returns the name of the buffer holding the rescued edits when the
+    /// buffer turned out damaged.
     fn adopt_saved_file(
         &mut self,
         buffer: BufferId,
         identity: FileIdentity,
         request: &SaveRequest,
-    ) {
+    ) -> Option<String> {
         let capacity = usize::try_from(self.config.block_cache_bytes).unwrap_or(usize::MAX);
         let target = &mut self.buffers[buffer];
         let binding = target.file.as_mut().expect("a saved buffer visits a file");
@@ -1298,9 +1338,11 @@ impl Editor {
         let path = binding.path.clone();
         if target.modified_tick() != request.tick {
             if request.rewrites_original {
-                self.mark_damaged(buffer);
+                return self.mark_damaged(buffer);
             }
-            return;
+            let text = target.text.clone();
+            self.journal_outbox.rebase(buffer, text);
+            return None;
         }
         target.set_saved_at(request.tick);
         let text = request.text.clone();
@@ -1344,10 +1386,13 @@ impl Editor {
             }
         }
         let target = &mut self.buffers[buffer];
+        let base = target.text.clone();
         if target.auto_saved_since_save {
             target.auto_saved_since_save = false;
             self.effects.push(Effect::RemoveAutoSave { file: path });
         }
+        self.journal_outbox.saved(buffer, identity, base);
+        None
     }
 
     // ---- save-some-buffers and exiting -----------------------------------
@@ -1535,7 +1580,7 @@ impl Editor {
     /// `--no-server` ends the process; a server client's terminal is let go.
     fn exit_now(&mut self, client: ClientId) {
         match self.session {
-            Session::NoServer => self.effects.push(Effect::Shutdown),
+            Session::NoServer => self.shutdown(),
             Session::Server => self.effects.push(Effect::Send(
                 client,
                 ServerMsg::Exit {
@@ -1741,6 +1786,120 @@ impl Editor {
             let window = self.selected_window_id(client);
             if self.window(client, window).buffer == buffer {
                 self.set_window_point(client, window, 0);
+            }
+        }
+    }
+}
+
+impl Editor {
+    // ---- The edit journal -----------------------------------------------
+
+    fn journal_header(&self, buffer: BufferId) -> Header {
+        let target = &self.buffers[buffer];
+        Header {
+            path: target.file.as_ref().map(|file| file.path.clone()),
+            name: target.name.clone(),
+        }
+    }
+
+    /// Journals the buffer's changes from its current text on.
+    pub(super) fn track_journal(&mut self, buffer: BufferId) {
+        let header = self.journal_header(buffer);
+        let base = self.buffers[buffer].text.clone();
+        self.journal_outbox.track(buffer, header, base);
+    }
+
+    /// A read-only buffer holding rescued text, journaled at once in
+    /// `journal` (or a new journal): the text exists nowhere else.
+    fn create_recovered_buffer(
+        &mut self,
+        name: &str,
+        content: Vec<u8>,
+        journal: Option<JournalId>,
+    ) -> BufferId {
+        let name = self.unique_buffer_name(name, Path::new(""), None);
+        let buffer = self.create_buffer(&name);
+        let target = &mut self.buffers[buffer];
+        target.text = Text::from_original(Sources::memory(content.into()));
+        target.read_only = true;
+        let header = self.journal_header(buffer);
+        let base = self.buffers[buffer].text.clone();
+        match journal {
+            Some(id) => self.journal_outbox.adopt(buffer, id, header, base),
+            None => {
+                self.journal_outbox.track(buffer, header, base);
+                self.journal_outbox.open(buffer);
+            }
+        }
+        buffer
+    }
+
+    /// The previous session's journals, as `journal::replay_dir` found them.
+    pub(super) fn recovered(&mut self, buffers: Vec<RecoveredBuffer>) {
+        for recovered in buffers {
+            match recovered {
+                RecoveredBuffer::Rebuilt {
+                    journal,
+                    name,
+                    path,
+                    identity,
+                    text,
+                } => {
+                    let name = match &path {
+                        Some(path) => self.unique_buffer_name(&name, path, None),
+                        None => self.unique_buffer_name(&name, Path::new(""), None),
+                    };
+                    let buffer = self.create_buffer(&name);
+                    let needs_index = matches!(text.sources().original, Original::File(_));
+                    let target = &mut self.buffers[buffer];
+                    target.text = text.clone();
+                    target.file = path.map(|path| FileBinding {
+                        path,
+                        identity,
+                        saving: false,
+                    });
+                    target.mark_modified();
+                    let header = self.journal_header(buffer);
+                    self.journal_outbox.adopt(buffer, journal, header, text);
+                    if needs_index {
+                        self.effects.push(Effect::StartIndex { buffer });
+                    }
+                }
+                RecoveredBuffer::EditsOnly {
+                    journal,
+                    name,
+                    edits,
+                    ..
+                } => {
+                    let content = render_edits(&name, CHANGED_ON_DISK, &edits);
+                    self.create_recovered_buffer(
+                        &recovered_buffer_name(&name),
+                        content,
+                        Some(journal),
+                    );
+                }
+                RecoveredBuffer::Finished { journal } => self.journal_outbox.discard(journal),
+                RecoveredBuffer::Unreadable { file, reason } => {
+                    // Not journaled: the unreadable journal stays where it is
+                    // and is reported again on every start until removed.
+                    let name = self.unique_buffer_name(
+                        &recovered_buffer_name(&file_name(&file)),
+                        Path::new(""),
+                        None,
+                    );
+                    let buffer = self.create_buffer(&name);
+                    let target = &mut self.buffers[buffer];
+                    target.text = Text::from_original(Sources::memory(
+                        format!(
+                            "The edit journal {} could not be read: {reason}.\n\
+                             It is left in place; nothing was taken from it.\n",
+                            file.display()
+                        )
+                        .into_bytes()
+                        .into(),
+                    ));
+                    target.read_only = true;
+                }
             }
         }
     }
