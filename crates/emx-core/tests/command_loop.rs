@@ -131,7 +131,7 @@ fn undefined_messages_describe_keys_like_emacs() {
     for (keys, message) in [
         ("M-z", "M-z is undefined"),
         ("ESC z", "M-z is undefined"),
-        ("C-x C-c", "C-x C-c is undefined"),
+        ("C-x C-y", "C-x C-y is undefined"),
         ("C-c Z", "C-c Z is undefined"),
         ("C-S-z", "C-S-z is undefined"),
         ("<f5>", "<f5> is undefined"),

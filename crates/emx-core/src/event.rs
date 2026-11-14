@@ -1,8 +1,12 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use emx_proto::{ClientKind, ServerMsg};
+use emx_text::{FileIdentity, Text};
 use emx_types::Key;
 
+use crate::buffer::BufferId;
+use crate::io::{Loaded, SavePlan};
 use crate::render::PrefetchRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -29,6 +33,26 @@ pub enum Event {
     /// A timer requested by `Effect::SetTimer` expired. Timers are never
     /// cancelled, so the editor ignores ones that no longer apply.
     Timer(TimerId),
+    /// The result of an `Effect::Load`, as `io::load_file` returned it.
+    FileLoaded {
+        buffer: BufferId,
+        result: Result<Loaded, String>,
+    },
+    /// The result of an `Effect::Save`: the identity of the file written.
+    SaveFinished {
+        buffer: BufferId,
+        result: Result<FileIdentity, String>,
+    },
+    /// The result of an `Effect::AutoSave`.
+    AutoSaved {
+        buffer: BufferId,
+        result: Result<(), String>,
+    },
+    /// The content of an auto-save file asked for by `Effect::ReadAutoSave`.
+    AutoSaveRead {
+        buffer: BufferId,
+        result: Result<Vec<u8>, String>,
+    },
 }
 
 /// Output of the editor state machine, carried out by the server.
@@ -44,5 +68,49 @@ pub enum Effect {
     /// the frame is rendered again. Repeated after every event until the
     /// block is cached, so the server keeps one read per block in flight.
     Prefetch(PrefetchRequest),
+    /// Read `path` with `io::load_file` and deliver `Event::FileLoaded`.
+    Load {
+        buffer: BufferId,
+        path: PathBuf,
+    },
+    /// Carry out the plan with `io::save` and deliver `Event::SaveFinished`.
+    /// The buffer stays read-only until then.
+    Save {
+        buffer: BufferId,
+        plan: SavePlan,
+    },
+    /// Build the line index of a buffer whose original is read through the
+    /// block cache.
+    StartIndex {
+        buffer: BufferId,
+    },
+    /// Write `autosave::write_auto_save(file, text)` and deliver
+    /// `Event::AutoSaved`.
+    AutoSave(AutoSaveJob),
+    /// Delete the auto-save file of `file` (`autosave::remove_auto_save`).
+    RemoveAutoSave {
+        file: PathBuf,
+    },
+    /// Read the auto-save file of `file` and deliver `Event::AutoSaveRead`.
+    ReadAutoSave {
+        buffer: BufferId,
+        file: PathBuf,
+    },
     Shutdown,
 }
+
+#[derive(Debug, Clone)]
+pub struct AutoSaveJob {
+    pub buffer: BufferId,
+    /// The visited file; the auto-save file is named after it.
+    pub file: PathBuf,
+    pub text: Text,
+}
+
+impl PartialEq for AutoSaveJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.buffer == other.buffer && self.file == other.file && self.text.same_root(&other.text)
+    }
+}
+
+impl Eq for AutoSaveJob {}

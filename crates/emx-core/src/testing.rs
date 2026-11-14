@@ -1,16 +1,21 @@
 //! Headless harness: one attached client driven through `Editor::handle`,
 //! with effects processed synchronously. Timers fire only when a test asks.
 
+use std::collections::VecDeque;
+use std::fs::File;
+use std::path::Path;
 use std::sync::Arc;
 
 use emx_proto::{ClientKind, ServerMsg};
 use emx_text::{Sources, Text};
-use emx_types::{Grid, Key, parse_kbd};
+use emx_types::{Grid, Key, KeyCode, Mods, parse_kbd};
 
-use crate::buffer::Buffer;
+use crate::autosave;
+use crate::buffer::{Buffer, BufferId};
 use crate::config::Config;
 use crate::editor::{Editor, Session};
 use crate::event::{ClientId, Effect, Event, TimerId};
+use crate::io::{self, SavePlan, SaveSink, SinkFactory};
 use crate::marker::InsertionType;
 use crate::render::{PrefetchRequest, render};
 
@@ -20,6 +25,55 @@ const HARNESS_CLIENT: ClientId = ClientId(1);
 const POINT_MARK: char = '|';
 const MARK_MARK: char = '^';
 
+/// A sink that writes `remaining` bytes, then fails with ENOSPC, as a full
+/// disk does part way through a save.
+pub struct FailAfter {
+    file: File,
+    remaining: u64,
+}
+
+impl SaveSink for FailAfter {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        let allowed = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        std::io::Write::write_all(&mut self.file, &buf[..allowed])?;
+        self.remaining -= allowed as u64;
+        if allowed < buf.len() {
+            return Err(std::io::Error::from_raw_os_error(
+                rustix::io::Errno::NOSPC.raw_os_error(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+
+    fn seek(&mut self, offset: u64) -> std::io::Result<()> {
+        std::io::Seek::seek(&mut self.file, std::io::SeekFrom::Start(offset)).map(|_| ())
+    }
+}
+
+/// Saves write `bytes` bytes, then fail with ENOSPC.
+pub fn fail_after(bytes: u64) -> Box<SinkFactory> {
+    Box::new(move |file| -> Box<dyn SaveSink> {
+        Box::new(FailAfter {
+            file,
+            remaining: bytes,
+        })
+    })
+}
+
+struct Sinks(Box<SinkFactory>);
+
+impl std::fmt::Debug for Sinks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Sinks")
+    }
+}
+
 #[derive(Debug)]
 pub struct Harness {
     editor: Editor,
@@ -28,6 +82,12 @@ pub struct Harness {
     timers: Vec<TimerId>,
     prefetches: Vec<PrefetchRequest>,
     shutdown: bool,
+    index_requests: Vec<BufferId>,
+    hold_saves: bool,
+    held_saves: Vec<(BufferId, SavePlan)>,
+    sinks: Option<Sinks>,
+    /// Auto-save files that could not be deleted.
+    io_errors: Vec<String>,
 }
 
 impl Default for Harness {
@@ -58,6 +118,11 @@ impl Harness {
             timers: Vec::new(),
             prefetches: Vec::new(),
             shutdown: false,
+            index_requests: Vec::new(),
+            hold_saves: false,
+            held_saves: Vec::new(),
+            sinks: None,
+            io_errors: Vec::new(),
         };
         harness.handle(Event::ClientAttached {
             client: HARNESS_CLIENT,
@@ -127,16 +192,137 @@ impl Harness {
         self.handle(Event::Paste(self.client, bytes.to_vec()));
     }
 
+    /// Feeds each character of `text` as a plain key, as typing it would.
+    pub fn type_text(&mut self, text: &str) {
+        for character in text.chars() {
+            self.key(Key {
+                code: KeyCode::Char(character),
+                mods: Mods::default(),
+            });
+        }
+    }
+
+    /// Handles the event, then carries out its effects the way the server's
+    /// workers do, feeding their results back in until none are left.
     pub fn handle(&mut self, event: Event) {
-        self.editor.handle(event);
-        for effect in self.editor.take_effects() {
-            match effect {
-                Effect::Send(_, message) => self.sent.push(message),
-                Effect::SetTimer { id, .. } => self.timers.push(id),
-                Effect::Prefetch(request) => self.prefetches.push(request),
-                Effect::Shutdown => self.shutdown = true,
+        let mut events = VecDeque::from([event]);
+        while let Some(event) = events.pop_front() {
+            self.editor.handle(event);
+            for effect in self.editor.take_effects() {
+                if let Some(result) = self.run_effect(effect) {
+                    events.push_back(result);
+                }
             }
         }
+    }
+
+    fn run_effect(&mut self, effect: Effect) -> Option<Event> {
+        match effect {
+            Effect::Send(_, message) => self.sent.push(message),
+            Effect::SetTimer { id, .. } => self.timers.push(id),
+            Effect::Prefetch(request) => self.prefetches.push(request),
+            Effect::Shutdown => self.shutdown = true,
+            Effect::StartIndex { buffer } => self.index_requests.push(buffer),
+            Effect::Load { buffer, path } => {
+                let result =
+                    io::load_file(&path, self.editor.config()).map_err(|error| error.to_string());
+                return Some(Event::FileLoaded { buffer, result });
+            }
+            Effect::Save { buffer, plan } => {
+                if self.hold_saves {
+                    self.held_saves.push((buffer, plan));
+                } else {
+                    return Some(self.save(buffer, &plan));
+                }
+            }
+            Effect::AutoSave(job) => {
+                let result = autosave::write_auto_save(&job.file, &job.text)
+                    .map_err(|error| error.to_string());
+                return Some(Event::AutoSaved {
+                    buffer: job.buffer,
+                    result,
+                });
+            }
+            Effect::RemoveAutoSave { file } => {
+                if let Err(error) = autosave::remove_auto_save(&file) {
+                    self.io_errors.push(format!("{}: {error}", file.display()));
+                }
+            }
+            Effect::ReadAutoSave { buffer, file } => {
+                let result = autosave::read_auto_save(&file).map_err(|error| {
+                    format!(
+                        "Opening input file: {}, {}",
+                        io::strerror(&error),
+                        autosave::auto_save_path(&file).display()
+                    )
+                });
+                return Some(Event::AutoSaveRead { buffer, result });
+            }
+        }
+        None
+    }
+
+    fn save(&mut self, buffer: BufferId, plan: &SavePlan) -> Event {
+        let result = match self.sinks.as_mut() {
+            Some(Sinks(sinks)) => io::save_with(plan, sinks.as_mut()),
+            None => io::save(plan),
+        };
+        Event::SaveFinished {
+            buffer,
+            result: result.map_err(|error| error.to_string()),
+        }
+    }
+
+    /// Saves write through sinks from `sinks`, for injecting failures.
+    pub fn set_save_sink(&mut self, sinks: Box<SinkFactory>) {
+        self.sinks = Some(Sinks(sinks));
+    }
+
+    pub fn clear_save_sink(&mut self) {
+        self.sinks = None;
+    }
+
+    /// Keeps save effects instead of running them, so the state while a
+    /// save is in flight can be inspected.
+    pub fn hold_saves(&mut self) {
+        self.hold_saves = true;
+    }
+
+    pub fn held_saves(&self) -> Vec<SavePlan> {
+        self.held_saves
+            .iter()
+            .map(|(_, plan)| plan.clone())
+            .collect()
+    }
+
+    /// Runs the held saves and stops holding.
+    pub fn release_saves(&mut self) {
+        self.hold_saves = false;
+        for (buffer, plan) in std::mem::take(&mut self.held_saves) {
+            let finished = self.save(buffer, &plan);
+            self.handle(finished);
+        }
+    }
+
+    /// Buffers whose line index was asked for, since the last call.
+    pub fn take_index_requests(&mut self) -> Vec<BufferId> {
+        std::mem::take(&mut self.index_requests)
+    }
+
+    /// Failures of effects that report no event, such as deleting an
+    /// auto-save file.
+    pub fn io_errors(&self) -> &[String] {
+        &self.io_errors
+    }
+
+    pub fn set_default_directory(&mut self, directory: &Path) {
+        self.editor.set_default_directory(directory);
+    }
+
+    /// The echo area's whole line: the message, or the minibuffer's
+    /// prompt, input and any message over it.
+    pub fn echo_line(&self) -> String {
+        self.editor.echo_area(self.client).0
     }
 
     /// Fires the timers pending now, oldest first, as if their delays passed

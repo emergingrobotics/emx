@@ -35,6 +35,7 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 toml = "0.8"
 slotmap = "1"
+xattr = "1"
 
 [dependencies]
 clap = { workspace = true }

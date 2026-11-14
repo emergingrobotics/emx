@@ -1,4 +1,7 @@
+mod files;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,8 +17,12 @@ use crate::event::{ClientId, Effect, Event, TimerId};
 use crate::keymap::{Keymap, Lookup, describe_keys, universal_argument_binding};
 use crate::killring::KillRing;
 use crate::marker::InsertionType;
+use crate::minibuffer::{Histories, Minibuffer};
 use crate::render::{PrefetchRequest, render};
 use crate::undo::{UndoLimits, outer_limit_warning};
+pub(crate) use files::Purpose;
+use files::{AutoSaveRequest, ExitWait, SaveRequest};
+
 use crate::window::{
     Fetch, Frame, Layout, Reader, ScreenLine, Window, WindowId, frame_layout, not_cached_block,
 };
@@ -143,6 +150,9 @@ struct Client {
     signaled: bool,
     /// Emacs `temporary-goal-column` for this client's vertical motion.
     temporary_goal_column: u64,
+    /// Keys go to the minibuffer while it reads something.
+    minibuffer: Option<Minibuffer>,
+    exit_wait: Option<ExitWait>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +161,11 @@ enum TimerPurpose {
     /// The daemon exits once no client is attached and nothing is unsaved,
     /// after a grace period that lets a client reattach.
     DaemonGrace,
+    /// Clears a message shown over the client's minibuffer, if it is still
+    /// the one with this serial.
+    MinibufferMessage(ClientId, u64),
+    /// Emacs `auto-save-timeout`.
+    AutoSaveIdle,
 }
 
 /// How a command finished, for the command loop's bookkeeping.
@@ -186,6 +201,22 @@ pub struct Editor {
     grace_timer: Option<TimerId>,
     session: Session,
     next_frame_number: u64,
+    histories: Histories,
+    /// Emacs `default-directory` for buffers that visit no file.
+    default_directory: PathBuf,
+    /// Buffers, most recently shown first.
+    recency: Vec<BufferId>,
+    /// Who asked for each file being read, saved or recovered.
+    pending_loads: HashMap<BufferId, ClientId>,
+    pending_saves: HashMap<BufferId, SaveRequest>,
+    pending_reads: HashMap<BufferId, ClientId>,
+    auto_saves: HashMap<BufferId, AutoSaveRequest>,
+    /// Commands that changed text since the last auto-save, toward Emacs
+    /// `auto-save-interval`, and in all, to tell whether the idle timer saw
+    /// any.
+    edits_since_auto_save: u64,
+    edits_total: u64,
+    auto_save_timer: Option<(TimerId, u64)>,
 }
 
 impl Editor {
@@ -214,6 +245,18 @@ impl Editor {
             grace_timer: None,
             session,
             next_frame_number: FIRST_SERVER_FRAME,
+            histories: Histories::default(),
+            // A working directory that no longer exists leaves only the
+            // root to offer as a starting point in file prompts.
+            default_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            recency: Vec::new(),
+            pending_loads: HashMap::new(),
+            pending_saves: HashMap::new(),
+            pending_reads: HashMap::new(),
+            auto_saves: HashMap::new(),
+            edits_since_auto_save: 0,
+            edits_total: 0,
+            auto_save_timer: None,
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -228,6 +271,7 @@ impl Editor {
             .insert_with_key(|id| Buffer::new(id, name.to_string(), text, limits));
         // Creating a buffer is a command's change: it gets its boundary.
         self.buffers[id].undo.boundary(0);
+        self.recency.push(id);
         id
     }
 
@@ -248,6 +292,10 @@ impl Editor {
                 client.rows = rows;
             }
             Event::Timer(id) => self.handle_timer(id),
+            Event::FileLoaded { buffer, result } => self.file_loaded(buffer, result),
+            Event::SaveFinished { buffer, result } => self.save_finished(buffer, result),
+            Event::AutoSaved { buffer, result } => self.auto_saved(buffer, result),
+            Event::AutoSaveRead { buffer, result } => self.auto_save_read(buffer, result),
         }
         self.redisplay();
     }
@@ -363,7 +411,11 @@ impl Editor {
                 Some(number)
             }
         };
-        let buffer_id = self.scratch;
+        let buffer_id = if self.buffers.contains_key(self.scratch) {
+            self.scratch
+        } else {
+            self.other_buffer(self.scratch)
+        };
         let buffer = &mut self.buffers[buffer_id];
         let window = Window {
             buffer: buffer_id,
@@ -386,6 +438,8 @@ impl Editor {
                 echo: String::new(),
                 signaled: false,
                 temporary_goal_column: 0,
+                minibuffer: None,
+                exit_wait: None,
             },
         );
     }
@@ -400,10 +454,8 @@ impl Editor {
             buffer.delete_marker(window.point);
             buffer.delete_marker(window.start);
         }
-        if self.clients.is_empty() && !self.has_unsaved() {
-            let id = self.set_timer(TimerPurpose::DaemonGrace, self.config.daemon_grace_ms);
-            self.grace_timer = Some(id);
-        }
+        self.grace_timer = None;
+        self.maybe_arm_grace();
     }
 
     fn set_timer(&mut self, purpose: TimerPurpose, after_ms: u64) -> TimerId {
@@ -435,11 +487,17 @@ impl Editor {
                 }
             }
             TimerPurpose::DaemonGrace => {
-                if self.grace_timer == Some(id) && self.clients.is_empty() && !self.has_unsaved() {
+                if self.grace_timer == Some(id) {
                     self.grace_timer = None;
-                    self.effects.push(Effect::Shutdown);
+                    if self.clients.is_empty() && !self.has_unsaved() {
+                        self.effects.push(Effect::Shutdown);
+                    }
                 }
             }
+            TimerPurpose::MinibufferMessage(client, serial) => {
+                self.minibuffer_message_expired(client, serial);
+            }
+            TimerPurpose::AutoSaveIdle => self.auto_save_idle(id),
         }
     }
 
@@ -448,6 +506,10 @@ impl Editor {
         // Reading an input event wipes the echo area.
         client.echo.clear();
         client.signaled = false;
+        if client.minibuffer.is_some() {
+            self.minibuffer_key(client_id, key);
+            return;
+        }
         let state = &mut client.command_loop;
         if !state.pending.is_empty() && key == QUIT_KEY {
             self.signal(client_id, None, &CommandError::Quit);
@@ -537,6 +599,10 @@ impl Editor {
         let client = self.client_mut(client_id);
         client.echo.clear();
         client.signaled = false;
+        if client.minibuffer.is_some() {
+            self.minibuffer_paste(client_id, &bytes);
+            return;
+        }
         if !client.command_loop.pending.is_empty() {
             let keys = describe_keys(&client.command_loop.pending);
             self.undefined(client_id, format!("{keys} {PASTE_EVENT_DESCRIPTION}"));
@@ -639,6 +705,9 @@ impl Editor {
     fn finish_command(&mut self, client_id: ClientId, journal_start: usize) {
         let mut buffers: BTreeSet<BufferId> =
             self.journal_outbox.buffers_since(journal_start).collect();
+        if !buffers.is_empty() {
+            self.note_edit(client_id);
+        }
         let selected = self.client(client_id).frame.selected_window().buffer;
         buffers.insert(selected);
         for buffer_id in buffers {
@@ -993,6 +1062,8 @@ mod tests {
         });
         type_keys(&mut editor, FIRST, "a");
         assert!(editor.has_unsaved());
+        // The edit armed the auto-save idle timer; only detach's count.
+        editor.take_effects();
         editor.handle(Event::ClientDetached(FIRST));
         assert!(timers(&editor.take_effects()).is_empty());
     }

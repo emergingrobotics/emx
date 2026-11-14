@@ -27,7 +27,7 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 45] = [
+const DEFAULT_BINDINGS: [(&str, &str); 53] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
@@ -70,6 +70,14 @@ const DEFAULT_BINDINGS: [(&str, &str); 45] = [
     ("M-v", "scroll-down-command"),
     ("<prior>", "scroll-down-command"),
     ("C-l", "recenter-top-bottom"),
+    ("C-x C-f", "find-file"),
+    ("C-x C-s", "save-buffer"),
+    ("C-x C-w", "write-file"),
+    ("C-x s", "save-some-buffers"),
+    ("C-x k", "kill-buffer"),
+    ("C-x C-c", "save-buffers-kill-terminal"),
+    ("C-x #", "server-edit"),
+    ("C-x C-q", "read-only-mode"),
     ("M--", NEGATIVE_ARGUMENT),
     ("C--", NEGATIVE_ARGUMENT),
     ("C-M--", NEGATIVE_ARGUMENT),

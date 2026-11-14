@@ -1,23 +1,29 @@
 #![forbid(unsafe_code)]
 
+pub mod autosave;
 mod buffer;
 pub mod command;
 pub mod config;
 mod editor;
 mod event;
+pub mod inplace;
+pub mod io;
 mod keymap;
 mod killring;
 mod marker;
+mod minibuffer;
 mod render;
 pub mod testing;
 mod undo;
 mod window;
 
-pub use buffer::{Buffer, BufferId, Change, ChangeRecorder, EditError, FileBinding};
+pub use buffer::{
+    Buffer, BufferId, Change, ChangeRecorder, CodingMnemonic, EditError, FileBinding,
+};
 pub use command::{CommandContext, CommandError, CommandSpec, PrefixArg};
 pub use config::{Config, ConfigError, InvalidSetting, KeyboardEncoding};
 pub use editor::{Editor, JournalOutbox, Session};
-pub use event::{ClientId, Effect, Event, TimerId};
+pub use event::{AutoSaveJob, ClientId, Effect, Event, TimerId};
 pub use keymap::{Binding, Keymap, Lookup, describe_keys};
 pub use killring::{KillRing, KillRingError};
 pub use marker::{InsertionType, MarkerId};

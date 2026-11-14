@@ -5,7 +5,7 @@
 
 use std::ops::{ControlFlow, Range};
 
-use emx_text::display_units;
+use emx_text::{display_units, unit_width};
 use emx_types::{Cell, Face, Grid};
 
 use crate::buffer::{Buffer, BufferId};
@@ -18,9 +18,10 @@ use crate::window::{
 
 /// `mode-line-front-space` on a terminal.
 const MODELINE_FRONT: &str = "-";
-/// `mode-line-mule-info` for UTF-8 keyboard, terminal and buffer coding
-/// with Unix line ends.
-const MODELINE_MULE_INFO: &str = "UUU:";
+/// `mode-line-mule-info` for UTF-8 keyboard and terminal coding; the
+/// buffer's coding letter and the Unix end-of-line `:` follow.
+const MODELINE_TERMINAL_CODING: &str = "UU";
+const MODELINE_UNIX_EOL: &str = ":";
 /// `mode-line-client` on a frame of a server client.
 const MODELINE_CLIENT: &str = "@";
 /// `mode-line-remote` for a local directory.
@@ -37,6 +38,8 @@ const MODELINE_POSITION_GAP: &str = "   ";
 const LINE_NUMBER_COLUMNS: usize = 6;
 const MODELINE_MODES_GAP: &str = "  ";
 const MODELINE_MODES: &str = "(Fundamental) ";
+/// Shown while the visited file is being read.
+const MODELINE_MODES_LOADING: &str = "(Fundamental Loading) ";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
 const MODELINE_FILL: &str = "-";
 const UNKNOWN_LINE: &str = "?";
@@ -77,8 +80,15 @@ pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>)
         &mut grid,
         &mut prefetch,
     );
+    let mut cursor = cursor;
     if let Some(row) = layout.echo_row {
-        draw_echo(&mut grid, row, editor.echo(client), tab_width(editor));
+        let (line, minibuffer_cursor) = editor.echo_area(client);
+        match minibuffer_cursor {
+            Some(at) => {
+                cursor = draw_minibuffer(&mut grid, row, &line, at, tab_width(editor));
+            }
+            None => draw_echo(&mut grid, row, &line, tab_width(editor)),
+        }
     }
     grid.cursor = cursor;
     (grid, prefetch)
@@ -356,7 +366,7 @@ fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usiz
     let buffer = modeline.buffer;
     let (frame_number, client_frame) = modeline.frame;
     // `%1*%1+`: `%` for read-only, `*` for modified, `-` otherwise.
-    let flags = match (buffer.read_only, buffer.is_modified()) {
+    let flags = match (buffer.read_only || buffer.loading, buffer.is_modified()) {
         (true, true) => "%*",
         (true, false) => "%%",
         (false, true) => "**",
@@ -370,7 +380,11 @@ fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usiz
     };
     writer.write(MODELINE_FRONT.as_bytes(), face, face);
     writer.min_width(MODELINE_FLAGS_MIN_WIDTH, face, |writer| {
-        writer.write(MODELINE_MULE_INFO.as_bytes(), face, face);
+        writer.write(MODELINE_TERMINAL_CODING.as_bytes(), face, face);
+        let mut letter = [0; 4];
+        let letter = buffer.coding.letter().encode_utf8(&mut letter);
+        writer.write(letter.as_bytes(), face, face);
+        writer.write(MODELINE_UNIX_EOL.as_bytes(), face, face);
         if client_frame {
             writer.write(MODELINE_CLIENT.as_bytes(), face, face);
         }
@@ -392,7 +406,12 @@ fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usiz
         writer.pad_to(line_start + LINE_NUMBER_COLUMNS, face);
     });
     writer.write(MODELINE_MODES_GAP.as_bytes(), face, face);
-    writer.write(MODELINE_MODES.as_bytes(), face, face);
+    let modes = if buffer.loading {
+        MODELINE_MODES_LOADING
+    } else {
+        MODELINE_MODES
+    };
+    writer.write(modes.as_bytes(), face, face);
     while writer.col < usize::from(writer.grid.cols) {
         writer.write(MODELINE_FILL.as_bytes(), face, face);
     }
@@ -406,6 +425,50 @@ fn draw_echo(grid: &mut Grid, row: u16, echo: &str, tab_width: usize) {
         tab_width,
     };
     writer.write(echo.as_bytes(), Face::Default, Face::EscapeGlyph);
+}
+
+/// Draws the minibuffer line with the cursor at byte `cursor`; a line too
+/// wide for the row drops columns on the left so the cursor stays visible.
+/// Returns the cursor's cell.
+fn draw_minibuffer(
+    grid: &mut Grid,
+    row: u16,
+    line: &str,
+    cursor: usize,
+    tab_width: usize,
+) -> Option<(u16, u16)> {
+    let cols = usize::from(grid.cols);
+    let last_col = cols.checked_sub(1)?;
+    let mut start = 0;
+    while text_width(&line.as_bytes()[start..cursor], tab_width) > last_col {
+        let rest = &line.as_bytes()[start..];
+        let mut units = display_units(rest);
+        units.next();
+        start += units.next().map_or(rest.len(), |(offset, _)| offset);
+    }
+    let mut writer = RowWriter {
+        grid,
+        row,
+        col: 0,
+        tab_width,
+    };
+    writer.write(
+        &line.as_bytes()[start..cursor],
+        Face::Default,
+        Face::EscapeGlyph,
+    );
+    let cursor_col = writer.col;
+    writer.write(&line.as_bytes()[cursor..], Face::Default, Face::EscapeGlyph);
+    let col = u16::try_from(cursor_col.min(last_col)).expect("inside the u16 grid width");
+    Some((col, row))
+}
+
+fn text_width(bytes: &[u8], tab_width: usize) -> usize {
+    let mut column = 0;
+    for (_, unit) in display_units(bytes) {
+        column += unit_width(&unit, column, tab_width);
+    }
+    column
 }
 
 #[cfg(test)]

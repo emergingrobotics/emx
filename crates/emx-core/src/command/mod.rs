@@ -1,4 +1,5 @@
 mod edit;
+mod files;
 mod kill;
 mod mark;
 mod misc;
@@ -222,6 +223,42 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "recenter-top-bottom",
         run: misc::recenter_top_bottom,
+    },
+    CommandSpec {
+        name: "find-file",
+        run: files::find_file,
+    },
+    CommandSpec {
+        name: "save-buffer",
+        run: files::save_buffer,
+    },
+    CommandSpec {
+        name: "write-file",
+        run: files::write_file,
+    },
+    CommandSpec {
+        name: "save-some-buffers",
+        run: files::save_some_buffers,
+    },
+    CommandSpec {
+        name: "kill-buffer",
+        run: files::kill_buffer,
+    },
+    CommandSpec {
+        name: "save-buffers-kill-terminal",
+        run: files::save_buffers_kill_terminal,
+    },
+    CommandSpec {
+        name: "server-edit",
+        run: files::server_edit,
+    },
+    CommandSpec {
+        name: "recover-this-file",
+        run: files::recover_this_file,
+    },
+    CommandSpec {
+        name: "read-only-mode",
+        run: files::read_only_mode,
     },
 ];
 

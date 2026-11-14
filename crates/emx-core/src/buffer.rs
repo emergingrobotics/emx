@@ -21,6 +21,24 @@ pub struct FileBinding {
     pub saving: bool,
 }
 
+/// The buffer coding's modeline letter (Emacs `mode-line-mule-info`): a
+/// visited file whose bytes are all ASCII stays undecided (`-`) until a
+/// save writes something else; everything else is UTF-8 (`U`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodingMnemonic {
+    Undecided,
+    Utf8,
+}
+
+impl CodingMnemonic {
+    pub fn letter(self) -> char {
+        match self {
+            CodingMnemonic::Undecided => '-',
+            CodingMnemonic::Utf8 => 'U',
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
     #[error("Buffer is read-only")]
@@ -56,9 +74,19 @@ pub struct Buffer {
     pub mark_active: bool,
     pub mark_ring: VecDeque<MarkerId>,
     pub undo: UndoList,
+    /// The file is being read; the buffer is read-only until it arrives.
+    pub loading: bool,
+    pub coding: CodingMnemonic,
+    /// Where point was when the buffer last left a window, so showing it
+    /// again puts point back, as Emacs's buffer point does.
+    pub(crate) last_point: Option<MarkerId>,
+    /// Emacs `recent-auto-save-p`: auto-saved since last read or saved, so
+    /// the auto-save file is this session's and a save may delete it.
+    pub(crate) auto_saved_since_save: bool,
     markers: SlotMap<MarkerId, Marker>,
     modified_tick: u64,
     save_tick: u64,
+    auto_save_tick: u64,
 }
 
 impl Buffer {
@@ -73,9 +101,14 @@ impl Buffer {
             mark_active: false,
             mark_ring: VecDeque::new(),
             undo: UndoList::new(limits),
+            loading: false,
+            coding: CodingMnemonic::Utf8,
+            last_point: None,
+            auto_saved_since_save: false,
             markers: SlotMap::with_key(),
             modified_tick: 0,
             save_tick: 0,
+            auto_save_tick: 0,
         }
     }
 
@@ -87,12 +120,35 @@ impl Buffer {
         self.save_tick = self.modified_tick;
     }
 
+    /// Emacs `(set-buffer-modified-p t)` without a change, as `write-file`
+    /// does so the new file is written even when nothing was edited.
+    pub(crate) fn mark_modified(&mut self) {
+        if !self.is_modified() {
+            self.modified_tick += 1;
+        }
+    }
+
+    /// Changed since the last auto-save (or since visiting).
+    pub(crate) fn changed_since_auto_save(&self) -> bool {
+        self.is_modified() && self.modified_tick > self.auto_save_tick
+    }
+
+    /// Records that the current text is being auto-saved; returns the
+    /// previous mark so a failed auto-save can restore it.
+    pub(crate) fn mark_auto_saved(&mut self) -> u64 {
+        std::mem::replace(&mut self.auto_save_tick, self.modified_tick)
+    }
+
+    pub(crate) fn restore_auto_save_mark(&mut self, tick: u64) {
+        self.auto_save_tick = tick;
+    }
+
     pub(crate) fn visited_identity(&self) -> Option<FileIdentity> {
         self.file.as_ref().and_then(|file| file.identity)
     }
 
     pub(crate) fn check_editable(&self) -> Result<(), EditError> {
-        if self.read_only {
+        if self.read_only || self.loading {
             return Err(EditError::ReadOnly);
         }
         if self.file.as_ref().is_some_and(|file| file.saving) {
