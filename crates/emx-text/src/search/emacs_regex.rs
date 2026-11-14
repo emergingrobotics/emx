@@ -312,6 +312,11 @@ impl Translator {
                 self.reset_item();
                 Ok(())
             }
+            // These map to the regex engine's Unicode word boundaries, which
+            // classify `_` as a word character. Emacs instead decides word and
+            // symbol boundaries from the buffer's syntax table, where `_` is a
+            // symbol constituent, not a word one, so a boundary next to `_` can
+            // disagree with Emacs. Syntax-table-aware boundaries are deferred.
             'b' => self.assertion(r"\b"),
             'B' => self.assertion(r"\B"),
             '<' => self.assertion(r"\b{start}"),
