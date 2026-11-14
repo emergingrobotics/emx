@@ -3,8 +3,9 @@
 //! paste, grapheme clusters (batch Emacs moves by code point), the
 //! read-only kill path, and configuration.
 
-use emx_core::Config;
 use emx_core::testing::Harness;
+use emx_core::{Config, Session};
+use emx_proto::ClientKind;
 
 fn with_config(config: Config, text: &str) -> Harness {
     let mut harness = Harness::with_config(config);
@@ -83,6 +84,20 @@ fn yank_pop_after_other_commands_reads_from_the_kill_ring() {
     assert_eq!(harness.echo_line(), "Yank from kill-ring: ");
     harness.keys("RET");
     assert_eq!(harness.text(), "abab");
+}
+
+/// The yank's text is found by the client's own record, which is gone once
+/// another client killed the buffer it was in: `M-y` cannot replace it.
+#[test]
+fn yank_pop_after_another_client_disturbed_the_yank_signals() {
+    let mut harness = Harness::with_session(Config::default(), Session::Server);
+    harness.set_text("|ab");
+    let other = harness.attach(ClientKind::Tui);
+    harness.keys("C-k C-y");
+    harness.keys_as(other, "C-x k RET");
+    harness.keys("M-y");
+    assert!(harness.signaled());
+    assert_eq!(harness.echo(), "Previous command was not a yank");
 }
 
 #[test]

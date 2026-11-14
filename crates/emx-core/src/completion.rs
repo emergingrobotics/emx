@@ -32,8 +32,23 @@ const ELLIPSIS: &str = "\u{2026}";
 /// icomplete's message when nothing matches, in `[]`, or `()` when the
 /// prompt requires a match.
 const NO_MATCHES: &str = "No matches";
+/// Shown while the directory listing is on its way.
+pub(crate) const LISTING: &str = "Listing directory...";
+/// Shown when the directory could not be listed because too many listings
+/// are outstanding (directories on a hung mount never answer).
+const OVERLOADED: &str = "Too many directory listings in progress";
 /// Buffer names starting with this are internal (Emacs's convention).
 const INTERNAL_BUFFER_PREFIX: char = ' ';
+
+/// Why a directory has no listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListingError {
+    /// It could not be read (missing, or not readable), with why.
+    Unreadable(String),
+    /// It was not read at all: as many listings as allowed are still
+    /// outstanding, which only directories that never answer cause.
+    Overloaded,
+}
 
 /// One thing a prompt can complete to. A directory's name ends in `/`, as
 /// Emacs file-name completion gives it.
@@ -394,7 +409,7 @@ pub(crate) struct Completer {
     /// directory in `listed`, empty until it arrives.
     base: Arc<[Candidate]>,
     listed: Option<PathBuf>,
-    listing_error: Option<String>,
+    listing_error: Option<ListingError>,
     /// The listing asked for and not yet arrived. Any other listing that
     /// arrives is stale and ignored.
     awaited: Option<(ListingId, PathBuf)>,
@@ -548,7 +563,7 @@ impl Completer {
     pub(crate) fn listing_arrived(
         &mut self,
         id: ListingId,
-        result: Result<Vec<Candidate>, String>,
+        result: Result<Vec<Candidate>, ListingError>,
         input: &[u8],
     ) -> bool {
         let Some((_, directory)) = self.awaited.take_if(|(awaited, _)| *awaited == id) else {
@@ -643,28 +658,38 @@ impl Completer {
         (shown, Some(self.selected - first))
     }
 
-    /// What icomplete shows after the input when there is nothing to list:
-    /// ` [No matches]`, or why the directory could not be listed. Nothing
-    /// while the listing is still on its way.
+    /// What the prompt shows after the input: that the listing is on its
+    /// way; icomplete's ` [No matches]` when nothing matches (also for a
+    /// directory that cannot be read, as Emacs 29 fido shows it); or that
+    /// the listing was refused because too many are outstanding.
     pub(crate) fn status(&self) -> Option<String> {
-        if self.pending() || !self.matches.is_empty() {
-            return None;
-        }
-        // An empty directory with nothing typed yet: fido would still list
-        // `./` and `../`, which emx leaves out, so there is nothing to say.
-        let typed = self
-            .filtered_for
-            .as_ref()
-            .is_some_and(|pattern| !pattern.is_empty());
-        if !typed && self.listing_error.is_none() {
-            return None;
-        }
         let (open, close) = if self.require_match {
             ('(', ')')
         } else {
             ('[', ']')
         };
-        let text = self.listing_error.as_deref().unwrap_or(NO_MATCHES);
+        if self.pending() {
+            return Some(format!(" [{LISTING}]"));
+        }
+        if !self.matches.is_empty() {
+            return None;
+        }
+        let text = match &self.listing_error {
+            Some(ListingError::Overloaded) => OVERLOADED,
+            Some(ListingError::Unreadable(_)) => NO_MATCHES,
+            None => {
+                // An empty directory with nothing typed yet: fido would
+                // still list `./` and `../`, which emx leaves out.
+                let typed = self
+                    .filtered_for
+                    .as_ref()
+                    .is_some_and(|pattern| !pattern.is_empty());
+                if !typed {
+                    return None;
+                }
+                NO_MATCHES
+            }
+        };
         Some(format!(" {open}{text}{close}"))
     }
 

@@ -9,8 +9,9 @@
 //!
 //! A prompt that completes (`completion`) gets `fido-vertical-mode`'s keys:
 //! `RET` takes the selected candidate (entering it when it is a
-//! directory), `C-j`/`M-j` take the input as typed, `C-n`/`C-p` and the
-//! arrows move the selection, and `DEL` after a `/` goes up a directory.
+//! directory), `C-j`/`M-j` take the input as typed, `C-n`/`C-p`, fido's
+//! `C-s`/`C-r` and the arrows move the selection, and `DEL` after a `/`
+//! goes up a directory.
 
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStringExt;
@@ -18,7 +19,7 @@ use std::path::Path;
 
 use emx_types::{Key, KeyCode, Mods};
 
-use crate::completion::{Candidate, Completer};
+use crate::completion::{Candidate, Completer, LISTING, ListingError};
 use crate::editor::Purpose;
 use crate::event::ListingId;
 use crate::io::expand_file_name;
@@ -36,6 +37,10 @@ const PLEASE_ANSWER_Y_OR_N: &str = " [Please answer y or n]";
 const PLEASE_ANSWER_YES_OR_NO: &str = "Please answer yes or no.";
 const DIRECTORY_SEPARATOR: u8 = b'/';
 const UTF8_MAX_LEN: usize = 4;
+/// Added to the listing status while `RET` waits for the listing, so a
+/// directory that never answers does not leave `RET` silently doing
+/// nothing: `C-j` takes the input without waiting.
+const RET_WAITS: &str = "; RET waits for it, C-j takes the input as typed";
 const HOME_DIRECTORY_INPUT: &[u8] = b"~/";
 
 /// The history lists Emacs keeps separately.
@@ -189,10 +194,10 @@ fn completion_command(key: Key) -> Option<Command> {
             Some(Command::ForceComplete)
         }
         (KeyCode::Char('j'), false, true, false) => Some(Command::Exit),
-        (KeyCode::Char('n'), true, false, false) | (KeyCode::Down, false, false, false) => {
+        (KeyCode::Char('n' | 's'), true, false, false) | (KeyCode::Down, false, false, false) => {
             Some(Command::NextCandidate)
         }
-        (KeyCode::Char('p'), true, false, false) | (KeyCode::Up, false, false, false) => {
+        (KeyCode::Char('p' | 'r'), true, false, false) | (KeyCode::Up, false, false, false) => {
             Some(Command::PreviousCandidate)
         }
         (KeyCode::Char('<'), false, true, false) => Some(Command::FirstCandidate),
@@ -309,7 +314,13 @@ impl Minibuffer {
                 match overlay {
                     Some(Overlay::Append(message)) => line.extend_from_slice(message.as_bytes()),
                     _ => {
-                        let status = self.completion.as_ref().and_then(Completer::status);
+                        let waiting = self.accept_when_listed
+                            && self.completion.as_ref().is_some_and(Completer::pending);
+                        let status = if waiting {
+                            Some(format!(" [{LISTING}{RET_WAITS}]"))
+                        } else {
+                            self.completion.as_ref().and_then(Completer::status)
+                        };
                         if let Some(status) = status {
                             line.extend_from_slice(status.as_bytes());
                         }
@@ -335,7 +346,7 @@ impl Minibuffer {
     pub(crate) fn listing_arrived(
         &mut self,
         id: ListingId,
-        result: Result<Vec<Candidate>, String>,
+        result: Result<Vec<Candidate>, ListingError>,
         histories: &mut Histories,
     ) -> Option<Outcome> {
         let completion = self.completion.as_mut()?;
@@ -343,7 +354,16 @@ impl Minibuffer {
             return None;
         }
         self.accept_when_listed = false;
-        Some(self.accept(histories))
+        let before = self.input.clone();
+        let outcome = self.accept(histories);
+        // Keys update completion in `line_key`; this `RET` came with the
+        // listing, so entering a directory has to be followed here.
+        if self.input != before
+            && let Some(completion) = self.completion.as_mut()
+        {
+            completion.update(&self.input);
+        }
+        Some(outcome)
     }
 
     /// Handles one key; on `Exit` the answer has been added to history.
@@ -556,9 +576,6 @@ impl Minibuffer {
         let enters = completion.completes_files() && candidate.is_directory();
         self.set_input(completed);
         if enters {
-            if let Some(completion) = self.completion.as_mut() {
-                completion.update(&self.input);
-            }
             return Outcome::Continue;
         }
         self.exit(histories)

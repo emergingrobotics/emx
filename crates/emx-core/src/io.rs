@@ -25,7 +25,7 @@ use xattr::FileExt;
 use crate::autosave;
 pub use crate::buffer::CodingMnemonic;
 use crate::buffer::FileBinding;
-use crate::completion::{Candidate, sort_by_length_then_name};
+use crate::completion::{Candidate, ListingError, sort_by_length_then_name};
 use crate::config::Config;
 use crate::inplace::{self, Move};
 
@@ -988,12 +988,19 @@ pub fn expand_file_name(input: impl AsRef<[u8]>, default_directory: &Path) -> Pa
 /// `..`, a directory (or a link to one) with a `/` appended as Emacs
 /// `file-name-all-completions` gives it, sorted shortest first and then by
 /// name. Names are bytes, so names that are not UTF-8 round-trip.
-pub fn list_directory(directory: &Path) -> Result<Vec<Candidate>, String> {
-    let entries = fs::read_dir(directory).map_err(|error| strerror(&error))?;
+pub fn list_directory(directory: &Path) -> Result<Vec<Candidate>, ListingError> {
+    let unreadable = |error: io::Error| ListingError::Unreadable(strerror(&error));
+    let entries = fs::read_dir(directory).map_err(unreadable)?;
     let mut candidates = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|error| strerror(&error))?;
-        let file_type = entry.file_type().map_err(|error| strerror(&error))?;
+        // An entry removed while the directory is read cannot be looked
+        // at; like Emacs, the listing goes on without it.
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         // A link whose target cannot be looked at is not a directory.
         let is_directory = if file_type.is_symlink() {
             fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_dir())

@@ -8,6 +8,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+use emx_core::completion::ListingError;
 use emx_core::testing::{HARNESS_ROWS, Harness};
 use emx_core::{Config, Session};
 use emx_proto::ClientKind;
@@ -364,7 +365,11 @@ fn listings_arrive_later_and_stale_ones_are_ignored() {
     harness.hold_listings();
     harness.keys("C-x C-f");
     let prefix = format!("Find file: {}", dir_text(directory.path()));
-    assert_eq!(harness.echo_line(), prefix, "the prompt shows at once");
+    assert_eq!(
+        harness.echo_line(),
+        format!("{prefix} [Listing directory...]"),
+        "the prompt shows at once, saying the listing is on its way"
+    );
     assert!(harness.candidates().is_empty());
     assert_eq!(harness.held_listings(), [directory.path().to_path_buf()]);
     // The input moves to another directory before the first listing is in.
@@ -403,18 +408,75 @@ fn listings_arrive_later_and_stale_ones_are_ignored() {
 }
 
 #[test]
-fn unlistable_directory_says_why() {
+fn unlistable_directory_shows_no_matches_like_emacs() {
     let directory = tempfile::tempdir().expect("tempdir");
     let mut harness = harness_in(directory.path());
     harness.keys("C-x C-f");
     harness.type_text("missing/");
-    assert!(
-        harness
-            .echo_line()
-            .ends_with("missing/ [No such file or directory]"),
-        "{}",
-        harness.echo_line()
+    assert_eq!(
+        harness.echo_line(),
+        format!(
+            "Find file: {}missing/ [No matches]",
+            dir_text(directory.path())
+        )
     );
+}
+
+#[test]
+fn a_pending_listing_shows_and_ret_says_it_waits() {
+    let directory = fruit_directory();
+    let mut harness = harness_in(directory.path());
+    harness.hold_listings();
+    harness.keys("C-x C-f");
+    let prefix = format!("Find file: {}", dir_text(directory.path()));
+    assert_eq!(
+        harness.echo_line(),
+        format!("{prefix} [Listing directory...]")
+    );
+    harness.type_text("ban");
+    harness.keys("RET");
+    assert_eq!(
+        harness.echo_line(),
+        format!(
+            "{prefix}ban [Listing directory...; RET waits for it, C-j takes the input as typed]"
+        )
+    );
+    // The directory never answers: C-j still takes the input.
+    harness.keys("C-j");
+    assert_eq!(harness.buffer().name, "ban");
+}
+
+#[test]
+fn a_refused_listing_says_so() {
+    let directory = fruit_directory();
+    let mut harness = harness_in(directory.path());
+    harness.hold_listings();
+    harness.keys("C-x C-f");
+    harness.answer_held_listings(Err(ListingError::Overloaded));
+    assert_eq!(
+        harness.echo_line(),
+        format!(
+            "Find file: {} [Too many directory listings in progress]",
+            dir_text(directory.path())
+        )
+    );
+    assert!(harness.candidates().is_empty());
+    harness.keys("RET");
+    assert_eq!(
+        harness.buffer().name,
+        "*scratch*",
+        "RET with no candidate exits with the directory, which is an error"
+    );
+}
+
+#[test]
+fn c_s_and_c_r_move_the_selection() {
+    let directory = fruit_directory();
+    let mut harness = harness_in(directory.path());
+    harness.keys("C-x C-f C-s C-s");
+    assert_eq!(harness.selected_candidate().as_deref(), Some("banana.txt"));
+    harness.keys("C-r");
+    assert_eq!(harness.selected_candidate().as_deref(), Some("apple.txt"));
 }
 
 #[test]

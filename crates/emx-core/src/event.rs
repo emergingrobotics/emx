@@ -6,7 +6,7 @@ use emx_text::{FileIdentity, Text};
 use emx_types::Key;
 
 use crate::buffer::BufferId;
-use crate::completion::Candidate;
+use crate::completion::{Candidate, ListingError};
 use crate::diff::{DiffJob, DiffRequester};
 use crate::io::{Loaded, SaveFailure, SavePlan, SavedFile};
 use crate::journal::{JournalOp, RecoveredBuffer};
@@ -143,7 +143,7 @@ pub enum Event {
     DirectoryListed {
         client: ClientId,
         id: ListingId,
-        result: Result<Vec<Candidate>, String>,
+        result: Result<Vec<Candidate>, ListingError>,
     },
 }
 

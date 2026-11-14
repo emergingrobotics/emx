@@ -1,15 +1,15 @@
 //! Work the editor thread hands off (DESIGN section 8: never block the UI
 //! thread): file reads and saves, auto-saves and cache prefetches on a pool
-//! of `IO_THREADS` threads, one line indexer thread per file, and
-//! directory listings for completion on `LISTING_THREADS` threads of their
-//! own.
+//! of `IO_THREADS` threads, one line indexer thread per file, and a thread
+//! per directory listed for completion (`Listers`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
+use emx_core::completion::{Candidate, ListingError};
 use emx_core::diff::{self, DiffJob};
 use emx_core::io::{self, SaveFailure, SavePlan};
 use emx_core::{
@@ -22,10 +22,13 @@ use super::journal_writer::JournalProgress;
 
 /// DESIGN section 8 sizes the I/O pool at four threads.
 pub const IO_THREADS: usize = 4;
-/// Threads that list directories for file-name completion. They are apart
-/// from the I/O pool because a directory on a hung network filesystem can
-/// block its reader forever: that may stall completion, never a save.
-pub const LISTING_THREADS: usize = 4;
+/// The most directory reads for completion outstanding at once. Each read
+/// has a thread of its own, and a read on a hung network mount never
+/// returns and keeps its thread, so they must be capped; typing a path
+/// below a hung point asks for a new directory at every `/`, which this
+/// leaves plenty of room for. A request over the cap fails at once and the
+/// prompt says so, instead of queueing behind reads that may never end.
+pub const LISTINGS_IN_FLIGHT_MAX: usize = 64;
 /// The indexer reports its progress every this many blocks.
 pub const INDEX_PROGRESS_BLOCKS: u64 = 256;
 
@@ -403,91 +406,269 @@ fn index_lines(
     deliver(Event::IndexFinished { buffer, result });
 }
 
-/// Who asked for a directory's listing: every request for a directory
-/// already queued or being read waits for that one read.
+/// Who waits for a directory's listing. A client awaits one listing at a
+/// time, so a client's newer request for the same directory replaces its
+/// older one: a list holds at most one entry per client.
 type Requesters = Vec<(ClientId, ListingId)>;
 
-#[derive(Default)]
-struct ListingQueue {
-    waiting: VecDeque<PathBuf>,
-    requesters: HashMap<PathBuf, Requesters>,
-    closed: bool,
-}
+/// How a directory is read; `io::list_directory` except in tests, which
+/// stand in directories that answer late or never.
+pub type ListFn = dyn Fn(&Path) -> Result<Vec<Candidate>, ListingError> + Send + Sync;
 
-/// Lists directories for completion (`Effect::ListDirectory`). The threads
-/// are never joined: one stuck reading a hung mount must not keep the
-/// server from exiting.
+/// The directories being read, each with who waits for it. It holds at
+/// most `cap` directories, and each of those at most one entry per
+/// client, so it stays bounded even when reads never return.
+type InFlight = Arc<Mutex<HashMap<PathBuf, Requesters>>>;
+
+/// Lists directories for completion (`Effect::ListDirectory`), each
+/// directory on a thread of its own: a directory on a hung mount blocks
+/// only its own read, never a listing of another directory, a save or the
+/// server's exit (the threads are never joined). Requests for a directory
+/// already being read share that read.
 pub struct Listers {
-    shared: Arc<(Mutex<ListingQueue>, Condvar)>,
+    in_flight: InFlight,
+    deliver: Deliver,
+    list: Arc<ListFn>,
+    cap: usize,
 }
 
 impl Listers {
     pub fn new(deliver: Deliver) -> Listers {
-        let shared = Arc::new((Mutex::new(ListingQueue::default()), Condvar::new()));
-        for index in 0..LISTING_THREADS {
-            let shared = shared.clone();
-            let deliver = deliver.clone();
-            // Dropping the handle detaches the thread.
-            thread::Builder::new()
-                .name(format!("emx-list-{index}"))
-                .spawn(move || list_directories(&shared, &deliver))
-                .expect("spawning a directory lister");
+        Listers::with(
+            deliver,
+            LISTINGS_IN_FLIGHT_MAX,
+            Arc::new(io::list_directory),
+        )
+    }
+
+    /// Listers that read with `list` and allow `cap` reads outstanding.
+    pub fn with(deliver: Deliver, cap: usize, list: Arc<ListFn>) -> Listers {
+        Listers {
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            deliver,
+            list,
+            cap,
         }
-        Listers { shared }
     }
 
     pub fn submit(&self, client: ClientId, id: ListingId, directory: PathBuf) {
-        let (queue, ready) = &*self.shared;
-        let mut state = queue.lock().expect("listing lock");
-        match state.requesters.get_mut(&directory) {
-            Some(requesters) => requesters.push((client, id)),
-            None => {
-                state
-                    .requesters
-                    .insert(directory.clone(), vec![(client, id)]);
-                state.waiting.push_back(directory);
-                ready.notify_one();
-            }
+        let mut in_flight = self.in_flight.lock().expect("listing lock");
+        if let Some(requesters) = in_flight.get_mut(&directory) {
+            requesters.retain(|(requester, _)| *requester != client);
+            requesters.push((client, id));
+            return;
+        }
+        if in_flight.len() >= self.cap {
+            drop(in_flight);
+            (self.deliver)(Event::DirectoryListed {
+                client,
+                id,
+                result: Err(ListingError::Overloaded),
+            });
+            return;
+        }
+        in_flight.insert(directory.clone(), vec![(client, id)]);
+        drop(in_flight);
+        let shared = self.in_flight.clone();
+        let deliver = self.deliver.clone();
+        let list = self.list.clone();
+        let reader = directory.clone();
+        let spawned = thread::Builder::new()
+            .name("emx-list".to_string())
+            .spawn(move || {
+                let result = list(&reader);
+                finish_listing(&shared, &deliver, &reader, &result);
+            });
+        // Dropping the handle detaches the thread. A thread that cannot be
+        // started is the same shortage the cap guards against.
+        if spawned.is_err() {
+            finish_listing(
+                &self.in_flight,
+                &self.deliver,
+                &directory,
+                &Err(ListingError::Overloaded),
+            );
         }
     }
 }
 
-impl Drop for Listers {
-    fn drop(&mut self) {
-        let (queue, ready) = &*self.shared;
-        queue.lock().expect("listing lock").closed = true;
-        ready.notify_all();
+fn finish_listing(
+    in_flight: &InFlight,
+    deliver: &Deliver,
+    directory: &Path,
+    result: &Result<Vec<Candidate>, ListingError>,
+) {
+    let requesters = in_flight
+        .lock()
+        .expect("listing lock")
+        .remove(directory)
+        .unwrap_or_default();
+    for (client, id) in requesters {
+        deliver(Event::DirectoryListed {
+            client,
+            id,
+            result: result.clone(),
+        });
     }
 }
 
-fn list_directories(shared: &(Mutex<ListingQueue>, Condvar), deliver: &Deliver) {
-    let (queue, ready) = shared;
-    loop {
-        let directory = {
-            let mut state = queue.lock().expect("listing lock");
-            loop {
-                if state.closed {
-                    return;
-                }
-                if let Some(directory) = state.waiting.pop_front() {
-                    break directory;
-                }
-                state = ready.wait(state).expect("listing lock");
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    use emx_core::completion::Candidate;
+
+    use super::*;
+
+    const WAIT: Duration = Duration::from_secs(10);
+    const HUNG: &str = "/hung";
+
+    /// A gate that holds reads below `HUNG` (and every read, when `all`) until
+    /// opened, counting reads.
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        opened: Condvar,
+        reads: Mutex<Vec<PathBuf>>,
+    }
+
+    impl Gate {
+        fn open(&self) {
+            *self.open.lock().expect("gate") = true;
+            self.opened.notify_all();
+        }
+
+        fn wait(&self) {
+            let mut open = self.open.lock().expect("gate");
+            while !*open {
+                open = self.opened.wait(open).expect("gate");
             }
-        };
-        let result = io::list_directory(&directory);
-        let requesters = queue
-            .lock()
-            .expect("listing lock")
-            .requesters
-            .remove(&directory)
-            .unwrap_or_default();
-        for (client, id) in requesters {
-            deliver(Event::DirectoryListed {
-                client,
-                id,
-                result: result.clone(),
-            });
+        }
+    }
+
+    fn listers(cap: usize, gate: &Arc<Gate>, all: bool) -> (Listers, Receiver<Event>) {
+        let (sender, receiver) = mpsc::channel();
+        let sender = Mutex::new(sender);
+        let deliver: Deliver = Arc::new(move |event| {
+            sender
+                .lock()
+                .expect("sender")
+                .send(event)
+                .expect("receiver");
+        });
+        let gate = gate.clone();
+        let list: Arc<ListFn> = Arc::new(move |directory: &Path| {
+            gate.reads
+                .lock()
+                .expect("reads")
+                .push(directory.to_path_buf());
+            if all || directory.starts_with(HUNG) {
+                gate.wait();
+            }
+            Ok(vec![Candidate::new(
+                directory.as_os_str().as_encoded_bytes(),
+            )])
+        });
+        (Listers::with(deliver, cap, list), receiver)
+    }
+
+    fn listed(event: Event) -> (ClientId, ListingId, Result<Vec<Candidate>, ListingError>) {
+        match event {
+            Event::DirectoryListed { client, id, result } => (client, id, result),
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    #[test]
+    fn requests_for_one_directory_share_one_read() {
+        let gate = Arc::new(Gate::default());
+        let (listers, events) = listers(LISTINGS_IN_FLIGHT_MAX, &gate, true);
+        listers.submit(ClientId(1), ListingId(1), PathBuf::from("/a"));
+        listers.submit(ClientId(2), ListingId(2), PathBuf::from("/a"));
+        // The first client moved on: only its newest request is answered.
+        listers.submit(ClientId(1), ListingId(3), PathBuf::from("/a"));
+        gate.open();
+        let first = listed(events.recv_timeout(WAIT).expect("listed"));
+        let second = listed(events.recv_timeout(WAIT).expect("listed"));
+        let mut answered = vec![(first.0, first.1), (second.0, second.1)];
+        answered.sort();
+        assert_eq!(
+            answered,
+            [(ClientId(1), ListingId(3)), (ClientId(2), ListingId(2))]
+        );
+        assert_eq!(first.2, second.2);
+        assert!(events.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(*gate.reads.lock().expect("reads"), [PathBuf::from("/a")]);
+    }
+
+    /// More hung directories than a fixed pool would have threads (typing
+    /// a path below a hung mount asks for one at every `/`).
+    const HUNG_DIRECTORIES: u64 = 8;
+
+    #[test]
+    fn hung_directories_do_not_hold_up_another() {
+        let gate = Arc::new(Gate::default());
+        let (listers, events) = listers(LISTINGS_IN_FLIGHT_MAX, &gate, false);
+        let mut hung = PathBuf::from(HUNG);
+        for _ in 0..HUNG_DIRECTORIES {
+            hung.push("below");
+            listers.submit(ClientId(1), ListingId(1), hung.clone());
+        }
+        listers.submit(ClientId(2), ListingId(2), PathBuf::from("/fast"));
+        let (client, id, result) = listed(events.recv_timeout(WAIT).expect("listed"));
+        assert_eq!((client, id), (ClientId(2), ListingId(2)));
+        assert_eq!(result.expect("read").len(), 1);
+        gate.open();
+        for _ in 0..HUNG_DIRECTORIES {
+            let (client, _, _) = listed(events.recv_timeout(WAIT).expect("listed"));
+            assert_eq!(client, ClientId(1));
+        }
+    }
+
+    #[test]
+    fn requests_over_the_cap_fail_at_once() {
+        let gate = Arc::new(Gate::default());
+        let (listers, events) = listers(2, &gate, true);
+        listers.submit(ClientId(1), ListingId(1), PathBuf::from("/one"));
+        listers.submit(ClientId(1), ListingId(2), PathBuf::from("/two"));
+        listers.submit(ClientId(1), ListingId(3), PathBuf::from("/three"));
+        let (_, id, result) = listed(events.recv_timeout(WAIT).expect("refused"));
+        assert_eq!(id, ListingId(3));
+        assert_eq!(result, Err(ListingError::Overloaded));
+        // A directory already being read is no new read: it is not refused.
+        listers.submit(ClientId(2), ListingId(4), PathBuf::from("/one"));
+        assert!(events.recv_timeout(Duration::from_millis(100)).is_err());
+        gate.open();
+        let mut answered: Vec<ListingId> = (0..3)
+            .map(|_| listed(events.recv_timeout(WAIT).expect("listed")).1)
+            .collect();
+        answered.sort();
+        assert_eq!(answered, [ListingId(1), ListingId(2), ListingId(4)]);
+        // With the reads done there is room again.
+        listers.submit(ClientId(1), ListingId(5), PathBuf::from("/three"));
+        let (_, id, result) = listed(events.recv_timeout(WAIT).expect("listed"));
+        assert_eq!(id, ListingId(5));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn finished_listings_leave_nothing_behind() {
+        let gate = Arc::new(Gate::default());
+        let (listers, events) = listers(LISTINGS_IN_FLIGHT_MAX, &gate, false);
+        listers.submit(ClientId(1), ListingId(1), PathBuf::from("/a"));
+        assert!(listed(events.recv_timeout(WAIT).expect("listed")).2.is_ok());
+        let in_flight = Arc::downgrade(&listers.in_flight);
+        drop(listers);
+        // The reading thread lets go of the state once it has delivered.
+        let deadline = Instant::now() + WAIT;
+        while in_flight.upgrade().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "a listing thread was left running"
+            );
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 }

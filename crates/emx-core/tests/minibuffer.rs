@@ -40,7 +40,7 @@ fn find_file_prompt_edits_a_line() {
     let typed = format!("{}/ab", directory.path().display());
     assert_eq!(
         harness.echo_line(),
-        format!("Find file: {typed}{typed} [No such file or directory]")
+        format!("Find file: {typed}{typed}{no_matches}")
     );
     assert_eq!(
         harness.kill_ring()[0],

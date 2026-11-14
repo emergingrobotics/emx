@@ -12,6 +12,7 @@ use emx_types::{Grid, Key, KeyCode, Mods, parse_kbd};
 
 use crate::autosave;
 use crate::buffer::{Buffer, BufferId};
+use crate::completion::{Candidate, ListingError};
 use crate::config::Config;
 use crate::diff;
 use crate::editor::{Editor, Session};
@@ -369,6 +370,19 @@ impl Harness {
                 client,
                 id,
                 result: io::list_directory(&directory),
+            });
+        }
+    }
+
+    /// Answers every held listing with `result` instead of reading, as a
+    /// server that refused or failed the reads would.
+    pub fn answer_held_listings(&mut self, result: Result<Vec<Candidate>, ListingError>) {
+        self.hold_listings = false;
+        for (client, id, _) in std::mem::take(&mut self.held_listings) {
+            self.handle(Event::DirectoryListed {
+                client,
+                id,
+                result: result.clone(),
             });
         }
     }

@@ -14,7 +14,7 @@ use super::{Editor, Session, TimerPurpose};
 use crate::autosave;
 use crate::buffer::{BufferId, CodingMnemonic, EditError, FileBinding};
 use crate::command::{CommandError, PrefixArg};
-use crate::completion::{Candidate, Completer};
+use crate::completion::{Candidate, Completer, ListingError};
 use crate::event::ListingId;
 use crate::event::{AutoSaveJob, ClientId, Effect};
 use crate::inplace::Move;
@@ -507,7 +507,7 @@ impl Editor {
         &mut self,
         client: ClientId,
         id: ListingId,
-        result: Result<Vec<Candidate>, String>,
+        result: Result<Vec<Candidate>, ListingError>,
     ) {
         let Some(state) = self.clients.get_mut(&client) else {
             return;
