@@ -1,7 +1,9 @@
 use emx_text::{ReadError, Text};
 
 use super::mark::push_mark;
-use super::r#move::{char_after, char_before, forward_line, line_end, line_start, word_target};
+use super::r#move::{
+    char_after, char_before, char_count, forward_line, line_end, line_start, word_target,
+};
 use super::{CommandContext, CommandError, PrefixArg};
 use crate::killring::KillRingError;
 
@@ -135,54 +137,6 @@ pub(super) fn step_chars(text: &Text, pos: u64, count: i64) -> Result<Option<u64
         }
     }
     Ok(Some(position))
-}
-
-/// Characters before `end`, as Emacs counts positions: each invalid byte is
-/// one character.
-fn char_count(text: &Text, end: u64) -> Result<u64, ReadError> {
-    let mut count = 0;
-    let mut pending: Vec<u8> = Vec::new();
-    for chunk in text.chunks(0..end) {
-        pending.extend_from_slice(chunk?.bytes());
-        let consumed = count_chars(&pending, false, &mut count);
-        pending.drain(..consumed);
-    }
-    count_chars(&pending, true, &mut count);
-    Ok(count)
-}
-
-/// Counts the characters in `bytes` and returns how many bytes it consumed;
-/// a sequence cut short at the end is left for the next chunk unless this
-/// is the last.
-fn count_chars(bytes: &[u8], last: bool, count: &mut u64) -> usize {
-    let mut index = 0;
-    loop {
-        match std::str::from_utf8(&bytes[index..]) {
-            Ok(valid) => {
-                *count += valid.chars().count() as u64;
-                return bytes.len();
-            }
-            Err(error) => {
-                let valid = &bytes[index..index + error.valid_up_to()];
-                *count += std::str::from_utf8(valid)
-                    .expect("valid_up_to marks valid UTF-8")
-                    .chars()
-                    .count() as u64;
-                index += error.valid_up_to();
-                match error.error_len() {
-                    Some(invalid) => {
-                        *count += invalid as u64;
-                        index += invalid;
-                    }
-                    None if last => {
-                        *count += (bytes.len() - index) as u64;
-                        return bytes.len();
-                    }
-                    None => return index,
-                }
-            }
-        }
-    }
 }
 
 /// Only spaces and tabs between `from` and `to`.

@@ -181,3 +181,7 @@
 {"name": "newline-shrinks-tab-indentation", "text": "  y|\t\tz", "keys": "RET", "tier": 1}
 {"name": "delete-char-kill-past-eob-error", "text": "ab|c", "keys": "C-u 2 C-d", "tier": 1}
 {"name": "delete-backward-char-kill-past-bob-error", "text": "a|bc", "keys": "C-u 2 DEL", "tier": 1}
+{"name": "beginning-of-buffer-tenths-multibyte", "text": "|éééééééééé\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\n", "keys": "M-2 M-<", "tier": 1}
+{"name": "end-of-buffer-tenths-multibyte", "text": "|éééééééééé\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\nx\n", "keys": "M-3 M->", "tier": 1}
+{"name": "beginning-of-buffer-tenths-cjk", "text": "|中文中文中文\nab\ncd\n中文\nef\n", "keys": "M-3 M-<", "tier": 1}
+{"name": "end-of-buffer-tenths-cjk", "text": "|ab\n中文中文中文中文\ncd\nef\n", "keys": "M-3 M->", "tier": 1}

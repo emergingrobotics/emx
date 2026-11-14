@@ -155,14 +155,14 @@ pub(super) fn end_of_buffer(ctx: &mut CommandContext) -> Result<(), CommandError
     let length = ctx.buffer().text.len();
     jump_in_buffer(
         ctx,
-        |length, numerator| length - numerator / BUFFER_FRACTIONS,
+        |size, numerator| size - numerator / BUFFER_FRACTIONS,
         length,
     )
 }
 
 /// The shared part of `beginning-of-buffer` and `end-of-buffer`. `numbered`
-/// maps the buffer length and length * N to the target for an argument N;
-/// Emacs counts characters there, and emx counts bytes.
+/// maps the buffer size and size * N, both in characters as Emacs counts
+/// them, to the target character position for an argument N.
 fn jump_in_buffer(
     ctx: &mut CommandContext,
     numbered: impl Fn(i128, i128) -> i128,
@@ -175,14 +175,14 @@ fn jump_in_buffer(
         push_mark(ctx, point, false, false);
     }
     let text = ctx.buffer().text.clone();
-    let length = text.len();
     let target = match argument {
         PrefixArg::None | PrefixArg::Raw(_) => edge,
         PrefixArg::Numeric(_) | PrefixArg::Negative => {
-            let numerator = i128::from(length) * i128::from(argument.numeric_value());
-            let wanted = numbered(i128::from(length), numerator).clamp(0, i128::from(length));
-            let wanted = u64::try_from(wanted).expect("clamped to the buffer length");
-            forward_line(&text, wanted, 1)?.1
+            let size = i128::from(char_count(&text, text.len())?);
+            let numerator = size * i128::from(argument.numeric_value());
+            let wanted = numbered(size, numerator).clamp(0, size);
+            let wanted = u64::try_from(wanted).expect("clamped to the buffer size");
+            forward_line(&text, char_to_byte(&text, wanted)?, 1)?.1
         }
     };
     ctx.set_point(target);
@@ -380,6 +380,69 @@ pub(crate) fn snap_to_unit(text: &Text, pos: u64, forward: bool) -> Result<u64, 
         return Ok(pos);
     }
     Ok(if forward { end } else { start })
+}
+
+/// Characters before `end`, as Emacs counts positions: each invalid byte is
+/// one character.
+pub(crate) fn char_count(text: &Text, end: u64) -> Result<u64, ReadError> {
+    let mut count = 0;
+    let mut pending: Vec<u8> = Vec::new();
+    for chunk in text.chunks(0..end) {
+        pending.extend_from_slice(chunk?.bytes());
+        let consumed = count_chars(&pending, false, &mut count);
+        pending.drain(..consumed);
+    }
+    count_chars(&pending, true, &mut count);
+    Ok(count)
+}
+
+/// Counts the characters in `bytes` and returns how many bytes it consumed;
+/// a sequence cut short at the end is left for the next chunk unless this
+/// is the last.
+fn count_chars(bytes: &[u8], last: bool, count: &mut u64) -> usize {
+    let mut index = 0;
+    loop {
+        match std::str::from_utf8(&bytes[index..]) {
+            Ok(valid) => {
+                *count += valid.chars().count() as u64;
+                return bytes.len();
+            }
+            Err(error) => {
+                let valid = &bytes[index..index + error.valid_up_to()];
+                *count += std::str::from_utf8(valid)
+                    .expect("valid_up_to marks valid UTF-8")
+                    .chars()
+                    .count() as u64;
+                index += error.valid_up_to();
+                match error.error_len() {
+                    Some(invalid) => {
+                        *count += invalid as u64;
+                        index += invalid;
+                    }
+                    None if last => {
+                        *count += (bytes.len() - index) as u64;
+                        return bytes.len();
+                    }
+                    None => return index,
+                }
+            }
+        }
+    }
+}
+
+/// The byte offset of the 0-based character position `target`, or the
+/// buffer end when there are fewer characters.
+fn char_to_byte(text: &Text, target: u64) -> Result<u64, ReadError> {
+    let mut position = 0;
+    let mut remaining = target;
+    while remaining > 0 {
+        let Some((_, length)) = char_after(text, position)? else {
+            break;
+        };
+        position += length;
+        remaining -= 1;
+    }
+    Ok(position)
 }
 
 /// The character starting at `pos` and its length in bytes, or `None` at
