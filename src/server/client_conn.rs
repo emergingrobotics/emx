@@ -33,8 +33,8 @@ pub const MAX_TERMINAL_ROWS: u16 = 250;
 /// Messages other than frames (answers, events) queued for a client that
 /// does not read them; past this the client is disconnected.
 pub const OUTBOX_MESSAGE_LIMIT: usize = 65_536;
-/// Bytes queued for a client that does not read them; past this the
-/// client is cut off.
+/// Bytes queued behind the message being sent for a client that does not
+/// read them; past this the client is cut off.
 pub const OUTBOX_BYTE_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -133,7 +133,11 @@ impl Outbox {
         if state.closed {
             return Delivery::Queued;
         }
-        let over_bytes = state.bytes + line.len() > OUTBOX_BYTE_LIMIT;
+        // Every message is bounded by `MAX_WIRE_MESSAGE` when encoded, so
+        // one is always admitted into an empty queue (a whole frame of a
+        // large terminal can exceed the limit); the limit bounds the
+        // backlog behind it.
+        let over_bytes = !state.queue.is_empty() && state.bytes + line.len() > OUTBOX_BYTE_LIMIT;
         if frame {
             if state.frames >= FRAME_QUEUE_DEPTH as usize || over_bytes {
                 state.resync = true;
@@ -457,5 +461,106 @@ fn write_loop(stream: UnixStream, client: ClientId, outbox: &Outbox, inputs: &Se
         && error.kind() != io::ErrorKind::NotConnected
     {
         eprintln!("emx server: closing client {}: {error}", client.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use emx_proto::{Response, RowUpdate};
+    use emx_types::Cell;
+
+    use super::*;
+
+    const MIB: usize = 1024 * 1024;
+
+    /// A full frame of about `bytes` bytes on the wire.
+    fn large_frame(bytes: usize) -> ServerMsg {
+        let cell_bytes = serde_json_len(&Cell::blank());
+        let cols = MAX_TERMINAL_COLS;
+        let rows = u16::try_from(bytes / (cell_bytes * usize::from(cols)) + 1).expect("rows");
+        ServerMsg::Frame {
+            full: true,
+            cols,
+            rows,
+            rows_changed: (0..rows)
+                .map(|row| RowUpdate {
+                    row,
+                    cells: vec![Cell::blank(); usize::from(cols)],
+                })
+                .collect(),
+            cursor: None,
+        }
+    }
+
+    fn serde_json_len(cell: &Cell) -> usize {
+        let mut line = Vec::new();
+        write_msg(
+            &mut line,
+            &ServerMsg::Frame {
+                full: true,
+                cols: 1,
+                rows: 1,
+                rows_changed: vec![RowUpdate {
+                    row: 0,
+                    cells: vec![cell.clone(); 2],
+                }],
+                cursor: None,
+            },
+        )
+        .expect("encode");
+        let mut one = Vec::new();
+        write_msg(
+            &mut one,
+            &ServerMsg::Frame {
+                full: true,
+                cols: 1,
+                rows: 1,
+                rows_changed: vec![RowUpdate {
+                    row: 0,
+                    cells: vec![cell.clone()],
+                }],
+                cursor: None,
+            },
+        )
+        .expect("encode");
+        line.len() - one.len()
+    }
+
+    fn diff_response(bytes: usize) -> ServerMsg {
+        ServerMsg::Response {
+            id: 1,
+            result: Ok(Response::Diff("d".repeat(bytes))),
+        }
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_byte_limit_is_sent_on_an_empty_outbox() {
+        let outbox = Outbox::default();
+        let frame = large_frame(OUTBOX_BYTE_LIMIT + MIB);
+        assert_eq!(outbox.push(frame.clone()), Delivery::Queued);
+        assert!(outbox.queued_bytes() > OUTBOX_BYTE_LIMIT);
+        let (sent, resync) = outbox.take_queued();
+        assert_eq!(sent, vec![frame]);
+        assert!(!resync, "no resync loop");
+    }
+
+    #[test]
+    fn a_nine_mib_diff_response_is_sent() {
+        let outbox = Outbox::default();
+        let response = diff_response(9 * MIB);
+        assert_eq!(outbox.push(response.clone()), Delivery::Queued);
+        assert_eq!(outbox.take_queued().0, vec![response]);
+    }
+
+    #[test]
+    fn a_backlog_past_the_byte_limit_still_overflows() {
+        let outbox = Outbox::default();
+        assert_eq!(outbox.push(diff_response(9 * MIB)), Delivery::Queued);
+        assert_eq!(outbox.push(diff_response(MIB)), Delivery::Overflow);
+        assert_eq!(
+            outbox.push(large_frame(MIB)),
+            Delivery::FrameDropped,
+            "a frame behind the backlog is dropped"
+        );
     }
 }

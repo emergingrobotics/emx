@@ -22,7 +22,8 @@ pub const INDEX_PROGRESS_BLOCKS: u64 = 256;
 
 /// Set in the environment, a save job panics on its I/O thread: the seam
 /// tests use to check that a worker panic ends the server (`panic =
-/// "abort"`) instead of leaving it wedged.
+/// "abort"`) instead of leaving it wedged. Debug builds only.
+#[cfg(debug_assertions)]
 pub const WORKER_PANIC_ENV: &str = "EMX_TEST_WORKER_PANIC";
 
 /// Where workers deliver the events their results become.
@@ -86,7 +87,7 @@ pub struct Pool {
 impl Pool {
     pub fn new(config: Arc<Config>, journal: JournalProgress, deliver: Deliver) -> Pool {
         let shared = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
-        let panic_on_save = std::env::var_os(WORKER_PANIC_ENV).is_some();
+        let panic_on_save = worker_panic_requested();
         let threads = (0..IO_THREADS)
             .map(|index| {
                 let shared = shared.clone();
@@ -160,6 +161,7 @@ fn work(
             }
         };
         journal.wait_for(queued.after_journal);
+        #[cfg(debug_assertions)]
         if panic_on_save && matches!(queued.job, Job::Save { .. }) {
             panic!("{WORKER_PANIC_ENV} is set: an I/O thread panics on a save");
         }
@@ -171,6 +173,17 @@ fn work(
             ready.notify_all();
         }
     }
+}
+
+#[cfg(debug_assertions)]
+fn worker_panic_requested() -> bool {
+    std::env::var_os(WORKER_PANIC_ENV).is_some()
+}
+
+/// Release builds carry no test seam.
+#[cfg(not(debug_assertions))]
+fn worker_panic_requested() -> bool {
+    false
 }
 
 fn run(job: Job, config: &Config) -> Option<Event> {
