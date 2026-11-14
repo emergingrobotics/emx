@@ -4,6 +4,7 @@ mod kill;
 mod mark;
 mod misc;
 mod r#move;
+mod window;
 mod word_syntax;
 
 pub(crate) use kill::xterm_paste;
@@ -275,6 +276,38 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "read-only-mode",
         run: files::read_only_mode,
+    },
+    CommandSpec {
+        name: "split-window-below",
+        run: window::split_window_below,
+    },
+    CommandSpec {
+        name: "split-window-right",
+        run: window::split_window_right,
+    },
+    CommandSpec {
+        name: "delete-window",
+        run: window::delete_window,
+    },
+    CommandSpec {
+        name: "delete-other-windows",
+        run: window::delete_other_windows,
+    },
+    CommandSpec {
+        name: "other-window",
+        run: window::other_window,
+    },
+    CommandSpec {
+        name: "switch-to-buffer",
+        run: window::switch_to_buffer,
+    },
+    CommandSpec {
+        name: "list-buffers",
+        run: window::list_buffers,
+    },
+    CommandSpec {
+        name: "Buffer-menu-this-window",
+        run: window::buffer_menu_this_window,
     },
 ];
 

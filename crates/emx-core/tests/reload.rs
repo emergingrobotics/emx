@@ -346,6 +346,45 @@ fn unmodified_reload_preserves_point_by_line_context() {
 }
 
 #[test]
+fn reload_keeps_the_point_and_start_of_every_window_by_line_context() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    let lines: Vec<String> = (0..40).map(|line| format!("line {line:02}\n")).collect();
+    fs::write(&path, lines.concat()).expect("write");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+    let line_length = 8;
+    // Upper window: point on "line 05" at column 3. Lower window: scrolled
+    // so it starts at "line 13", point on "line 18" at column 2.
+    harness.keys("C-n C-n C-n C-n C-n C-f C-f C-f C-x 2 C-x o");
+    harness.keys("M-< C-u 1 8 C-n C-f C-f C-l C-l");
+    assert_eq!(harness.point(), 18 * line_length + 2);
+    assert_eq!(harness.screen()[12].trim_end(), "line 18");
+    // A third window shows the file only through its history.
+    let other = harness.attach(ClientKind::Tui);
+    harness.keys_as(other, "C-x b RET");
+    harness.keys_as(other, "C-x b RET");
+    let edited = format!("new top\nanother\n{}", lines.concat());
+    replace_by_rename(&path, edited.as_bytes(), 1);
+    external_change(&mut harness, &path);
+    assert_eq!(harness.text(), edited);
+    let shift = 16;
+    assert_eq!(harness.point(), shift + 18 * line_length + 2);
+    assert_eq!(
+        harness.screen()[12].trim_end(),
+        "line 18",
+        "the lower window still starts on the same line"
+    );
+    harness.keys("C-x o");
+    assert_eq!(harness.point(), shift + 5 * line_length + 3);
+    assert_eq!(harness.screen()[0].trim_end(), "line 00");
+    // Showing the file again in the other client's window puts point back
+    // where that window left it, moved with its line.
+    harness.keys_as(other, "C-x b RET");
+    assert_eq!(harness.point_of(other), shift + 5 * line_length + 3);
+}
+
+#[test]
 fn modified_buffer_gets_conflict_not_reload() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("a.txt");

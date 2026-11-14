@@ -120,6 +120,18 @@ pub trait ChangeRecorder {
     fn record(&mut self, buffer: BufferId, change: &Change);
 }
 
+/// What a Buffer Menu lists: the buffer of each line, and its header line.
+#[derive(Debug, Clone)]
+pub(crate) struct BufferMenu {
+    pub entries: Vec<BufferId>,
+    pub header: String,
+}
+
+/// Emacs `mode-name` of a Fundamental-mode buffer.
+const FUNDAMENTAL_MODE: &str = "Fundamental";
+/// Emacs `mode-name` of `Buffer-menu-mode`.
+const BUFFER_MENU_MODE: &str = "Buffer Menu";
+
 #[derive(Debug)]
 pub struct Buffer {
     pub id: BufferId,
@@ -143,6 +155,12 @@ pub struct Buffer {
     /// Where point was when the buffer last left a window, so showing it
     /// again puts point back, as Emacs's buffer point does.
     pub(crate) last_point: Option<MarkerId>,
+    /// Emacs `last_window_start`: where the last window to stop showing
+    /// the buffer started, which is where a window newly showing it
+    /// starts. A position, not a marker, as in Emacs.
+    pub(crate) last_window_start: u64,
+    /// Set while the buffer is a Buffer Menu (`*Buffer List*`).
+    pub(crate) menu: Option<BufferMenu>,
     /// Emacs `recent-auto-save-p`: auto-saved since last read or saved, so
     /// the auto-save file is this session's and a save may delete it.
     pub(crate) auto_saved_since_save: bool,
@@ -169,12 +187,36 @@ impl Buffer {
             damaged: false,
             recovered: false,
             last_point: None,
+            last_window_start: 0,
+            menu: None,
             auto_saved_since_save: false,
             markers: SlotMap::with_key(),
             modified_tick: 0,
             save_tick: 0,
             auto_save_tick: 0,
         }
+    }
+
+    /// Emacs `mode-name`.
+    pub(crate) fn mode_name(&self) -> &'static str {
+        if self.menu.is_some() {
+            BUFFER_MENU_MODE
+        } else {
+            FUNDAMENTAL_MODE
+        }
+    }
+
+    /// Replaces the text as Emacs's `erase-buffer` then an insertion with
+    /// undo disabled would: every marker ends up at the start, nothing is
+    /// recorded, and the buffer is unmodified.
+    pub(crate) fn reset_text(&mut self, text: Text, limits: UndoLimits) {
+        self.text = text;
+        for marker in self.markers.values_mut() {
+            marker.pos = 0;
+        }
+        self.undo = UndoList::new(limits);
+        self.modified_tick += 1;
+        self.set_unmodified();
     }
 
     pub fn is_modified(&self) -> bool {

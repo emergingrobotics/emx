@@ -1,6 +1,7 @@
 mod files;
 mod reload;
 mod requests;
+mod windows;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -29,7 +30,7 @@ use reload::ReloadRequest;
 use requests::{GroupReply, OpenRequest, Reply};
 
 use crate::window::{
-    Fetch, Frame, Layout, Reader, ScreenLine, Window, WindowId, frame_layout, not_cached_block,
+    Fetch, Frame, Layout, Reader, ScreenLine, Window, WindowArea, WindowId, not_cached_block,
 };
 
 const SCRATCH_BUFFER: &str = "*scratch*";
@@ -37,6 +38,13 @@ const SCRATCH_BUFFER: &str = "*scratch*";
 const NO_SERVER_FRAME: u64 = 1;
 /// A daemon's own frame is F1, so `emacsclient -t` frames start at F2.
 const FIRST_SERVER_FRAME: u64 = 2;
+/// Emacs numbers every window it makes, from 1; `emacs -nw`'s own window
+/// is 1 and its minibuffer window 2.
+const FIRST_WINDOW_NUMBER: u64 = 1;
+/// A daemon's own frame took windows 1 and 2.
+const FIRST_SERVER_WINDOW_NUMBER: u64 = 3;
+/// Each terminal frame makes its root window and its minibuffer window.
+const WINDOWS_PER_FRAME: u64 = 2;
 
 /// How clients reach the editor, which decides how their terminal frames
 /// are named on the modeline, as Emacs names them.
@@ -252,6 +260,13 @@ pub struct Editor {
     revert_pending: HashMap<BufferId, Option<ClientId>>,
     /// Follow-edit mode: a reload moves point to the first changed line.
     follow_edit: bool,
+    /// The next Emacs window sequence number; every client's windows
+    /// share the count, as one Emacs process's do.
+    next_window_number: u64,
+    /// Emacs `window_select_count`, the clock of `window-use-time`.
+    window_select_count: u64,
+    /// `Buffer-menu-mode-map`, active in Buffer Menu buffers.
+    buffer_menu_keymap: Keymap,
     /// Saves waiting for a look at a target changed under the buffer's
     /// file-backed text, and who asked.
     save_verify: HashMap<BufferId, (ClientId, SaveFlow)>,
@@ -317,6 +332,12 @@ impl Editor {
             appending: HashMap::new(),
             revert_pending: HashMap::new(),
             follow_edit: false,
+            next_window_number: match session {
+                Session::NoServer => FIRST_WINDOW_NUMBER,
+                Session::Server => FIRST_SERVER_WINDOW_NUMBER,
+            },
+            window_select_count: 0,
+            buffer_menu_keymap: Keymap::buffer_menu(),
             save_verify: HashMap::new(),
             watched: BTreeSet::new(),
             polled_paths: BTreeSet::new(),
@@ -362,6 +383,7 @@ impl Editor {
                 let client = self.client_mut(client);
                 client.cols = cols;
                 client.rows = rows;
+                client.frame.resize(cols, rows);
             }
             Event::Request(client, id, request) => self.handle_request(client, id, request),
             Event::Redraw(client) => self.request_full_redraw(client),
@@ -439,6 +461,7 @@ impl Editor {
         client_id: ClientId,
         window_id: WindowId,
     ) -> Result<(), ReadError> {
+        self.refit_window_start(client_id, window_id)?;
         let (cols, height) = self.window_size(client_id, window_id);
         let window = *self.window(client_id, window_id);
         let buffer = &self.buffers[window.buffer];
@@ -551,13 +574,25 @@ impl Editor {
         } else {
             self.other_buffer(self.scratch)
         };
+        // A terminal frame numbers its root and minibuffer windows; other
+        // clients have no Emacs frame and their window is never named.
+        let number = if kind == ClientKind::Tui {
+            let number = self.next_window_number;
+            self.next_window_number += WINDOWS_PER_FRAME;
+            number
+        } else {
+            0
+        };
         let buffer = &mut self.buffers[buffer_id];
         let window = Window {
             buffer: buffer_id,
             point: buffer.create_marker_without_undo(0, InsertionType::StayBefore),
             start: buffer.create_marker_without_undo(0, InsertionType::StayBefore),
             start_row_skip: 0,
+            start_cols: cols,
             hscroll: 0,
+            number,
+            use_time: 0,
         };
         self.clients.insert(
             client,
@@ -566,7 +601,7 @@ impl Editor {
                 rows,
                 kind,
                 frame_number,
-                frame: Frame::new(window),
+                frame: Frame::new(window, cols, rows),
                 grid: None,
                 recenter_last_op: None,
                 command_loop: CommandLoopState::default(),
@@ -582,6 +617,8 @@ impl Editor {
             },
         );
         if kind == ClientKind::Tui {
+            let selected = self.selected_window_id(client);
+            self.bump_use_time(client, selected);
             self.note_terminal_activity(client);
             self.client_attached_event(client);
         }
@@ -592,10 +629,15 @@ impl Editor {
             .clients
             .remove(&client)
             .expect("the server detaches only attached clients");
-        for window in removed.frame.windows.values() {
+        for (id, window) in &removed.frame.windows {
             let buffer = &mut self.buffers[window.buffer];
             buffer.delete_marker(window.point);
             buffer.delete_marker(window.start);
+            for entry in removed.frame.prev_buffers.get(id).into_iter().flatten() {
+                let buffer = &mut self.buffers[entry.buffer];
+                buffer.delete_marker(entry.start);
+                buffer.delete_marker(entry.point);
+            }
         }
         if let Some(yank) = removed.yank
             && let Some(buffer) = self.buffers.get_mut(yank.buffer)
@@ -678,7 +720,7 @@ impl Editor {
         }
         state.pending.push(key);
         let pending = state.pending.clone();
-        match self.keymap.lookup(&pending) {
+        match self.lookup_keys(client_id, &pending) {
             Lookup::Command(name) => self.run_key_command(client_id, name, key),
             Lookup::Prefix => self.continue_sequence(client_id),
             Lookup::Undefined => self.shift_translate_or_undefined(client_id),
@@ -694,7 +736,7 @@ impl Editor {
         if let Some(unshifted) = unshift(last) {
             let mut translated = state.pending.clone();
             *translated.last_mut().expect("non-empty") = unshifted;
-            match self.keymap.lookup(&translated) {
+            match self.lookup_keys(client_id, &translated) {
                 Lookup::Command(name) => {
                     self.client_mut(client_id).command_loop.pending = translated;
                     self.run_key_command(client_id, name, unshifted);
@@ -975,11 +1017,20 @@ impl Editor {
         usize::try_from(self.config.tab_width).expect("tab_width is validated small")
     }
 
-    /// A window's columns and text rows. The one window fills the frame
-    /// above the modeline and echo area.
-    pub(crate) fn window_size(&self, client_id: ClientId, _window: WindowId) -> (u16, u16) {
-        let client = self.client(client_id);
-        (client.cols, frame_layout(client.rows).text_rows)
+    /// A window's text columns and rows.
+    pub(crate) fn window_size(&self, client_id: ClientId, window: WindowId) -> (u16, u16) {
+        let area = self.window_area(client_id, window);
+        (area.cols, area.text_rows)
+    }
+
+    /// Where the window draws: its place on the frame, less its border,
+    /// modeline and any header line its buffer has.
+    pub(crate) fn window_area(&self, client_id: ClientId, window: WindowId) -> WindowArea {
+        let frame = &self.client(client_id).frame;
+        let buffer = &self.buffers[frame.windows[window].buffer];
+        frame
+            .window_box(window)
+            .area(frame.cols(), buffer.menu.is_some())
     }
 
     pub(crate) fn window_start(&self, client_id: ClientId, window: WindowId) -> ScreenLine {
@@ -996,10 +1047,12 @@ impl Editor {
         window_id: WindowId,
         start: ScreenLine,
     ) {
+        let (cols, _) = self.window_size(client_id, window_id);
         let window = &mut self.client_mut(client_id).frame.windows[window_id];
         // Only a line of over four billion rows could overflow; its window
         // then starts at the last row that can be recorded.
         window.start_row_skip = u32::try_from(start.row).unwrap_or(u32::MAX);
+        window.start_cols = cols;
         let window = *window;
         self.buffers[window.buffer].set_marker(window.start, start.line_start);
     }

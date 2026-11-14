@@ -30,6 +30,8 @@ pub fn face_sgr(face: Face) -> &'static str {
         Face::Default => "0",
         Face::ModeLine => "0;7",
         Face::ModeLineInactive => "0;2;7",
+        // Emacs draws `header-line` underlined on a terminal.
+        Face::HeaderLine => "0;4",
         Face::Region => "0;97;44",
         Face::IsearchMatch => "0;97;45",
         Face::LazyHighlight => "0;30;46",

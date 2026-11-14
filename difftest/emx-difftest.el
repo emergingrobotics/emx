@@ -63,12 +63,44 @@
            (buffer-substring-no-properties (point-min) position)
            'utf-8-unix t)))
 
+(defvar emx-difftest--initial-buffers nil
+  "The buffers batch Emacs has before any case; cases kill the rest.")
+
+(defun emx-difftest--setup ()
+  "Make batch Emacs's buffers match a fresh emx session's."
+  ;; emx has no *Messages* buffer; keep Emacs from recreating it so the
+  ;; Buffer Menu lists the same buffers.
+  (setq message-log-max nil)
+  (let ((messages (get-buffer "*Messages*")))
+    (when messages (kill-buffer messages)))
+  (setq emx-difftest--initial-buffers (buffer-list))
+  ;; Batch Emacs has no redisplay, so `format-mode-line' returns "" and
+  ;; the Buffer Menu's Mode column would be empty; a plain string such
+  ;; as `mode-name' formats as itself.
+  (advice-add 'format-mode-line :around
+              (lambda (original format &rest arguments)
+                (if (stringp format)
+                    format
+                  (apply original format arguments)))))
+
 (defun emx-difftest--fresh-buffer (content point mark)
-  "Make a fresh *scratch* holding CONTENT and reset the editing state."
+  "Make a fresh *scratch* holding CONTENT and reset the editing state.
+Buffers and windows an earlier case made are removed."
+  ;; Internal buffers (a leading space), such as the one the results are
+  ;; written from, are not the cases' and are never listed.
+  (dolist (buffer (buffer-list))
+    (unless (or (memq buffer emx-difftest--initial-buffers)
+                (string-prefix-p " " (buffer-name buffer)))
+      (kill-buffer buffer)))
   (let ((old (get-buffer emx-difftest-buffer-name)))
     (when old (kill-buffer old)))
+  (select-window (frame-first-window))
+  (delete-other-windows)
   (switch-to-buffer (get-buffer-create emx-difftest-buffer-name))
   (fundamental-mode)
+  ;; Killing the last ordinary buffer makes Emacs recreate *scratch* with
+  ;; `initial-scratch-message'.
+  (erase-buffer)
   (transient-mark-mode 1)
   (insert content)
   (set-marker (mark-marker) (and mark (1+ mark)))
@@ -122,6 +154,8 @@
         (kill_ring . ,(emx-difftest--kills))
         (modified . ,(if (buffer-modified-p) t :false))
         (error . ,(or error-message :null))))))
+
+(emx-difftest--setup)
 
 (let* ((arguments (emx-difftest--arguments))
        (cases (emx-difftest--read-cases (car arguments)))

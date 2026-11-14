@@ -33,4 +33,4 @@ pub use killring::{KillRing, KillRingError};
 pub use marker::{InsertionType, MarkerId};
 pub use render::{PrefetchRequest, render};
 pub use undo::{UndoEntry, UndoError, UndoLimits, UndoList, UndoOutcome, outer_limit_warning};
-pub use window::{Frame, Window, WindowId};
+pub use window::{Frame, PrevBuffer, Window, WindowId};

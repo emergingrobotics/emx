@@ -24,6 +24,7 @@ use crate::reload::{
     AppendRead, AppendedBytes, Classification, ExternalState, Observation, Reloaded, classify,
 };
 use crate::undo::UndoEntry;
+use crate::window::PrevBuffer;
 
 const DIFF_BUFFER: &str = "*diff-external*";
 const NOT_VISITING: &str = "Buffer does not seem to be associated with any file";
@@ -639,8 +640,9 @@ impl Editor {
             .map_or(0, |window| self.buffers[buffer].marker_pos(window.point))
     }
 
-    /// The markers of every window showing the buffer, and the point it
-    /// had when last shown.
+    /// The markers of every window showing the buffer, of every window's
+    /// memory of it (`window-prev-buffers`), and the point it had when last
+    /// shown.
     fn window_markers(&self, buffer: BufferId) -> Vec<MarkerId> {
         let mut markers: Vec<MarkerId> = self
             .clients
@@ -649,8 +651,22 @@ impl Editor {
             .filter(|window| window.buffer == buffer)
             .flat_map(|window| [window.point, window.start])
             .collect();
+        markers.extend(
+            self.prev_buffer_entries(buffer)
+                .flat_map(|entry| [entry.point, entry.start]),
+        );
         markers.extend(self.buffers[buffer].last_point);
         markers
+    }
+
+    /// Every window's remembered start and point for the buffer.
+    fn prev_buffer_entries(&self, buffer: BufferId) -> impl Iterator<Item = PrevBuffer> + '_ {
+        self.clients
+            .values()
+            .flat_map(|client| client.frame.prev_buffers.values())
+            .flatten()
+            .filter(move |entry| entry.buffer == buffer)
+            .copied()
     }
 
     /// Window points (and the remembered point) at `position`.
@@ -663,6 +679,7 @@ impl Editor {
             .filter(|window| window.buffer == buffer)
             .map(|window| window.point)
             .collect();
+        points.extend(self.prev_buffer_entries(buffer).map(|entry| entry.point));
         points.extend(target.last_point);
         points
             .into_iter()

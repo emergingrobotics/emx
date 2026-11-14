@@ -23,13 +23,11 @@ use crate::journal::{
     CHANGED_ON_DISK, Header, JournalId, LEFT_PARTLY_REWRITTEN, RecoveredBuffer,
     recovered_buffer_name, render_edits,
 };
-use crate::marker::InsertionType;
 use crate::minibuffer::{
     Answer, BACKSPACE, ESCAPE, HistoryKind, KeyChoice, Minibuffer, Mode, Outcome, Overlay, RETURN,
     control, plain,
 };
 use crate::reload::ExternalState;
-use crate::window::WindowId;
 
 /// Emacs `minibuffer-message-timeout`, and the `sit-for`/`sleep-for` of
 /// the "Please answer" messages: how long a message over the minibuffer
@@ -100,6 +98,10 @@ pub(crate) enum Purpose {
     /// `revert-buffer` in a modified buffer: discard the edits?
     Revert {
         buffer: BufferId,
+    },
+    /// `switch-to-buffer`: the buffer to show; empty input means `default`.
+    SwitchToBuffer {
+        default: String,
     },
 }
 
@@ -319,7 +321,7 @@ impl Editor {
 
     // ---- The minibuffer -------------------------------------------------
 
-    fn read_from_minibuffer(
+    pub(super) fn read_from_minibuffer(
         &mut self,
         client: ClientId,
         prompt: String,
@@ -525,6 +527,11 @@ impl Editor {
                     None => Err(user_error(format!("No such buffer {name}"))),
                 }
             }
+            (Purpose::SwitchToBuffer { default }, Answer::Line(name)) => {
+                let name = if name.is_empty() { default } else { name };
+                self.switch_to_buffer_named(client, &name);
+                Ok(())
+            }
             (Purpose::KillModified { buffer }, Answer::Line(choice)) => {
                 if !self.buffers.contains_key(buffer) {
                     Ok(())
@@ -707,44 +714,8 @@ impl Editor {
         self.reload_after_busy(buffer);
     }
 
-    pub(super) fn show_in_selected_window(&mut self, client: ClientId, buffer: BufferId) {
-        let window = self.selected_window_id(client);
-        self.show_buffer(client, window, buffer);
-    }
-
-    /// Emacs `set-window-buffer`: point comes back where it was when the
-    /// buffer was last shown.
-    pub(super) fn show_buffer(&mut self, client: ClientId, window_id: WindowId, buffer: BufferId) {
-        let window = *self.window(client, window_id);
-        self.touch_buffer(buffer);
-        if window.buffer == buffer {
-            return;
-        }
-        let old = &mut self.buffers[window.buffer];
-        let old_point = old.marker_pos(window.point);
-        match old.last_point {
-            Some(marker) => old.set_marker(marker, old_point),
-            None => {
-                old.last_point =
-                    Some(old.create_marker_without_undo(old_point, InsertionType::StayBefore));
-            }
-        }
-        old.delete_marker(window.point);
-        old.delete_marker(window.start);
-        let new = &mut self.buffers[buffer];
-        let point = new.last_point.map_or(0, |marker| new.marker_pos(marker));
-        let point_marker = new.create_marker_without_undo(point, InsertionType::StayBefore);
-        let start_marker = new.create_marker_without_undo(0, InsertionType::StayBefore);
-        let target = &mut self.client_mut(client).frame.windows[window_id];
-        target.buffer = buffer;
-        target.point = point_marker;
-        target.start = start_marker;
-        target.start_row_skip = 0;
-        target.hscroll = 0;
-    }
-
     /// Moves `buffer` to the front of the most-recently-shown order.
-    fn touch_buffer(&mut self, buffer: BufferId) {
+    pub(super) fn touch_buffer(&mut self, buffer: BufferId) {
         self.recency.retain(|id| *id != buffer);
         self.recency.insert(0, buffer);
     }
@@ -839,22 +810,7 @@ impl Editor {
     pub(super) fn kill_buffer(&mut self, buffer: BufferId) {
         self.buffer_killed(buffer);
         self.forget_reload_state(buffer);
-        let replacement = self.other_buffer(buffer);
-        let showing: Vec<(ClientId, WindowId)> = self
-            .clients
-            .iter()
-            .flat_map(|(client, state)| {
-                state
-                    .frame
-                    .windows
-                    .iter()
-                    .filter(|(_, window)| window.buffer == buffer)
-                    .map(|(window, _)| (*client, window))
-            })
-            .collect();
-        for (client, window) in showing {
-            self.show_buffer(client, window, replacement);
-        }
+        self.replace_buffer_in_windows(buffer);
         self.recency.retain(|id| *id != buffer);
         self.journal_outbox.killed(buffer);
         self.pending_loads.remove(&buffer);

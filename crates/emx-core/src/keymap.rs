@@ -27,7 +27,7 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 53] = [
+const DEFAULT_BINDINGS: [(&str, &str); 60] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
@@ -78,10 +78,18 @@ const DEFAULT_BINDINGS: [(&str, &str); 53] = [
     ("C-x C-c", "save-buffers-kill-terminal"),
     ("C-x #", "server-edit"),
     ("C-x C-q", "read-only-mode"),
+    ("C-x 2", "split-window-below"),
+    ("C-x 3", "split-window-right"),
+    ("C-x 0", "delete-window"),
+    ("C-x 1", "delete-other-windows"),
+    ("C-x o", "other-window"),
+    ("C-x b", "switch-to-buffer"),
+    ("C-x C-b", "list-buffers"),
     ("M--", NEGATIVE_ARGUMENT),
     ("C--", NEGATIVE_ARGUMENT),
     ("C-M--", NEGATIVE_ARGUMENT),
 ];
+const BUFFER_MENU_BINDINGS: [(&str, &str); 1] = [("RET", "Buffer-menu-this-window")];
 /// `ctl-x-map` and `mode-specific-map`; their bindings arrive with later
 /// commands, but the prefixes exist so `C-c z` reads as one sequence.
 const DEFAULT_PREFIXES: [&str; 2] = ["C-x", "C-c"];
@@ -133,6 +141,16 @@ impl Keymap {
                     Binding::Command(DIGIT_ARGUMENT),
                 );
             }
+        }
+        keymap
+    }
+
+    /// Emacs `Buffer-menu-mode-map`, looked up before the global map in a
+    /// Buffer Menu.
+    pub fn buffer_menu() -> Keymap {
+        let mut keymap = Keymap::new();
+        for (sequence, command) in BUFFER_MENU_BINDINGS {
+            keymap.bind_default(sequence, Binding::Command(command));
         }
         keymap
     }

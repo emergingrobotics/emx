@@ -14,7 +14,7 @@ use crate::event::ClientId;
 use crate::reload::ExternalState;
 use crate::window::{
     CONTINUATION_GLYPH, CursorTracker, Fetch, Layout, LineEvent, Reader, ScreenLine, Window,
-    frame_layout, not_cached_block, unit_glyphs,
+    WindowArea, frame_layout, not_cached_block, unit_glyphs,
 };
 
 /// `mode-line-front-space` on a terminal.
@@ -38,7 +38,6 @@ const MODELINE_POSITION_GAP: &str = "   ";
 /// this many columns, which is also its `min-width`.
 const LINE_NUMBER_COLUMNS: usize = 6;
 const MODELINE_MODES_GAP: &str = "  ";
-const MODELINE_MODES: &str = "(Fundamental) ";
 /// Shown, until the buffer is killed, on a buffer whose file an in-place
 /// save left partly rewritten.
 const MODELINE_DAMAGED: &str = "[DAMAGED] ";
@@ -49,8 +48,10 @@ const MODELINE_DELETED: &str = "[DELETED] ";
 const MODELINE_CHANGED: &str = "[ext] ";
 /// The visited file is polled, not watched (DESIGN section 3).
 const MODELINE_POLLED: &str = "[poll] ";
-/// Shown while the visited file is being read.
-const MODELINE_MODES_LOADING: &str = "(Fundamental Loading) ";
+/// Added to the mode name while the visited file is being read.
+const MODELINE_LOADING: &str = " Loading";
+/// The vertical border between side-by-side windows on a terminal.
+const VERTICAL_BORDER_GLYPH: &str = "|";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
 const MODELINE_FILL: &str = "-";
 const UNKNOWN_LINE: &str = "?";
@@ -74,26 +75,26 @@ pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>)
     let (cols, rows) = editor.client_size(client);
     let mut grid = Grid::new(cols, rows);
     let mut prefetch = Vec::new();
-    let layout = frame_layout(rows);
     let frame = editor.frame(client);
-    // A single window fills the frame until the window tree arrives; each
-    // window draws into its own rectangle so more can be laid out later.
-    let area = WindowArea {
-        top: 0,
-        cols,
-        text_rows: layout.text_rows,
-        modeline_row: layout.modeline_row,
-    };
-    let cursor = draw_window(
-        editor,
-        client,
-        frame.selected_window(),
-        &area,
-        &mut grid,
-        &mut prefetch,
-    );
-    let mut cursor = cursor;
-    if let Some(row) = layout.echo_row {
+    let mut cursor = None;
+    for (window_id, _) in frame.boxes() {
+        let area = editor.window_area(client, window_id);
+        let selected = window_id == frame.selected;
+        let window_cursor = draw_window(
+            editor,
+            client,
+            &frame.windows[window_id],
+            selected,
+            &area,
+            &mut grid,
+            &mut prefetch,
+        );
+        // Only the selected window shows its cursor on a terminal.
+        if selected {
+            cursor = window_cursor;
+        }
+    }
+    if let Some(row) = frame_layout(rows).echo_row {
         let (line, minibuffer_cursor) = editor.echo_area(client);
         match minibuffer_cursor {
             Some(at) => {
@@ -106,24 +107,17 @@ pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>)
     (grid, prefetch)
 }
 
-/// The grid rows a window draws into.
-struct WindowArea {
-    top: u16,
-    cols: u16,
-    text_rows: u16,
-    modeline_row: Option<u16>,
-}
-
 fn tab_width(editor: &Editor) -> usize {
     usize::try_from(editor.config().tab_width).expect("tab_width is validated small")
 }
 
-/// Draws the window's text and modeline; returns the cursor when point is
-/// shown.
+/// Draws the window's text, header line, modeline and border; returns the
+/// cursor when point is shown.
 fn draw_window(
     editor: &Editor,
     window_client: ClientId,
     window: &Window,
+    selected: bool,
     area: &WindowArea,
     grid: &mut Grid,
     prefetch: &mut Vec<PrefetchRequest>,
@@ -143,8 +137,7 @@ fn draw_window(
     let mut tracker = CursorTracker::new(point);
     let mut first_shown = None;
     let walk = layout.walk_window(start, area.text_rows, &mut |row, event| {
-        let row = area.top + row;
-        draw_event(grid, row, event, &region, &mut tracker);
+        draw_event(grid, area, row, event, &region, &mut tracker);
         if let LineEvent::Unit { pos, .. }
         | LineEvent::End { pos, .. }
         | LineEvent::Cell { unit: pos, .. } = event
@@ -163,6 +156,11 @@ fn draw_window(
             false
         }
     };
+    if let (Some(row), Some(menu)) = (area.header_row, &buffer.menu) {
+        let mut writer = RowWriter::within(grid, row, area, tab_width(editor));
+        writer.write(menu.header.as_bytes(), Face::HeaderLine, Face::HeaderLine);
+        writer.fill(b" ", Face::HeaderLine);
+    }
     if let Some(row) = area.modeline_row {
         let line = match buffer.text.line_of_cached(point) {
             Ok(Some(line)) => (line + 1).to_string(),
@@ -182,13 +180,31 @@ fn draw_window(
             frame: editor.frame_name(window_client),
             position: &position,
             line: &line,
+            face: if selected {
+                Face::ModeLine
+            } else {
+                Face::ModeLineInactive
+            },
         };
-        draw_modeline(grid, row, &modeline, tab_width(editor));
+        let mut writer = RowWriter::within(grid, row, area, tab_width(editor));
+        draw_modeline(&mut writer, &modeline);
+    }
+    if let Some(col) = area.border {
+        for row in area.box_top..area.box_top.saturating_add(area.box_rows) {
+            put_glyph(
+                grid,
+                row,
+                usize::from(col),
+                VERTICAL_BORDER_GLYPH,
+                1,
+                Face::ModeLineInactive,
+            );
+        }
     }
     let (row, col) = tracker.location()?;
     let last_col = area.cols.checked_sub(1)?;
     let col = u16::try_from(col).unwrap_or(u16::MAX).min(last_col);
-    Some((col, area.top + row))
+    Some((area.left + col, area.top + row))
 }
 
 /// The region Transient Mark mode highlights, between point and an
@@ -201,13 +217,17 @@ fn active_region(buffer: &Buffer, point: u64) -> Option<Range<u64>> {
     Some(mark.min(point)..mark.max(point))
 }
 
+/// Draws one layout event of window row `window_row`; the tracker sees
+/// window rows, the grid gets the area's cells.
 fn draw_event(
     grid: &mut Grid,
-    row: u16,
+    area: &WindowArea,
+    window_row: u16,
     event: &LineEvent,
     region: &Option<Range<u64>>,
     tracker: &mut CursorTracker,
 ) {
+    let row = area.top + window_row;
     let in_region = |pos: u64| region.as_ref().is_some_and(|range| range.contains(&pos));
     match event {
         LineEvent::Cell {
@@ -225,25 +245,42 @@ fn draw_event(
             } else {
                 Face::Default
             };
-            put_glyph(grid, row, *col, text, *width, face);
+            put_window_glyph(grid, area, row, *col, text, *width, face);
         }
         LineEvent::Continuation { col, .. } => {
-            put_glyph(grid, row, *col, CONTINUATION_GLYPH, 1, Face::Default);
+            put_window_glyph(grid, area, row, *col, CONTINUATION_GLYPH, 1, Face::Default);
         }
-        LineEvent::Unit { pos, col, .. } => tracker.observe(*pos, row, *col),
+        LineEvent::Unit { pos, col, .. } => tracker.observe(*pos, window_row, *col),
         LineEvent::End {
             pos, col, newline, ..
         } => {
-            tracker.observe(*pos, row, *col);
+            tracker.observe(*pos, window_row, *col);
             // The region face has `:extend t`: a selected newline lights
             // the rest of its row.
             if *newline && in_region(*pos) {
-                for fill in *col..usize::from(grid.cols) {
-                    put_glyph(grid, row, fill, " ", 1, Face::Region);
+                for fill in *col..usize::from(area.cols) {
+                    put_window_glyph(grid, area, row, fill, " ", 1, Face::Region);
                 }
             }
         }
     }
+}
+
+/// Writes a glyph at window column `col` if it fits inside the window's
+/// text columns.
+fn put_window_glyph(
+    grid: &mut Grid,
+    area: &WindowArea,
+    row: u16,
+    col: usize,
+    text: &str,
+    width: usize,
+    face: Face,
+) {
+    if col + width > usize::from(area.cols) {
+        return;
+    }
+    put_glyph(grid, row, usize::from(area.left) + col, text, width, face);
 }
 
 /// Writes a glyph if it fits entirely; a wide glyph's second column gets
@@ -296,19 +333,56 @@ fn position_indicator(window_start: u64, length: u64, end_visible: bool) -> Stri
     }
 }
 
-/// Writes glyphs left to right along one row, clipped at the right edge.
+/// Writes glyphs left to right along one row from column `col`, clipped
+/// at column `right`.
 struct RowWriter<'g> {
     grid: &'g mut Grid,
     row: u16,
     col: usize,
+    right: usize,
     tab_width: usize,
 }
 
-impl RowWriter<'_> {
+impl<'g> RowWriter<'g> {
+    /// A writer across the whole grid row.
+    fn full_row(grid: &'g mut Grid, row: u16, tab_width: usize) -> RowWriter<'g> {
+        let right = usize::from(grid.cols);
+        RowWriter {
+            grid,
+            row,
+            col: 0,
+            right,
+            tab_width,
+        }
+    }
+
+    /// A writer across a window's text columns.
+    fn within(grid: &'g mut Grid, row: u16, area: &WindowArea, tab_width: usize) -> RowWriter<'g> {
+        let left = usize::from(area.left);
+        RowWriter {
+            grid,
+            row,
+            col: left,
+            right: left + usize::from(area.cols),
+            tab_width,
+        }
+    }
+
+    /// Repeats `bytes` to the right edge.
+    fn fill(&mut self, bytes: &[u8], face: Face) {
+        while self.col < self.right {
+            let before = self.col;
+            self.write(bytes, face, face);
+            if self.col == before {
+                return;
+            }
+        }
+    }
+
     /// Writes `bytes` with control and invalid bytes escaped; escape
     /// notation gets `escape_face`.
     fn write(&mut self, bytes: &[u8], face: Face, escape_face: Face) {
-        let cols = usize::from(self.grid.cols);
+        let cols = self.right;
         for (offset, unit) in display_units(bytes) {
             let unit = one_line(unit);
             let column = self.col as u64;
@@ -337,7 +411,7 @@ impl RowWriter<'_> {
     fn pad_to(&mut self, column: usize, face: Face) {
         while self.col < column {
             self.write(b" ", face, face);
-            if self.col >= usize::from(self.grid.cols) {
+            if self.col >= self.right {
                 return;
             }
         }
@@ -351,6 +425,9 @@ struct Modeline<'a> {
     frame: (u64, bool),
     position: &'a str,
     line: &'a str,
+    /// `mode-line` for the selected window, `mode-line-inactive` for the
+    /// others.
+    face: Face,
 }
 
 impl RowWriter<'_> {
@@ -374,8 +451,8 @@ impl RowWriter<'_> {
 /// Emacs 29's default `mode-line-format` for a Fundamental-mode buffer as
 /// `emacs -nw -Q` (or `emacsclient -t`) shows it on screen, the rest of the
 /// row filled with dashes.
-fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usize) {
-    let face = Face::ModeLine;
+fn draw_modeline(writer: &mut RowWriter, modeline: &Modeline) {
+    let face = modeline.face;
     let buffer = modeline.buffer;
     let (frame_number, client_frame) = modeline.frame;
     // `%1*%1+`: `%` for read-only, `*` for modified, `-` otherwise.
@@ -384,12 +461,6 @@ fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usiz
         (true, false) => "%%",
         (false, true) => "**",
         (false, false) => "--",
-    };
-    let mut writer = RowWriter {
-        grid,
-        row,
-        col: 0,
-        tab_width,
     };
     writer.write(MODELINE_FRONT.as_bytes(), face, face);
     writer.min_width(MODELINE_FLAGS_MIN_WIDTH, face, |writer| {
@@ -419,11 +490,8 @@ fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usiz
         writer.pad_to(line_start + LINE_NUMBER_COLUMNS, face);
     });
     writer.write(MODELINE_MODES_GAP.as_bytes(), face, face);
-    let modes = if buffer.loading {
-        MODELINE_MODES_LOADING
-    } else {
-        MODELINE_MODES
-    };
+    let loading = if buffer.loading { MODELINE_LOADING } else { "" };
+    let modes = format!("({}{loading}) ", buffer.mode_name());
     writer.write(modes.as_bytes(), face, face);
     if buffer.damaged {
         writer.write(MODELINE_DAMAGED.as_bytes(), face, face);
@@ -434,9 +502,7 @@ fn draw_modeline(grid: &mut Grid, row: u16, modeline: &Modeline, tab_width: usiz
     if buffer.file.as_ref().is_some_and(|file| file.polled) {
         writer.write(MODELINE_POLLED.as_bytes(), face, face);
     }
-    while writer.col < usize::from(writer.grid.cols) {
-        writer.write(MODELINE_FILL.as_bytes(), face, face);
-    }
+    writer.fill(MODELINE_FILL.as_bytes(), face);
 }
 
 /// The modeline notice for what happened to the visited file on disk. A
@@ -458,12 +524,7 @@ fn external_badge(binding: &FileBinding) -> Option<String> {
 }
 
 fn draw_echo(grid: &mut Grid, row: u16, echo: &str, tab_width: usize) {
-    let mut writer = RowWriter {
-        grid,
-        row,
-        col: 0,
-        tab_width,
-    };
+    let mut writer = RowWriter::full_row(grid, row, tab_width);
     writer.write(echo.as_bytes(), Face::Default, Face::EscapeGlyph);
 }
 
@@ -486,12 +547,7 @@ fn draw_minibuffer(
         units.next();
         start += units.next().map_or(rest.len(), |(offset, _)| offset);
     }
-    let mut writer = RowWriter {
-        grid,
-        row,
-        col: 0,
-        tab_width,
-    };
+    let mut writer = RowWriter::full_row(grid, row, tab_width);
     writer.write(
         &line.as_bytes()[start..cursor],
         Face::Default,

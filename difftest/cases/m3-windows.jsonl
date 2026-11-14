@@ -1,0 +1,29 @@
+{"name": "split-too-small-names-the-window", "text": "|abc", "keys": "C-x 2 C-x 2 C-x o C-x 2", "tier": 1}
+{"name": "split-below-size-too-large", "text": "|abc", "keys": "C-u 3 0 C-x 2", "tier": 1}
+{"name": "window-points-independent", "text": "a|bc\ndef\n", "keys": "C-x 2 C-n C-x o C-f", "tier": 1}
+{"name": "window-point-kept-while-away", "text": "a|bc\ndef\n", "keys": "C-x 2 C-n C-e C-x o C-f C-x o", "tier": 1}
+{"name": "window-point-moved-by-other-window-insert", "text": "abc\n|def\n", "keys": "C-x 2 C-x o M-< x y C-x o", "tier": 1}
+{"name": "other-window-negative", "text": "|abcdef", "keys": "C-x 2 C-x o C-f C-x 3 C-x o C-f C-f M-- C-x o", "tier": 1}
+{"name": "other-window-count", "text": "|abcdef", "keys": "C-x 2 C-x o C-f C-x 3 C-x o C-f C-f C-u 2 C-x o", "tier": 1}
+{"name": "other-window-count-wraps", "text": "|abcdef", "keys": "C-x 2 C-x o C-f C-x 3 C-x o C-f C-f C-u 4 C-x o", "tier": 1}
+{"name": "other-window-zero", "text": "|abcdef", "keys": "C-x 2 C-x o C-f C-u 0 C-x o", "tier": 1}
+{"name": "other-window-sole", "text": "|abc", "keys": "C-x o C-f", "tier": 1}
+{"name": "delete-window-selects-most-recent", "text": "|abc\ndef", "keys": "C-x 2 C-x o C-n C-x 2 C-x o C-x o C-x o C-x 0", "tier": 1}
+{"name": "delete-window-sole-error", "text": "|abc", "keys": "C-x 0", "tier": 1}
+{"name": "delete-other-windows-keeps-selected", "text": "a|bc", "keys": "C-x 2 C-x o C-f C-x 1 C-f", "tier": 1}
+{"name": "split-below-new-window-too-small", "text": "|abc", "keys": "C-u - 3 C-x 2", "tier": 1}
+{"name": "split-right-new-window-too-small", "text": "|abc", "keys": "C-u - 5 C-x 3", "tier": 1}
+{"name": "switch-to-new-buffer", "text": "ab|c", "keys": "C-x b f o o RET x y", "tier": 1}
+{"name": "switch-to-buffer-default-returns", "text": "ab|c", "keys": "C-x b f o o RET x y C-x b RET", "tier": 1}
+{"name": "switch-to-buffer-round-trip-keeps-points", "text": "ab|c", "keys": "C-x b f o o RET x y C-x b RET C-f C-x b RET", "tier": 1}
+{"name": "switch-to-buffer-takes-buffer-point", "text": "|abc\ndef", "keys": "C-n C-x b f o o RET C-x 2 C-x b RET C-x o C-x b RET", "tier": 1}
+{"name": "switch-to-buffer-by-name", "text": "a|bc", "keys": "C-x b f o o RET C-x b b a r RET C-x b * s c r a t c h * RET", "tier": 1}
+{"name": "kill-buffer-shows-previous-buffer", "text": "|", "keys": "C-x b f o o RET C-x b b a r RET C-x 2 C-x k RET q", "tier": 1}
+{"name": "kill-buffer-other-window-takes-recent", "text": "|", "keys": "C-x b f o o RET C-x b b a r RET C-x 2 C-x k RET C-x o r", "tier": 1}
+{"name": "buffer-list-contents", "text": "|", "keys": "C-x b f o o RET h e l l o C-x b RET C-x C-b C-x o", "tier": 1}
+{"name": "buffer-list-flags", "text": "a|b", "keys": "C-x b f o o RET C-x C-q C-x b b a r RET x C-x b RET C-x C-b C-x o", "tier": 1}
+{"name": "buffer-list-visits", "text": "|", "keys": "C-x b f o o RET h e l l o C-x b RET C-x C-b C-x o C-n RET", "tier": 1}
+{"name": "buffer-list-no-buffer-on-line", "text": "|", "keys": "C-x C-b C-x o M-> RET", "tier": 1}
+{"name": "buffer-list-shown-again-in-previous-window", "text": "|", "keys": "C-x b f o o RET C-x b RET C-x C-b C-x o C-n RET C-x C-b", "tier": 1}
+{"name": "buffer-list-files-only", "text": "|", "keys": "C-x b f o o RET C-x b RET C-u C-x C-b C-x o", "tier": 1}
+{"name": "buffer-list-in-other-window", "text": "|", "keys": "C-x 2 C-x C-b C-x o", "tier": 1}

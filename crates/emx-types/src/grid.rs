@@ -6,6 +6,8 @@ pub enum Face {
     Default,
     ModeLine,
     ModeLineInactive,
+    /// A window's header line, as the Buffer Menu's column titles.
+    HeaderLine,
     Region,
     IsearchMatch,
     LazyHighlight,
