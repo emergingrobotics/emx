@@ -623,7 +623,7 @@ impl Editor {
         binding.content_predates_disk = false;
         self.journal_outbox.reloaded(buffer, identity, text);
         if needs_index {
-            self.effects.push(Effect::StartIndex { buffer });
+            self.start_indexing(buffer);
         }
         self.external_change_event(buffer, ExternalKind::Appended);
     }
@@ -872,7 +872,7 @@ impl Editor {
         binding.content_predates_disk = false;
         self.journal_outbox.reloaded(buffer, identity, text);
         if loaded.needs_index {
-            self.effects.push(Effect::StartIndex { buffer });
+            self.start_indexing(buffer);
         }
         if self.follow_edit
             && let Some(first) = reloaded.first_change

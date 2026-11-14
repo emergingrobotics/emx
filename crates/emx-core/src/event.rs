@@ -133,11 +133,14 @@ pub enum Event {
         result: Result<(), String>,
     },
     /// The line indexer of an `Effect::StartIndex` has counted the lines of
-    /// `indexed_blocks` of `total_blocks` blocks.
+    /// `indexed_blocks` of `total_blocks` blocks. `complete` is set on the
+    /// final report, once every block is counted, so the editor knows the
+    /// whole file is indexed without waiting for `Event::IndexFinished`.
     IndexProgress {
         buffer: BufferId,
         indexed_blocks: u64,
         total_blocks: u64,
+        complete: bool,
     },
     /// The line indexer stopped: done, or the file could not be read.
     IndexFinished {

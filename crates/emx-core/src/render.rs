@@ -602,6 +602,10 @@ fn draw_modeline(writer: &mut RowWriter, modeline: &Modeline) {
     if buffer.file.as_ref().is_some_and(|file| file.polled) {
         writer.write(MODELINE_POLLED.as_bytes(), face, face);
     }
+    if let Some(progress) = buffer.indexing {
+        let badge = format!("[Indexing {}%] ", progress.percent());
+        writer.write(badge.as_bytes(), face, face);
+    }
     writer.fill(MODELINE_FILL.as_bytes(), face);
 }
 

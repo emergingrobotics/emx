@@ -1,4 +1,4 @@
-use emx_text::{ReadError, Text, display_units, unit_width};
+use emx_text::{LineLookup, ReadError, Text, display_units, unit_width};
 
 use super::mark::push_mark;
 use super::misc::recenter_if_past_window_end;
@@ -547,19 +547,54 @@ pub(crate) fn line_is_blank(text: &Text, line: u64) -> Result<bool, ReadError> {
 /// number in the minibuffer; a numeric prefix argument goes there directly.
 pub(super) fn goto_line(ctx: &mut CommandContext) -> Result<(), CommandError> {
     match ctx.prefix_arg {
-        PrefixArg::Numeric(line) => {
-            let point = ctx.point();
-            super::mark::push_mark(ctx, point, true, false);
-            let text = ctx.buffer().text.clone();
-            ctx.set_point(line_number_position(&text, line)?);
-            Ok(())
-        }
+        PrefixArg::Numeric(line) => goto_line_to(ctx, line),
         _ => {
             let client = ctx.client;
             ctx.editor().read_goto_line(client);
             Ok(())
         }
     }
+}
+
+/// Moves point to the start of line `line` (1-based) and pushes the mark, as
+/// `goto-line` does. When the buffer's line index is still being built and
+/// the line lies beyond the counted prefix, the jump cannot be placed yet:
+/// the client enters a pending state and the indexer finishes it once it
+/// reaches the line (`Editor::resolve_pending_goto`).
+pub(crate) fn goto_line_to(ctx: &mut CommandContext, line: i64) -> Result<(), CommandError> {
+    let point = ctx.point();
+    super::mark::push_mark(ctx, point, true, false);
+    let text = ctx.buffer().text.clone();
+    // A fully indexed buffer (every small file, and any large file once its
+    // scan is done) resolves the line directly, exactly as before.
+    if text.sources().index.is_complete() {
+        ctx.set_point(line_number_position(&text, line)?);
+        return Ok(());
+    }
+    match goto_line_offset(&text, line)? {
+        Some(offset) => ctx.set_point(offset),
+        None => {
+            let client = ctx.client;
+            let buffer = ctx.buffer;
+            let window = ctx.window;
+            ctx.editor()
+                .enter_pending_goto(client, buffer, window, line);
+        }
+    }
+    Ok(())
+}
+
+/// The byte offset of the start of line `line` (1-based) when the line index
+/// can place it, or `None` while the region that must be scanned to reach the
+/// line is still unindexed. A line past the end clamps to the buffer end, as
+/// Emacs `goto-line` does.
+pub(crate) fn goto_line_offset(text: &Text, line: i64) -> Result<Option<u64>, ReadError> {
+    let zero_based = (line.max(1) as u64) - 1;
+    Ok(match text.line_start(zero_based)? {
+        LineLookup::Found(offset) => Some(offset),
+        LineLookup::PastEnd => Some(text.len()),
+        LineLookup::Unknown => None,
+    })
 }
 
 /// The position of the start of line `line` (1-based), as Emacs `goto-line`

@@ -764,9 +764,13 @@ impl Editor {
         let Err(message) = result else {
             return;
         };
-        let Some(target) = self.buffers.get(buffer) else {
+        let Some(target) = self.buffers.get_mut(buffer) else {
             return;
         };
+        // The scan stopped early: drop the progress badge rather than leave it
+        // frozen at the fraction it reached.
+        target.indexing = None;
+        let target = &self.buffers[buffer];
         let text = format!("Counting the lines of {} failed: {message}", target.name);
         let terminals: Vec<ClientId> = self.terminal_recency.clone();
         self.show_echo_to(&terminals, text);

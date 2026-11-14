@@ -167,6 +167,19 @@ struct Client {
     register_read: Option<RegisterRead>,
     /// Cycling state for successive `dabbrev-expand` (`M-/`) presses.
     dabbrev: Option<DabbrevState>,
+    /// A `goto-line` waiting for the background indexer to reach a line that
+    /// lies beyond the counted prefix.
+    pending_goto: Option<PendingGoto>,
+}
+
+/// A `goto-line` whose target line is not yet indexed: the jump completes
+/// once the indexer counts past it, or is dropped by `C-g`.
+#[derive(Debug, Clone, Copy)]
+struct PendingGoto {
+    buffer: BufferId,
+    window: WindowId,
+    /// The 1-based line asked for.
+    line: i64,
 }
 
 #[derive(Debug, Default)]
@@ -451,7 +464,12 @@ impl Editor {
             Event::Request(client, id, request) => self.handle_request(client, id, request),
             Event::Redraw(client) => self.request_full_redraw(client),
             Event::BlockReady { buffer, result, .. } => self.block_ready(buffer, result),
-            Event::IndexProgress { .. } => {}
+            Event::IndexProgress {
+                buffer,
+                indexed_blocks,
+                total_blocks,
+                complete,
+            } => self.index_progress(buffer, indexed_blocks, total_blocks, complete),
             Event::IndexFinished { buffer, result } => self.index_finished(buffer, result),
             Event::Timer(id) => self.handle_timer(id),
             Event::FileLoaded { buffer, result } => self.file_loaded(buffer, result),
@@ -686,6 +704,7 @@ impl Editor {
                 macro_repeat: None,
                 register_read: None,
                 dabbrev: None,
+                pending_goto: None,
             },
         );
         if kind == ClientKind::Tui {

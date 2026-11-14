@@ -76,6 +76,7 @@ pub(super) fn keyboard_quit(ctx: &mut CommandContext) -> Result<(), CommandError
     // synchronous occur would be.
     let client = ctx.client;
     ctx.editor().occur_cancel(client);
+    ctx.editor().cancel_pending_goto(client);
     ctx.editor().abort_keyboard_macro(client);
     Err(CommandError::Quit)
 }

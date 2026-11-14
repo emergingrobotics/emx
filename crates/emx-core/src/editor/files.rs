@@ -877,7 +877,7 @@ impl Editor {
             )
         };
         if loaded.needs_index {
-            self.effects.push(Effect::StartIndex { buffer });
+            self.start_indexing(buffer);
         }
         self.track_journal(buffer);
         if let (Some(client), Some(message)) = (client, message) {
@@ -1803,7 +1803,7 @@ impl Editor {
         if let Some((sources, needs_index)) = replacement {
             target.text = Text::from_original(sources);
             if needs_index {
-                self.effects.push(Effect::StartIndex { buffer });
+                self.start_indexing(buffer);
             }
         }
         let target = &mut self.buffers[buffer];
@@ -2292,7 +2292,7 @@ impl Editor {
                         self.journal_outbox.mark_rescue(buffer);
                     }
                     if needs_index {
-                        self.effects.push(Effect::StartIndex { buffer });
+                        self.start_indexing(buffer);
                     }
                 }
                 RecoveredBuffer::EditsOnly {

@@ -406,10 +406,21 @@ fn index_lines(
                 buffer,
                 indexed_blocks,
                 total_blocks,
+                complete: false,
             });
         }
     };
     let result = index_file(cache, index, cancel, &mut progress).map_err(|error| error.to_string());
+    // A full scan ends with a terminal report so the editor learns the file
+    // is wholly indexed; a cancelled or failed scan reports neither.
+    if result.is_ok() && index.is_complete() {
+        deliver(Event::IndexProgress {
+            buffer,
+            indexed_blocks: total_blocks,
+            total_blocks,
+            complete: true,
+        });
+    }
     deliver(Event::IndexFinished { buffer, result });
 }
 
