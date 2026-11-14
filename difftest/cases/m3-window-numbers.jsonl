@@ -1,0 +1,2 @@
+{"name": "split-too-small-names-the-window", "text": "|abc", "keys": "C-x 2 C-x 2 C-x o C-x 2", "tier": 1}
+{"name": "split-below-size-too-large", "text": "|abc", "keys": "C-u 3 0 C-x 2", "tier": 1}

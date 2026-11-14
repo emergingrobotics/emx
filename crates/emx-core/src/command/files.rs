@@ -50,10 +50,17 @@ pub(super) fn recover_this_file(ctx: &mut CommandContext) -> Result<(), CommandE
     ctx.editor().recover_this_file_command(client)
 }
 
-/// Emacs `read-only-mode` (`C-x C-q`) toggles `buffer-read-only`.
+/// Emacs `read-only-mode` (`C-x C-q`) toggles `buffer-read-only` and,
+/// as an interactive minor-mode toggle, says which way it went.
 pub(super) fn read_only_mode(ctx: &mut CommandContext) -> Result<(), CommandError> {
     let buffer = ctx.buffer_mut();
     buffer.read_only = !buffer.read_only;
+    let state = if buffer.read_only {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    ctx.message(format!("Read-Only mode {state} in current buffer"));
     Ok(())
 }
 

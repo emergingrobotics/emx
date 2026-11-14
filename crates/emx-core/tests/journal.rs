@@ -1053,7 +1053,12 @@ fn saving_rescued_text_to_a_file_ends_its_journal() {
     session.keys("C-x k");
     session.type_text("*scratch*");
     session.keys("RET");
-    // The recovered buffer is shown in place of the killed *scratch*.
+    // The most recent other buffer is shown in place of the killed
+    // *scratch*, as in Emacs; the recovered buffer is switched to.
+    assert_eq!(session.buffer().name, "*Messages*");
+    session.keys("C-x b");
+    session.type_text("*recovered: big.txt*");
+    session.keys("RET");
     assert_eq!(session.buffer().name, "*recovered: big.txt*");
     let saved = directory.path().join("rescued.txt");
     session.keys("C-x C-w C-a C-k");

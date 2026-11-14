@@ -21,7 +21,7 @@ use crate::event::ClientId;
 use crate::killring::KillRing;
 use crate::marker::InsertionType;
 use crate::undo::UndoError;
-use crate::window::{ScreenLine, WindowId};
+use crate::window::{Fetch, Layout, ScreenLine, WindowId};
 
 /// Emacs `user-error` from `region-beginning` and the region commands.
 const NO_REGION: &str = "The mark is not set now, so there is no region";
@@ -526,6 +526,12 @@ impl<'a> CommandContext<'a> {
     /// The window's columns and text rows.
     pub(crate) fn window_size(&self) -> (u16, u16) {
         self.editor.window_size(self.client, self.window)
+    }
+
+    /// How this window lays out `text`, reading it as commands may.
+    pub(crate) fn layout<'t>(&self, text: &'t emx_text::Text) -> Layout<'t> {
+        self.editor
+            .window_layout(self.client, self.window, text, Fetch::Io)
     }
 
     pub(crate) fn window_start(&self) -> ScreenLine {

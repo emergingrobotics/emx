@@ -13,8 +13,8 @@ use crate::editor::Editor;
 use crate::event::ClientId;
 use crate::reload::ExternalState;
 use crate::window::{
-    CONTINUATION_GLYPH, CursorTracker, Fetch, Layout, LineEvent, Reader, ScreenLine, Window,
-    WindowArea, frame_layout, not_cached_block, unit_glyphs,
+    CONTINUATION_GLYPH, CursorTracker, Fetch, LineEvent, ScreenLine, TRUNCATION_GLYPH, WindowArea,
+    WindowId, frame_layout, not_cached_block, unit_glyphs,
 };
 
 /// `mode-line-front-space` on a terminal.
@@ -83,7 +83,7 @@ pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>)
         let window_cursor = draw_window(
             editor,
             client,
-            &frame.windows[window_id],
+            window_id,
             selected,
             &area,
             &mut grid,
@@ -116,23 +116,20 @@ fn tab_width(editor: &Editor) -> usize {
 fn draw_window(
     editor: &Editor,
     window_client: ClientId,
-    window: &Window,
+    window_id: WindowId,
     selected: bool,
     area: &WindowArea,
     grid: &mut Grid,
     prefetch: &mut Vec<PrefetchRequest>,
 ) -> Option<(u16, u16)> {
+    let window = editor.window(window_client, window_id);
     let buffer = editor.buffer(window.buffer);
     let point = buffer.marker_pos(window.point);
     let start = ScreenLine {
         line_start: buffer.marker_pos(window.start),
         row: u64::from(window.start_row_skip),
     };
-    let layout = Layout::new(
-        Reader::new(&buffer.text, Fetch::CachedOnly),
-        area.cols,
-        tab_width(editor),
-    );
+    let layout = editor.window_layout(window_client, window_id, &buffer.text, Fetch::CachedOnly);
     let region = active_region(buffer, point);
     let mut tracker = CursorTracker::new(point);
     let mut first_shown = None;
@@ -249,6 +246,9 @@ fn draw_event(
         }
         LineEvent::Continuation { col, .. } => {
             put_window_glyph(grid, area, row, *col, CONTINUATION_GLYPH, 1, Face::Default);
+        }
+        LineEvent::Truncation { col, .. } => {
+            put_window_glyph(grid, area, row, *col, TRUNCATION_GLYPH, 1, Face::Default);
         }
         LineEvent::Unit { pos, col, .. } => tracker.observe(*pos, window_row, *col),
         LineEvent::End {

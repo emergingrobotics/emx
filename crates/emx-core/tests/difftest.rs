@@ -5,6 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use emx_core::testing::Harness;
 use emx_types::parse_kbd;
@@ -16,6 +17,16 @@ const EMACS_ENV: &str = "EMACS";
 const DEFAULT_EMACS: &str = "emacs";
 /// The driver reports this many of the newest kills.
 const KILL_RING_COMPARED: usize = 3;
+/// A case file takes batch Emacs well under a second; one still running
+/// after this long is in a loop.
+const EMACS_TIMEOUT: Duration = Duration::from_secs(120);
+const EMACS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Batch Emacs needs a few hundred MiB of address space; a runaway case
+/// once grew past 80 GB. 4 GiB, in the KiB `ulimit -v` takes.
+const EMACS_ADDRESS_SPACE_KIB: u64 = 4 * 1024 * 1024;
+const SHELL: &str = "sh";
+/// `sh -c` script: $1 is the address-space limit, the rest the command.
+const BOUNDED_EXEC: &str = r#"ulimit -v "$1" && shift && exec "$@""#;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,12 +95,26 @@ fn read_cases(file: &Path) -> Vec<Case> {
         .collect()
 }
 
-/// Runs every case in `file` through one Emacs process.
+/// Runs every case in `file` through one Emacs process, bounded in time
+/// and memory: a case that sends Emacs into a loop fails the test instead
+/// of hanging it or exhausting the machine.
 fn run_emacs(root: &Path, file: &Path) -> Vec<EmacsResult> {
     let emacs = emacs_binary();
     let directory = tempfile::tempdir().expect("temporary directory");
     let out = directory.path().join("emacs-results.jsonl");
-    let output = Command::new(&emacs)
+    // Output goes to files: a pipe nobody reads while polling could fill
+    // and stall Emacs.
+    let stdout = fs::File::create(directory.path().join("emacs-stdout")).expect("stdout file");
+    let stderr_path = directory.path().join("emacs-stderr");
+    let stderr = fs::File::create(&stderr_path).expect("stderr file");
+    // `ulimit -v` caps the address space; `exec` makes Emacs the process
+    // that is waited for and killed.
+    let mut child = Command::new(SHELL)
+        .arg("-c")
+        .arg(BOUNDED_EXEC)
+        .arg(SHELL)
+        .arg(EMACS_ADDRESS_SPACE_KIB.to_string())
+        .arg(&emacs)
         .arg("--batch")
         .arg("-Q")
         .arg("-l")
@@ -100,19 +125,32 @@ fn run_emacs(root: &Path, file: &Path) -> Vec<EmacsResult> {
         .arg(&out)
         // Anything that prompts must fail instead of waiting for input.
         .stdin(Stdio::null())
-        .output()
-        .unwrap_or_else(|error| {
-            panic!(
-                "the differential tests need GNU Emacs 29: could not run `{emacs}` \
-                 ({error}); install Emacs or set {EMACS_ENV} to its path"
-            )
-        });
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap_or_else(|error| panic!("could not start `{SHELL}` to run Emacs: {error}"));
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait().expect("waiting for Emacs") {
+            Some(status) => break status,
+            None if started.elapsed() > EMACS_TIMEOUT => {
+                child.kill().expect("killing Emacs");
+                child.wait().expect("reaping Emacs");
+                panic!(
+                    "Emacs did not finish {} within {EMACS_TIMEOUT:?} and was killed",
+                    file.display()
+                );
+            }
+            None => std::thread::sleep(EMACS_POLL_INTERVAL),
+        }
+    };
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
     assert!(
-        output.status.success(),
-        "Emacs failed on {}: {}\n{}",
+        status.success(),
+        "Emacs failed on {}: {status} (a status of 127 means `{emacs}` was not found: \
+         the differential tests need GNU Emacs 29; install it or set {EMACS_ENV} to \
+         its path)\n{stderr}",
         file.display(),
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
     );
     let content = fs::read_to_string(&out).expect("Emacs wrote its results");
     content

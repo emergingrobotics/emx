@@ -192,7 +192,10 @@ fn directory_and_unreadable_files_are_errors() {
     );
     assert!(harness.signaled());
     assert_eq!(harness.buffer().name, "*scratch*");
-    assert_eq!(harness.editor().buffer_names(), vec!["*scratch*"]);
+    assert_eq!(
+        harness.editor().buffer_names(),
+        vec!["*Messages*", "*scratch*"]
+    );
     assert!(matches!(
         load_file(directory.path(), &Config::default()),
         Err(LoadError::IsDirectory(_))
@@ -207,7 +210,10 @@ fn directory_and_unreadable_files_are_errors() {
         harness.echo(),
         format!("File is not readable: {}", unreadable.display())
     );
-    assert_eq!(harness.editor().buffer_names(), vec!["*scratch*"]);
+    assert_eq!(
+        harness.editor().buffer_names(),
+        vec!["*Messages*", "*scratch*"]
+    );
 }
 
 #[test]
@@ -224,7 +230,7 @@ fn visiting_a_visited_file_switches_to_its_buffer() {
     assert_eq!(harness.point(), 4, "point kept from when it was left");
     assert_eq!(
         harness.editor().buffer_names(),
-        vec!["*scratch*", "a.txt", "b.txt"]
+        vec!["*Messages*", "*scratch*", "a.txt", "b.txt"]
     );
 }
 
@@ -906,7 +912,10 @@ fn kill_buffer_asks_when_modified() {
     harness.keys("C-x k");
     assert_eq!(harness.echo_line(), "Kill buffer (default a.txt): ");
     harness.keys("RET");
-    assert_eq!(harness.editor().buffer_names(), vec!["*scratch*"]);
+    assert_eq!(
+        harness.editor().buffer_names(),
+        vec!["*Messages*", "*scratch*"]
+    );
     assert_eq!(harness.buffer().name, "*scratch*");
 
     visit(&mut harness, &path);
@@ -925,12 +934,18 @@ fn kill_buffer_asks_when_modified() {
     harness.type_text("save and then kill");
     harness.keys("RET");
     assert_eq!(fs::read(&path).expect("read"), b"1a\n");
-    assert_eq!(harness.editor().buffer_names(), vec!["*scratch*"]);
+    assert_eq!(
+        harness.editor().buffer_names(),
+        vec!["*Messages*", "*scratch*"]
+    );
     visit(&mut harness, &path);
     harness.keys("2 C-x k RET");
     harness.type_text("yes");
     harness.keys("RET");
-    assert_eq!(harness.editor().buffer_names(), vec!["*scratch*"]);
+    assert_eq!(
+        harness.editor().buffer_names(),
+        vec!["*Messages*", "*scratch*"]
+    );
     assert_eq!(fs::read(&path).expect("read"), b"1a\n");
     harness.keys("C-x k");
     harness.type_text("nonesuch");
@@ -1603,7 +1618,10 @@ fn non_regular_files_are_refused() {
             harness.echo(),
             format!("not a regular file: {}", path.display())
         );
-        assert_eq!(harness.editor().buffer_names(), vec!["*scratch*"]);
+        assert_eq!(
+            harness.editor().buffer_names(),
+            vec!["*Messages*", "*scratch*"]
+        );
     }
 }
 

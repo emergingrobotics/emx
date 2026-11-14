@@ -1486,6 +1486,7 @@ impl Editor {
     /// A failed save abandons every pending exit; the exiting clients see
     /// why.
     fn abandon_exits(&mut self, message: &str) {
+        self.log_message(message);
         let exiting: Vec<ClientId> = self
             .clients
             .iter()

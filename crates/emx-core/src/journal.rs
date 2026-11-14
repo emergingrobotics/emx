@@ -1340,6 +1340,11 @@ impl JournalOutbox {
     }
 
     /// The buffer whose journal is `id`.
+    /// Whether the buffer's changes are journaled.
+    pub(crate) fn tracks(&self, buffer: BufferId) -> bool {
+        self.journals.contains_key(&buffer)
+    }
+
     pub(crate) fn buffer_of(&self, id: JournalId) -> Option<BufferId> {
         self.journals
             .iter()

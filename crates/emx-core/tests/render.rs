@@ -367,10 +367,12 @@ fn render_1x1_does_not_panic() {
         vec!["E".to_string()],
         "the echo row comes first"
     );
+    // A one-row window has no modeline in Emacs (`window_wants_mode_line`):
+    // the row shows text.
     harness.resize(4, 2);
     assert_eq!(
         harness.screen(),
-        vec!["-UUU".to_string(), "End ".to_string()]
+        vec!["abc ".to_string(), "End ".to_string()]
     );
 }
 

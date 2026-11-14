@@ -310,29 +310,32 @@ fn a_wrapped_window_start_survives_a_width_change() {
     // One long line wrapped over many rows: the window starts part way
     // through it, then the window is split side by side. The new width
     // shows the same text at the top, from the start of its row.
+    // 120 columns, so both halves are 60 wide and still wrap (a window
+    // narrower than 50 columns would truncate instead).
     let line: String = (0..400)
         .map(|index| char::from(b'a' + (index % 26) as u8))
         .collect();
     let mut harness = Harness::with_text(&format!("{line}\n|end\n"));
-    harness.resize(80, 6);
-    // Point at "end": the window shows the end of the long line.
-    // Recentered: the window starts at the long line's fifth row.
+    harness.resize(120, 6);
+    // Point at "end": recentered, the window starts at the long line's
+    // third row (119 columns of text each).
     let top = harness.screen()[0].clone();
-    assert!(top.starts_with(&line[316..395]), "{top:?}");
+    assert!(top.starts_with(&line[238..357]), "{top:?}");
     harness.keys("C-x 3");
     let top = harness.screen()[0].clone();
-    // The left window has 39 text columns, 38 of them for text: the row
-    // holding position 316 starts at 304.
-    assert!(top.starts_with(&line[304..342]), "{top:?}");
+    // The left window has 59 text columns, 58 of them for text: the row
+    // holding position 238 starts at 232.
+    assert!(top.starts_with(&line[232..290]), "{top:?}");
 }
 
 #[test]
 fn switch_to_buffer_creates_and_restores_window_point() {
     let mut harness = Harness::with_text("abc|def\n");
     harness.keys("C-x b");
+    // A fresh session's other buffer is `*Messages*`, as in Emacs.
     assert_eq!(
         harness.echo_line(),
-        "Switch to buffer (default *scratch*): "
+        "Switch to buffer (default *Messages*): "
     );
     harness.type_text("foo");
     harness.keys("RET");
@@ -367,15 +370,15 @@ fn each_window_remembers_its_own_point_per_buffer() {
     harness.keys("C-x 2");
     // Upper: foo at 3. Lower: foo at 3 too; move it, then show *scratch*
     // in both and come back.
-    harness.keys("C-x o C-a C-f C-x b RET");
+    harness.keys("C-x o C-a C-f C-x b * s c r a t c h * RET");
     assert_eq!(harness.buffer().name, "*scratch*");
     harness.keys("C-n");
-    harness.keys("C-x o C-x b RET");
+    harness.keys("C-x o C-x b * s c r a t c h * RET");
     assert_eq!(harness.buffer().name, "*scratch*");
-    harness.keys("C-x b RET");
+    harness.keys("C-x b f o o RET");
     assert_eq!(harness.buffer().name, "foo");
     assert_eq!(harness.point(), 3);
-    harness.keys("C-x o C-x b RET");
+    harness.keys("C-x o C-x b f o o RET");
     assert_eq!(harness.buffer().name, "foo");
     assert_eq!(harness.point(), 1);
 }
@@ -383,7 +386,11 @@ fn each_window_remembers_its_own_point_per_buffer() {
 /// `*Buffer List*` as Emacs 29 prints it: columns C, R, M, the buffer name
 /// in 19 columns, the size right-aligned in 7, the mode in 16, the file.
 fn buffer_list_line(flags: &str, name: &str, size: u64, file: &str) -> String {
-    format!("{flags} {name:<19} {size:>7} {:<16} {file}", "Fundamental")
+    buffer_list_mode_line(flags, name, size, "Fundamental", file)
+}
+
+fn buffer_list_mode_line(flags: &str, name: &str, size: u64, mode: &str, file: &str) -> String {
+    format!("{flags} {name:<19} {size:>7} {mode:<16} {file}")
 }
 
 #[test]
@@ -414,11 +421,16 @@ fn buffer_list_visits() {
         screen[22]
     );
     assert_eq!(
+        screen[15].trim_end(),
+        buffer_list_mode_line(" % ", "*Messages*", 0, "Messages", "").trim_end()
+    );
+    assert_eq!(
         harness.buffer_text("*Buffer List*").expect("listed"),
         format!(
-            "{}\n{}\n",
+            "{}\n{}\n{}\n",
             buffer_list_line(".  ", "*scratch*", 0, ""),
-            buffer_list_line("  *", "foo", 5, "")
+            buffer_list_line("  *", "foo", 5, ""),
+            buffer_list_mode_line(" % ", "*Messages*", 0, "Messages", "")
         )
     );
 
@@ -454,11 +466,18 @@ fn buffer_list_names_files_and_flags() {
     let mut lines = text.lines();
     assert_eq!(
         lines.next().expect("first entry"),
-        buffer_list_line(".% ", "notes.txt", 12, &path.display().to_string())
+        buffer_list_line(".% ", "notes.txt", 12, &emx_core::io::abbreviate(&path))
     );
     assert_eq!(
         lines.next().expect("second entry").trim_end(),
         buffer_list_line("   ", "*scratch*", 0, "").trim_end()
+    );
+    // C-x C-q said "Read-Only mode enabled in current buffer", which is
+    // logged.
+    let logged = "Read-Only mode enabled in current buffer\n".len() as u64;
+    assert_eq!(
+        lines.next().expect("third entry"),
+        buffer_list_mode_line(" %*", "*Messages*", logged, "Messages", "")
     );
     assert_eq!(lines.next(), None);
 }
@@ -508,4 +527,182 @@ fn windows_of_other_clients_are_their_own() {
     harness.detach(other);
     harness.keys("C-x o");
     assert_eq!(harness.cursor(), Some((0, 12)));
+}
+
+/// `long.txt` of the truncation captures: a short line, a 100-column
+/// line, a 43-column line and a short one.
+fn long_lines() -> (String, String) {
+    let line: String = (0..100)
+        .map(|index| char::from(b'a' + (index % 26) as u8))
+        .collect();
+    let text = format!("|short\n{line}\nmid{}\nend\n", "x".repeat(40));
+    (text, line)
+}
+
+fn rows(harness: &Harness, count: usize) -> Vec<String> {
+    harness
+        .screen()
+        .iter()
+        .take(count)
+        .map(|row| row.trim_end().to_string())
+        .collect()
+}
+
+#[test]
+fn partial_width_windows_truncate_lines() {
+    // emacs -nw -Q, 80x12, C-x 3 C-n: both halves are under 50 columns
+    // (`truncate-partial-width-windows`), so lines are cut with `$`.
+    let (text, _) = long_lines();
+    let mut harness = Harness::with_text(&text);
+    harness.resize(80, 12);
+    harness.keys("C-x 3 C-n");
+    assert_eq!(
+        rows(&harness, 4),
+        vec![
+            "short                                  |short",
+            "abcdefghijklmnopqrstuvwxyzabcdefghijkl$|abcdefghijklmnopqrstuvwxyzabcdefghijklm$",
+            "midxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$|midxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$",
+            "end                                    |end",
+        ]
+    );
+    assert_eq!(harness.cursor(), Some((0, 1)));
+}
+
+#[test]
+fn auto_hscroll_follows_point_like_emacs() {
+    // Captured from emacs -nw -Q, 80x8, in the 40-column left window: the
+    // window scrolls once point reaches column 35 (`hscroll-margin` 5),
+    // to put point in the middle; it scrolls back when point comes within
+    // 5 columns of the left edge; at the end of a line, point is put 4
+    // columns from the right edge.
+    let (text, _) = long_lines();
+    let mut harness = Harness::with_text(&text);
+    harness.resize(80, 8);
+    harness.keys("C-x 3 C-n C-u 3 4 C-f");
+    assert_eq!(harness.cursor(), Some((34, 1)));
+    assert!(harness.screen()[1].starts_with("abc"));
+    harness.keys("C-f");
+    assert_eq!(
+        rows(&harness, 4),
+        vec![
+            "$                                      |short",
+            "$qrstuvwxyzabcdefghijklmnopqrstuvwxyza$|abcdefghijklmnopqrstuvwxyzabcdefghijklm$",
+            "$xxxxxxxxxxxxxxxxxxxxxxxxxxx           |midxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx$",
+            "$                                      |end",
+        ]
+    );
+    assert_eq!(harness.cursor(), Some((20, 1)));
+    harness.keys("C-u 1 5 C-b");
+    assert_eq!(harness.cursor(), Some((5, 1)), "still scrolled");
+    harness.keys("C-b");
+    assert_eq!(harness.cursor(), Some((19, 1)));
+    assert!(harness.screen()[1].starts_with("abcdefghijklmnopqrs"));
+    harness.keys("C-e");
+    assert_eq!(
+        rows(&harness, 2)[1],
+        "$nopqrstuvwxyzabcdefghijklmnopqrstuv   |abcdefghijklmnopqrstuvwxyzabcdefghijklm$"
+    );
+    assert_eq!(harness.cursor(), Some((36, 1)));
+}
+
+#[test]
+fn only_a_line_running_past_the_edge_scrolls_the_window() {
+    // emacs -nw -Q: in the 40-column left window (38 text columns), C-e
+    // on a 38-column line leaves the window alone; on a 39-column line it
+    // scrolls by 3.
+    let lines: Vec<String> = (36..40).map(|length| "y".repeat(length)).collect();
+    let mut harness = Harness::with_text(&format!("|{}\n", lines.join("\n")));
+    harness.resize(80, 8);
+    harness.keys("C-x 3 C-n C-n C-e");
+    assert_eq!(harness.cursor(), Some((38, 2)));
+    assert_eq!(
+        rows(&harness, 3)[2],
+        format!("{} |{}", "y".repeat(38), "y".repeat(38))
+    );
+    harness.keys("C-a C-n C-e");
+    assert_eq!(harness.cursor(), Some((36, 3)));
+    let screen = rows(&harness, 4);
+    assert_eq!(
+        screen[0],
+        format!("${}      |{}", "y".repeat(32), "y".repeat(36))
+    );
+    assert_eq!(
+        screen[3],
+        format!("${}   |{}", "y".repeat(35), "y".repeat(39))
+    );
+}
+
+#[test]
+fn a_scrolled_window_stays_truncated_when_it_widens() {
+    // emacs -nw -Q: after C-x 1 the full-width window keeps its hscroll of
+    // 15 and so keeps truncating, until point comes back near the left.
+    let (text, line) = long_lines();
+    let mut harness = Harness::with_text(&text);
+    harness.resize(80, 8);
+    harness.keys("C-x 3 C-n C-u 3 5 C-f C-x 1");
+    assert_eq!(
+        rows(&harness, 4),
+        vec![
+            "$".to_string(),
+            format!("${}$", &line[16..94]),
+            format!("${}", "x".repeat(27)),
+            "$".to_string(),
+        ]
+    );
+    harness.keys("C-a");
+    assert_eq!(rows(&harness, 2)[1], format!("{}\\", &line[..79]));
+    assert_eq!(harness.cursor(), Some((0, 1)));
+}
+
+#[test]
+fn a_one_row_window_shows_text_without_a_modeline() {
+    // emacs -nw -Q, 60x12, C-u 1 C-x 2: the upper window is one row of
+    // text (`window_wants_mode_line` wants more than one line).
+    let mut harness = Harness::with_text("|abc\ndef\n");
+    harness.resize(60, 12);
+    harness.keys("C-u 1 C-x 2");
+    assert!(!harness.signaled());
+    let screen = harness.screen();
+    assert_eq!(screen[0].trim_end(), "abc");
+    assert_eq!(screen[1].trim_end(), "abc");
+    assert!(screen[10].starts_with("-UUU"));
+    assert_eq!(harness.grid().row(0)[0].face, Face::Default);
+    assert_eq!(harness.cursor(), Some((0, 0)));
+}
+
+#[test]
+fn a_user_buffer_named_buffer_list_stays_journaled() {
+    use emx_core::Config;
+    use emx_core::journal::RecoveredBuffer;
+    use emx_core::testing::write_and_replay;
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut harness = Harness::with_text("|");
+    harness.keys("C-x b");
+    harness.type_text("*Buffer List*");
+    harness.keys("RET");
+    harness.type_text("typed");
+    harness.keys("C-x C-b");
+    let listed = harness.buffer_text("*Buffer List*").expect("exists");
+    assert!(listed.contains("*scratch*"), "{listed:?}");
+    // A journal directory must be private, as `write_and_replay` checks.
+    let journals = directory.path().join("journal");
+    let recovered =
+        write_and_replay(&journals, harness.journal_ops(), &Config::default()).expect("replay");
+    let rebuilt: Vec<String> = recovered
+        .into_iter()
+        .filter_map(|buffer| match buffer {
+            RecoveredBuffer::Rebuilt { name, text, .. } if name == "*Buffer List*" => {
+                let mut bytes = Vec::new();
+                text.read(0..text.len(), &mut bytes).expect("in memory");
+                Some(String::from_utf8(bytes).expect("UTF-8"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rebuilt,
+        vec![listed],
+        "the journal saw the list replace the text"
+    );
 }

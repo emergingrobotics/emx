@@ -2,28 +2,25 @@
 //! buffer each one shows and where, and the Buffer Menu. Ported from
 //! Emacs 29's window.el, window.c and buff-menu.el.
 
-use std::sync::Arc;
+use std::ops::ControlFlow;
 
-use emx_text::{ReadError, Sources, Text};
+use emx_text::{ReadError, Text};
 use emx_types::Key;
 
 use super::{Editor, Purpose};
-use crate::buffer::{BufferId, BufferMenu};
+use crate::buffer::BufferId;
 use crate::command::CommandError;
 use crate::event::ClientId;
-use crate::io::abbreviate;
 use crate::keymap::Lookup;
 use crate::marker::InsertionType;
 use crate::minibuffer::{HistoryKind, Mode};
-use crate::render::text_width;
-use crate::undo::UndoLimits;
 use crate::window::{
-    Fetch, Layout, PrevBuffer, Reader, ScreenLine, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH,
+    Fetch, HSCROLL_END_OF_LINE_ROOM, HSCROLL_MARGIN, Layout, LineEvent, PrevBuffer, Reader,
+    ScreenLine, TRUNCATE_PARTIAL_WIDTH_WINDOWS, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH,
     WINDOW_SAFE_MIN_HEIGHT, WINDOW_SAFE_MIN_WIDTH, Window, WindowId,
 };
 
 const SCRATCH_BUFFER: &str = "*scratch*";
-const BUFFER_LIST: &str = "*Buffer List*";
 /// Emacs `split-height-threshold` and `split-width-threshold`: the size a
 /// window needs before `display-buffer` splits it, unless it is alone.
 const SPLIT_HEIGHT_THRESHOLD: u16 = 80;
@@ -36,36 +33,9 @@ const SOLE_WINDOW: &str = "Attempt to delete minibuffer or sole ordinary window"
 const NO_OTHER_WINDOWS: &str = "No other windows to delete";
 const NO_OTHER_WINDOW: &str = "No other window to select";
 const NEW_WINDOW_TOO_SMALL: &str = "Size of new window too small";
-const NO_BUFFER_ON_LINE: &str = "No buffer on this line";
-const BUFFER_KILLED: &str = "This buffer has been killed";
 /// Buffers whose names start with a space are internal: Emacs neither
 /// lists nor records them.
-const INTERNAL_NAME_PREFIX: char = ' ';
-
-/// The Buffer Menu's columns (`list-buffers--refresh`): the name column is
-/// as wide as the longest name, at least 19 columns and at most a 4.2th
-/// of the window.
-const MENU_NAME_MIN_WIDTH: usize = 19;
-const MENU_NAME_WIDTH_RATIO_TENTHS: usize = 42;
-const TENTHS: usize = 10;
-const MENU_SIZE_WIDTH: usize = 7;
-const MENU_MODE_WIDTH: usize = 16;
-const MENU_FLAG_WIDTH: usize = 1;
-const MENU_FILE_WIDTH: usize = 1;
-const MENU_CURRENT: &str = ".";
-const MENU_READ_ONLY: &str = "%";
-const MENU_MODIFIED: &str = "*";
-const MENU_BLANK: &str = " ";
-/// `truncate-string-ellipsis` on a terminal that shows it.
-const ELLIPSIS: &str = "\u{2026}";
-
-/// One column of a tabulated list (`tabulated-list-format`).
-struct Column {
-    title: &'static str,
-    width: usize,
-    pad_right: usize,
-    right_align: bool,
-}
+pub(super) const INTERNAL_NAME_PREFIX: char = ' ';
 
 impl Editor {
     /// Emacs looks keys up in the current buffer's local map first, then
@@ -586,7 +556,7 @@ impl Editor {
     /// Emacs `display-buffer` with its default actions: a window already
     /// showing the buffer, else a new window split off, else a window that
     /// showed it before, else the least recently used window.
-    fn display_buffer(&mut self, client: ClientId, buffer: BufferId) -> WindowId {
+    pub(super) fn display_buffer(&mut self, client: ClientId, buffer: BufferId) -> WindowId {
         let frame = self.frame(client);
         let selected = frame.selected;
         let order = frame.order_from_selected();
@@ -701,116 +671,88 @@ impl Editor {
         Some(self.split_window(client, window, side_by_side, new_size))
     }
 
-    // ---- The Buffer Menu --------------------------------------------------
+    // ---- Truncation and horizontal scrolling --------------------------------
 
-    /// `list-buffers` (`C-x C-b`): `*Buffer List*` lists the buffers, most
-    /// recent first, and is displayed without being selected. With
-    /// `files_only`, only buffers visiting files are listed.
-    pub(crate) fn list_buffers_command(&mut self, client: ClientId, files_only: bool) {
-        let current = self.selected_buffer(client);
-        let selected = self.selected_window_id(client);
-        let window_cols = usize::from(self.window_area(client, selected).cols);
-        let list = match self
-            .buffers
-            .iter()
-            .find(|(_, buffer)| buffer.name == BUFFER_LIST)
-            .map(|(id, _)| id)
-        {
-            Some(list) => list,
-            None => self.create_buffer(BUFFER_LIST),
-        };
-        let entries: Vec<BufferId> = self
-            .recency
-            .iter()
-            .copied()
-            .filter(|id| {
-                let buffer = &self.buffers[*id];
-                *id != list
-                    && (!buffer.name.starts_with(INTERNAL_NAME_PREFIX) || buffer.file.is_some())
-                    && (!files_only || buffer.file.is_some())
-            })
-            .collect();
-        let rows: Vec<Vec<String>> = entries
-            .iter()
-            .map(|id| self.menu_row(*id, current))
-            .collect();
-        let longest_name = entries
-            .iter()
-            .map(|id| self.buffers[*id].name.chars().count())
-            .max()
-            .unwrap_or(0);
-        let name_width = MENU_NAME_MIN_WIDTH
-            .max((window_cols * TENTHS / MENU_NAME_WIDTH_RATIO_TENTHS).min(longest_name));
-        let columns = menu_columns(name_width);
-        let tab_width = self.tab_width();
-        let mut text = String::new();
-        for (index, row) in rows.iter().enumerate() {
-            let previous = &rows[index.saturating_sub(1)];
-            let next = rows.get(index + 1).unwrap_or(row);
-            text.push_str(&tabulated_row(
-                &columns,
-                row,
-                [previous, row, next],
-                tab_width,
-            ));
-            text.push('\n');
+    /// `Some(hscroll)` when the window truncates lines instead of wrapping
+    /// them: Emacs `truncated-partial-width-window-p` (not as wide as the
+    /// frame and narrower than `truncate-partial-width-windows`), or the
+    /// window is scrolled horizontally, which truncates any window.
+    pub(crate) fn window_hscroll(&self, client: ClientId, window: WindowId) -> Option<u64> {
+        let frame = self.frame(client);
+        let place = frame.window_box(window);
+        let hscroll = frame.windows[window].hscroll;
+        let partial_width =
+            place.cols != frame.cols() && place.cols < TRUNCATE_PARTIAL_WIDTH_WINDOWS;
+        (partial_width || hscroll > 0).then_some(u64::from(hscroll))
+    }
+
+    /// How the window lays out `text`: wrapped, or truncated and scrolled.
+    pub(crate) fn window_layout<'t>(
+        &self,
+        client: ClientId,
+        window: WindowId,
+        text: &'t Text,
+        fetch: Fetch,
+    ) -> Layout<'t> {
+        let (cols, _) = self.window_size(client, window);
+        let reader = Reader::new(text, fetch);
+        match self.window_hscroll(client, window) {
+            Some(hscroll) => Layout::truncating(reader, cols, self.tab_width(), hscroll),
+            None => Layout::new(reader, cols, self.tab_width()),
         }
-        let titles: Vec<String> = columns
-            .iter()
-            .map(|column| column.title.to_string())
-            .collect();
-        let header = tabulated_row(&columns, &titles, [&titles, &titles, &titles], tab_width);
-        let limits = UndoLimits::from(&self.config);
-        let target = &mut self.buffers[list];
-        target.reset_text(
-            Text::from_original(Sources::memory(Arc::from(text.into_bytes()))),
-            limits,
-        );
-        target.read_only = true;
-        target.menu = Some(BufferMenu { entries, header });
-        self.display_buffer(client, list);
     }
 
-    /// One Buffer Menu entry: current, read-only and modified flags, name,
-    /// size, mode and file.
-    fn menu_row(&self, buffer: BufferId, current: BufferId) -> Vec<String> {
-        let target = &self.buffers[buffer];
-        let flag = |set: bool, shown: &str| if set { shown } else { MENU_BLANK }.to_string();
-        vec![
-            flag(buffer == current, MENU_CURRENT),
-            flag(target.read_only, MENU_READ_ONLY),
-            flag(target.is_modified(), MENU_MODIFIED),
-            target.name.clone(),
-            target.text.len().to_string(),
-            target.mode_name().to_string(),
-            target
-                .file
-                .as_ref()
-                .map(|file| abbreviate(&file.path))
-                .unwrap_or_default(),
-        ]
-    }
-
-    /// `Buffer-menu-this-window` (`RET` in the Buffer Menu): shows the
-    /// buffer of point's line in this window.
-    pub(crate) fn buffer_menu_this_window_command(
+    /// Emacs auto-hscroll (`hscroll_window_tree`, `hscroll-step` 0): a
+    /// truncating window scrolls so point's column is not within
+    /// `hscroll-margin` of an edge it can scroll past. Reads only cached
+    /// text, like the rest of redisplay.
+    pub(super) fn auto_hscroll(
         &mut self,
         client: ClientId,
-    ) -> Result<(), CommandError> {
-        let list = &self.buffers[self.selected_buffer(client)];
-        let Some(menu) = &list.menu else {
-            return Err(CommandError::User(NO_BUFFER_ON_LINE.to_string()));
+        window: WindowId,
+    ) -> Result<(), ReadError> {
+        let Some(hscroll) = self.window_hscroll(client, window) else {
+            return Ok(());
         };
-        let point = self.window_point(client, self.selected_window_id(client));
-        let line = list.text.line_of(point)?;
-        let entry = line
-            .and_then(|line| usize::try_from(line).ok())
-            .and_then(|line| menu.entries.get(line).copied())
-            .ok_or_else(|| CommandError::User(NO_BUFFER_ON_LINE.to_string()))?;
-        if !self.buffers.contains_key(entry) {
-            return Err(CommandError::User(BUFFER_KILLED.to_string()));
+        let target = *self.window(client, window);
+        let text = self.buffers[target.buffer].text.clone();
+        let point = self.buffers[target.buffer].marker_pos(target.point);
+        let (cols, _) = self.window_size(client, window);
+        let layout = Layout::truncating(
+            Reader::new(&text, Fetch::CachedOnly),
+            cols,
+            self.tab_width(),
+            0,
+        );
+        let line_start = layout.line_start(point)?;
+        let mut column = 0;
+        let mut end = (0, 0);
+        layout.walk_line(line_start, &mut |event| {
+            match event {
+                LineEvent::Unit { pos, col, .. } if *pos <= point => column = *col,
+                LineEvent::End { pos, col, .. } => {
+                    if *pos <= point {
+                        column = *col;
+                    }
+                    end = (*pos, *col);
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        })?;
+        let line = HorizontalLine {
+            column: column as u64,
+            width: end.1 as u64,
+            at_end: point >= end.0,
+        };
+        let window_width = u64::from(self.frame(client).window_box(window).cols);
+        let text_width = u64::from(cols).saturating_sub(1);
+        let wanted = wanted_hscroll(hscroll, window_width, text_width, line);
+        if wanted != hscroll {
+            // Only a line over four billion columns long could overflow.
+            self.client_mut(client).frame.windows[window].hscroll =
+                u32::try_from(wanted).unwrap_or(u32::MAX);
         }
-        self.switch_to_buffer(client, entry);
         Ok(())
     }
 
@@ -826,6 +768,12 @@ impl Editor {
     ) -> Result<(), ReadError> {
         let (cols, _) = self.window_size(client, window);
         let target = *self.window(client, window);
+        // A truncating window shows each line in one row, from its start.
+        if target.start_row_skip > 0 && self.window_hscroll(client, window).is_some() {
+            let line_start = self.window_start(client, window).line_start;
+            self.set_window_start(client, window, ScreenLine { line_start, row: 0 });
+            return Ok(());
+        }
         if target.start_cols == cols {
             return Ok(());
         }
@@ -843,179 +791,66 @@ impl Editor {
     }
 }
 
-/// `list-buffers--refresh`'s `tabulated-list-format`.
-fn menu_columns(name_width: usize) -> Vec<Column> {
-    let flag = |title, pad_right| Column {
-        title,
-        width: MENU_FLAG_WIDTH,
-        pad_right,
-        right_align: false,
+/// Point's line as auto-hscroll sees it, in columns from the line start.
+#[derive(Debug, Clone, Copy)]
+struct HorizontalLine {
+    column: u64,
+    width: u64,
+    at_end: bool,
+}
+
+/// The hscroll Emacs picks for a window `window_width` columns wide, its
+/// border included, of which `text_width` show text before the
+/// truncation glyph. Point within the margin of the left edge of a
+/// scrolled window, or of the right edge of a line that goes on past it,
+/// is brought to the middle, or near the right edge when it is at the end
+/// of its line.
+fn wanted_hscroll(hscroll: u64, window_width: u64, text_width: u64, line: HorizontalLine) -> u64 {
+    let x = line.column as i128 - hscroll as i128;
+    let margin = i128::from(HSCROLL_MARGIN);
+    let truncated_right = line.width > hscroll + text_width;
+    let near_left = hscroll > 0 && x < margin;
+    let near_right = truncated_right && x >= window_width as i128 - margin;
+    if !(near_left || near_right) {
+        return hscroll;
+    }
+    let keep = if line.at_end {
+        window_width.saturating_sub(HSCROLL_END_OF_LINE_ROOM)
+    } else {
+        window_width / 2
     };
-    vec![
-        flag("C", 0),
-        flag("R", 0),
-        flag("M", 1),
-        Column {
-            title: "Buffer",
-            width: name_width,
-            pad_right: 1,
-            right_align: false,
-        },
-        Column {
-            title: "Size",
-            width: MENU_SIZE_WIDTH,
-            pad_right: 1,
-            right_align: true,
-        },
-        Column {
-            title: "Mode",
-            width: MENU_MODE_WIDTH,
-            pad_right: 1,
-            right_align: false,
-        },
-        Column {
-            title: "File",
-            width: MENU_FILE_WIDTH,
-            pad_right: 1,
-            right_align: false,
-        },
-    ]
-}
-
-/// One row of a tabulated list as Emacs displays it
-/// (`tabulated-list-print-col`): each column padded to its width, a label
-/// too wide for it truncated with an ellipsis, except that a label before
-/// a right-aligned column may run into that column's unused space, judged
-/// from the rows around it (`near`: previous, this, next).
-fn tabulated_row(
-    columns: &[Column],
-    cells: &[String],
-    near: [&Vec<String>; 3],
-    tab_width: usize,
-) -> String {
-    let width_of = |text: &str| text_width(text.as_bytes(), tab_width);
-    let mut out = String::new();
-    let mut column = 0;
-    let mut x = 0;
-    for (index, (format, cell)) in columns.iter().zip(cells).enumerate() {
-        let not_last = index + 1 < columns.len();
-        let mut width = format.width;
-        let mut label = cell.clone();
-        let mut label_width = width_of(&label);
-        let available = match columns.get(index + 1) {
-            Some(next) if !format.right_align && next.right_align => {
-                let local_max = near
-                    .iter()
-                    .map(|row| width_of(&row[index + 1]))
-                    .max()
-                    .unwrap_or(0);
-                width + next.width - next.width.min(local_max)
-            }
-            _ => width,
-        };
-        if not_last && label_width > available {
-            label = truncate_with_ellipsis(&label, available, tab_width);
-            label_width = available;
-        }
-        if format.right_align && width > label_width {
-            let shift = width - label_width;
-            align_to(&mut out, &mut column, x + shift);
-            width -= shift;
-            x += shift;
-        }
-        out.push_str(&label);
-        column += label_width;
-        let next_x = x + format.pad_right + width;
-        if not_last {
-            out.push_str(&" ".repeat(format.pad_right));
-            column += format.pad_right;
-            align_to(&mut out, &mut column, next_x);
-        }
-        x = next_x;
-    }
-    out
-}
-
-/// A `(space :align-to TARGET)` stretch: blanks up to the target column,
-/// none when the text already reaches past it.
-fn align_to(out: &mut String, column: &mut usize, target: usize) {
-    if target > *column {
-        out.push_str(&" ".repeat(target - *column));
-        *column = target;
-    }
-}
-
-/// Emacs `truncate-string-to-width` with an ellipsis: as many whole
-/// characters as fit before the ellipsis.
-fn truncate_with_ellipsis(label: &str, width: usize, tab_width: usize) -> String {
-    let room = width.saturating_sub(text_width(ELLIPSIS.as_bytes(), tab_width));
-    let mut kept = String::new();
-    let mut used = 0;
-    for character in label.chars() {
-        let mut encoded = [0; 4];
-        let character_width = text_width(character.encode_utf8(&mut encoded).as_bytes(), tab_width);
-        if used + character_width > room {
-            break;
-        }
-        kept.push(character);
-        used += character_width;
-    }
-    kept.push_str(ELLIPSIS);
-    kept
+    line.column.saturating_sub(keep)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn row(cells: &[&str]) -> Vec<String> {
-        cells.iter().map(|cell| cell.to_string()).collect()
+    fn line(column: u64, width: u64, at_end: bool) -> HorizontalLine {
+        HorizontalLine {
+            column,
+            width,
+            at_end,
+        }
     }
 
     #[test]
-    fn header_matches_the_emacs_screen() {
-        let columns = menu_columns(MENU_NAME_MIN_WIDTH);
-        let titles = row(&["C", "R", "M", "Buffer", "Size", "Mode", "File"]);
-        assert_eq!(
-            tabulated_row(&columns, &titles, [&titles, &titles, &titles], 8),
-            "CRM Buffer                 Size Mode             File"
-        );
-    }
-
-    #[test]
-    fn a_long_name_runs_into_the_free_size_columns() {
-        // emacs -nw -Q, C-x C-b: ` %  *Async-native-compile-l…  0 Fundamental`
-        // below a `*Messages*` row of size 66.
-        let columns = menu_columns(MENU_NAME_MIN_WIDTH);
-        let previous = row(&[" ", "%", "*", "*Messages*", "66", "Messages", ""]);
-        let this = row(&[
-            " ",
-            "%",
-            " ",
-            "*Async-native-compile-log*",
-            "0",
-            "Fundamental",
-            "",
-        ]);
-        assert_eq!(
-            tabulated_row(&columns, &this, [&previous, &this, &this], 8),
-            " %  *Async-native-compile-l\u{2026}  0 Fundamental      "
-        );
-        // Between rows of sizes 145 and 66: three columns of the size
-        // column are taken.
-        let above = row(&[".", " ", " ", "*scratch*", "145", "Fundamental", ""]);
-        let this = row(&[
-            " ",
-            " ",
-            " ",
-            "a-very-long-buffer-name-indeed",
-            "0",
-            "Fundamental",
-            "",
-        ]);
-        assert_eq!(
-            tabulated_row(&columns, &this, [&above, &this, &previous], 8),
-            "    a-very-long-buffer-nam\u{2026}   0 Fundamental      "
-        );
+    fn wanted_hscroll_matches_emacs_captures() {
+        // emacs -nw -Q, 80 columns, C-x 3: the left window is 40 wide with
+        // 38 text columns, the right one 40 with 39.
+        assert_eq!(wanted_hscroll(0, 40, 38, line(34, 100, false)), 0);
+        assert_eq!(wanted_hscroll(0, 40, 38, line(35, 100, false)), 15);
+        assert_eq!(wanted_hscroll(0, 40, 39, line(35, 100, false)), 15);
+        assert_eq!(wanted_hscroll(15, 40, 38, line(20, 100, false)), 15);
+        assert_eq!(wanted_hscroll(15, 40, 38, line(19, 100, false)), 0);
+        assert_eq!(wanted_hscroll(0, 40, 38, line(100, 100, true)), 64);
+        assert_eq!(wanted_hscroll(0, 40, 38, line(43, 43, true)), 7);
+        assert_eq!(wanted_hscroll(0, 40, 38, line(38, 38, true)), 0);
+        assert_eq!(wanted_hscroll(0, 40, 38, line(39, 39, true)), 3);
+        assert_eq!(wanted_hscroll(0, 40, 39, line(39, 39, true)), 0);
+        // 70 columns: both windows are 35 wide.
+        assert_eq!(wanted_hscroll(0, 35, 33, line(29, 100, false)), 0);
+        assert_eq!(wanted_hscroll(0, 35, 33, line(30, 100, false)), 13);
+        assert_eq!(wanted_hscroll(0, 35, 34, line(30, 100, false)), 13);
     }
 }

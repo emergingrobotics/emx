@@ -757,9 +757,7 @@ impl Editor {
             })
             .map(|(id, _)| *id)
             .collect();
-        for client in viewers {
-            self.set_echo(client, text.clone());
-        }
+        self.show_echo_to(&viewers, text);
     }
 
     pub(super) fn index_finished(&mut self, buffer: BufferId, result: Result<(), String>) {
@@ -771,9 +769,7 @@ impl Editor {
         };
         let text = format!("Counting the lines of {} failed: {message}", target.name);
         let terminals: Vec<ClientId> = self.terminal_recency.clone();
-        for client in terminals {
-            self.set_echo(client, text.clone());
-        }
+        self.show_echo_to(&terminals, text);
     }
 }
 

@@ -9,6 +9,12 @@
 ;; text, point and mark as 0-based UTF-8 byte offsets, whether the mark is
 ;; active, the first kills, whether the buffer is modified, and the error
 ;; message that ended the keyboard macro, if any.
+;;
+;; Each case file runs in its own Emacs process.  Emacs numbers windows
+;; across the whole process and never reuses a number, so cases whose
+;; messages name a window (`#<window 1 on *scratch*>') live in
+;; cases/m3-window-numbers.jsonl, where no case deletes window 1 and
+;; every case starts in it.
 
 (require 'json)
 
@@ -68,18 +74,13 @@
 
 (defun emx-difftest--setup ()
   "Make batch Emacs's buffers match a fresh emx session's."
-  ;; emx has no *Messages* buffer; keep Emacs from recreating it so the
-  ;; Buffer Menu lists the same buffers.
-  (setq message-log-max nil)
-  (let ((messages (get-buffer "*Messages*")))
-    (when messages (kill-buffer messages)))
   (setq emx-difftest--initial-buffers (buffer-list))
   ;; Batch Emacs has no redisplay, so `format-mode-line' returns "" and
-  ;; the Buffer Menu's Mode column would be empty; a plain string such
-  ;; as `mode-name' formats as itself.
+  ;; the Buffer Menu's Mode column would be empty. A string with no
+  ;; %-construct, such as a `mode-name', formats as itself.
   (advice-add 'format-mode-line :around
               (lambda (original format &rest arguments)
-                (if (stringp format)
+                (if (and (stringp format) (not (string-search "%" format)))
                     format
                   (apply original format arguments)))))
 
@@ -104,6 +105,11 @@ Buffers and windows an earlier case made are removed."
   (transient-mark-mode 1)
   (insert content)
   (set-marker (mark-marker) (and mark (1+ mark)))
+  ;; A fresh emx session's *Messages* is empty and unmodified.
+  (with-current-buffer (messages-buffer)
+    (let ((inhibit-read-only t))
+      (erase-buffer))
+    (set-buffer-modified-p nil))
   (setq mark-active nil
         mark-ring nil
         global-mark-ring nil

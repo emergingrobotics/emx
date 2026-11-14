@@ -355,7 +355,7 @@ fn reload_keeps_the_point_and_start_of_every_window_by_line_context() {
     visit(&mut harness, &path);
     let line_length = 8;
     // Upper window: point on "line 05" at column 3. Lower window: scrolled
-    // so it starts at "line 13", point on "line 18" at column 2.
+    // so it starts at "line 18", point on "line 18" at column 2.
     harness.keys("C-n C-n C-n C-n C-n C-f C-f C-f C-x 2 C-x o");
     harness.keys("M-< C-u 1 8 C-n C-f C-f C-l C-l");
     assert_eq!(harness.point(), 18 * line_length + 2);

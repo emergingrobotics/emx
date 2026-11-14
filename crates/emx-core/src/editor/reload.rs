@@ -1068,9 +1068,7 @@ impl Editor {
     /// Non-modal: shown in every terminal client's echo area.
     fn notify_all(&mut self, message: String) {
         let clients: Vec<ClientId> = self.clients.keys().copied().collect();
-        for client in clients {
-            self.set_echo(client, message.clone());
-        }
+        self.show_echo_to(&clients, message);
     }
 
     /// Whether a terminal shows the buffer in one of its windows.
@@ -1176,6 +1174,10 @@ impl Editor {
             .iter()
             .map(|(id, client)| (*id, client.cols))
             .collect();
+        // Each terminal gets the summary fitted to its width; the log
+        // keeps it once, whole.
+        let unfitted = reload_summary(&round.reloaded, &round.conflicts, usize::MAX, tab_width);
+        self.log_message(&unfitted);
         for (client, cols) in clients {
             let message = reload_summary(
                 &round.reloaded,
@@ -1183,7 +1185,7 @@ impl Editor {
                 usize::from(cols),
                 tab_width,
             );
-            self.set_echo(client, message);
+            self.client_mut(client).echo = message;
         }
     }
 

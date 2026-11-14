@@ -1,4 +1,6 @@
+mod buffer_menu;
 mod files;
+mod messages;
 mod reload;
 mod requests;
 mod windows;
@@ -29,9 +31,7 @@ use files::{AutoSaveRequest, ExitWait, SaveFlow, SaveRequest};
 use reload::ReloadRequest;
 use requests::{GroupReply, OpenRequest, Reply};
 
-use crate::window::{
-    Fetch, Frame, Layout, Reader, ScreenLine, Window, WindowArea, WindowId, not_cached_block,
-};
+use crate::window::{Fetch, Frame, ScreenLine, Window, WindowArea, WindowId, not_cached_block};
 
 const SCRATCH_BUFFER: &str = "*scratch*";
 /// The one terminal frame of `emx --no-server`, like `emacs -nw`'s.
@@ -346,6 +346,7 @@ impl Editor {
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
         editor.track_journal(editor.scratch);
+        editor.create_messages_buffer();
         Ok(editor)
     }
 
@@ -462,17 +463,14 @@ impl Editor {
         window_id: WindowId,
     ) -> Result<(), ReadError> {
         self.refit_window_start(client_id, window_id)?;
-        let (cols, height) = self.window_size(client_id, window_id);
+        self.auto_hscroll(client_id, window_id)?;
+        let (_, height) = self.window_size(client_id, window_id);
         let window = *self.window(client_id, window_id);
         let buffer = &self.buffers[window.buffer];
         let text = buffer.text.clone();
         let point = buffer.marker_pos(window.point);
         let start = self.window_start(client_id, window_id);
-        let layout = Layout::new(
-            Reader::new(&text, Fetch::CachedOnly),
-            cols,
-            self.tab_width(),
-        );
+        let layout = self.window_layout(client_id, window_id, &text, Fetch::CachedOnly);
         if let Some(start) = layout.keep_point_visible(start, height, point)? {
             self.set_window_start(client_id, window_id, start);
         }
@@ -531,9 +529,7 @@ impl Editor {
             self.journal_outbox.restart(buffer, text);
         }
         let clients: Vec<ClientId> = self.clients.keys().copied().collect();
-        for client in clients {
-            self.set_echo(client, message.clone());
-        }
+        self.show_echo_to(&clients, message);
         self.redisplay();
         self.flush_journal();
     }
@@ -758,8 +754,10 @@ impl Editor {
     /// prefix-argument keys), and drop the prefix argument.
     fn undefined(&mut self, client_id: ClientId, keys: String) {
         self.ring_bell(client_id);
+        let message = format!("{keys} is undefined");
+        self.log_message(&message);
         let client = self.client_mut(client_id);
-        client.echo = format!("{keys} is undefined");
+        client.echo = message;
         client.command_loop.end_command();
         client.command_loop.last_command = None;
         self.finish_command(client_id, self.journal_outbox.len());
@@ -920,8 +918,10 @@ impl Editor {
         let client = self.client_mut(client_id);
         client.echo = error.to_string();
         client.signaled = true;
+        let message = client.echo.clone();
         client.command_loop.end_command();
         client.command_loop.last_command = this_command;
+        self.log_message(&message);
         if this_command.is_none() {
             self.finish_command(client_id, self.journal_outbox.len());
         }
@@ -1086,8 +1086,19 @@ impl Editor {
         (&mut self.buffers[id], &mut self.journal_outbox)
     }
 
+    /// Emacs `message`: shown in the client's echo area and logged in
+    /// `*Messages*`.
     pub(crate) fn set_echo(&mut self, client_id: ClientId, text: String) {
+        self.log_message(&text);
         self.client_mut(client_id).echo = text;
+    }
+
+    /// One message for several clients' echo areas, logged once.
+    pub(crate) fn show_echo_to(&mut self, clients: &[ClientId], text: String) {
+        self.log_message(&text);
+        for client in clients {
+            self.client_mut(*client).echo = text.clone();
+        }
     }
 
     pub(crate) fn echo(&self, client_id: ClientId) -> &str {

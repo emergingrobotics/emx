@@ -131,6 +131,8 @@ pub(crate) struct BufferMenu {
 const FUNDAMENTAL_MODE: &str = "Fundamental";
 /// Emacs `mode-name` of `Buffer-menu-mode`.
 const BUFFER_MENU_MODE: &str = "Buffer Menu";
+/// Emacs `mode-name` of `messages-buffer-mode`.
+const MESSAGES_MODE: &str = "Messages";
 
 #[derive(Debug)]
 pub struct Buffer {
@@ -161,6 +163,8 @@ pub struct Buffer {
     pub(crate) last_window_start: u64,
     /// Set while the buffer is a Buffer Menu (`*Buffer List*`).
     pub(crate) menu: Option<BufferMenu>,
+    /// The buffer is the message log, `*Messages*`.
+    pub(crate) messages: bool,
     /// Emacs `recent-auto-save-p`: auto-saved since last read or saved, so
     /// the auto-save file is this session's and a save may delete it.
     pub(crate) auto_saved_since_save: bool,
@@ -189,6 +193,7 @@ impl Buffer {
             last_point: None,
             last_window_start: 0,
             menu: None,
+            messages: false,
             auto_saved_since_save: false,
             markers: SlotMap::with_key(),
             modified_tick: 0,
@@ -201,22 +206,68 @@ impl Buffer {
     pub(crate) fn mode_name(&self) -> &'static str {
         if self.menu.is_some() {
             BUFFER_MENU_MODE
+        } else if self.messages {
+            MESSAGES_MODE
         } else {
             FUNDAMENTAL_MODE
         }
     }
 
     /// Replaces the text as Emacs's `erase-buffer` then an insertion with
-    /// undo disabled would: every marker ends up at the start, nothing is
-    /// recorded, and the buffer is unmodified.
-    pub(crate) fn reset_text(&mut self, text: Text, limits: UndoLimits) {
-        self.text = text;
+    /// undo disabled would: every marker ends up at the start, undo is
+    /// cleared, and the buffer is unmodified. The change goes to
+    /// `recorder` like any other, so a journal stays in step.
+    pub(crate) fn reset_text(
+        &mut self,
+        text: Text,
+        limits: UndoLimits,
+        recorder: &mut dyn ChangeRecorder,
+    ) {
+        self.text = text.clone();
+        recorder.record(self.id, &Change::ReplaceAll { text });
         for marker in self.markers.values_mut() {
             marker.pos = 0;
         }
         self.undo = UndoList::new(limits);
         self.modified_tick += 1;
         self.set_unmodified();
+    }
+
+    /// Inserts with no undo and no journal record, for a buffer whose
+    /// changes are kept nowhere (Emacs's `*Messages*` has undo disabled).
+    /// Markers move as for any insertion.
+    pub(crate) fn insert_unrecorded(&mut self, at: u64, bytes: &[u8]) -> Result<(), EditError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.text = self.text.insert(at, bytes)?;
+        for marker in self.markers.values_mut() {
+            marker.adjust_for_insert(at, bytes.len() as u64);
+        }
+        self.modified_tick += 1;
+        Ok(())
+    }
+
+    /// Deletes with no undo and no journal record; see `insert_unrecorded`.
+    pub(crate) fn delete_unrecorded(&mut self, range: Range<u64>) -> Result<(), EditError> {
+        if range.is_empty() {
+            return Ok(());
+        }
+        self.text = self.text.delete(range.clone())?;
+        for marker in self.markers.values_mut() {
+            marker.adjust_for_delete(&range);
+        }
+        self.modified_tick += 1;
+        Ok(())
+    }
+
+    /// The markers at `pos`.
+    pub(crate) fn markers_at(&self, pos: u64) -> Vec<MarkerId> {
+        self.markers
+            .iter()
+            .filter(|(_, marker)| marker.pos == pos)
+            .map(|(id, _)| id)
+            .collect()
     }
 
     pub fn is_modified(&self) -> bool {

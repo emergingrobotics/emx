@@ -1,7 +1,6 @@
 use emx_types::KeyCode;
 
 use super::{CommandContext, CommandError, PrefixArg};
-use crate::window::{Fetch, Layout, Reader};
 
 /// `C-u` multiplies the raw argument by this.
 const UNIVERSAL_ARGUMENT_FACTOR: i64 = 4;
@@ -133,7 +132,7 @@ fn scroll_command(ctx: &mut CommandContext, direction: i64) -> Result<(), Comman
 /// window.c `window_scroll_line_based`, which Emacs uses on terminals,
 /// with `scroll-margin` 0 and `scroll-preserve-screen-position` nil.
 fn window_scroll(ctx: &mut CommandContext, count: i64, whole: bool) -> Result<(), CommandError> {
-    let (cols, height) = ctx.window_size();
+    let (_, height) = ctx.window_size();
     let count = if whole {
         let context = ctx.editor().config().next_screen_context_lines;
         let page = u64::from(height).saturating_sub(context).max(1);
@@ -142,8 +141,7 @@ fn window_scroll(ctx: &mut CommandContext, count: i64, whole: bool) -> Result<()
         count
     };
     let text = ctx.buffer().text.clone();
-    let tab_width = ctx.editor().tab_width();
-    let layout = Layout::new(Reader::new(&text, Fetch::Io), cols, tab_width);
+    let layout = ctx.layout(&text);
     let point = ctx.point();
     let mut start = ctx.window_start();
     if layout.point_location(start, height, point)?.is_none() {
@@ -218,7 +216,7 @@ pub(super) fn recenter_top_bottom(ctx: &mut CommandContext) -> Result<(), Comman
 /// window.c `Frecenter` with `scroll-margin` 0: scrolls so point's row is
 /// at `target`.
 pub(super) fn recenter(ctx: &mut CommandContext, target: Recenter) -> Result<(), CommandError> {
-    let (cols, height) = ctx.window_size();
+    let (_, height) = ctx.window_size();
     let height = u64::from(height);
     let rows_above = match target {
         Recenter::Middle => height / 2,
@@ -226,8 +224,7 @@ pub(super) fn recenter(ctx: &mut CommandContext, target: Recenter) -> Result<(),
         Recenter::Row(row) => height - row.unsigned_abs().max(1).min(height),
     };
     let text = ctx.buffer().text.clone();
-    let tab_width = ctx.editor().tab_width();
-    let layout = Layout::new(Reader::new(&text, Fetch::Io), cols, tab_width);
+    let layout = ctx.layout(&text);
     let start = layout.start_with_point_at(ctx.point(), rows_above)?;
     ctx.set_window_start(start);
     Ok(())
@@ -236,10 +233,9 @@ pub(super) fn recenter(ctx: &mut CommandContext, target: Recenter) -> Result<(),
 /// What `end-of-buffer` does after moving without a numeric argument: if
 /// point is past Emacs `(window-end nil t)`, show it near the bottom.
 pub(super) fn recenter_if_past_window_end(ctx: &mut CommandContext) -> Result<(), CommandError> {
-    let (cols, height) = ctx.window_size();
+    let (_, height) = ctx.window_size();
     let text = ctx.buffer().text.clone();
-    let tab_width = ctx.editor().tab_width();
-    let layout = Layout::new(Reader::new(&text, Fetch::Io), cols, tab_width);
+    let layout = ctx.layout(&text);
     let walk = layout.walk_window(ctx.window_start(), height, &mut |_, _| {
         std::ops::ControlFlow::Continue(())
     })?;

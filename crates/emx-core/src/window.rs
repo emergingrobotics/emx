@@ -27,6 +27,9 @@ const UTF8_MAX_LEN: usize = 4;
 /// so text never uses it except for the cursor at the end of a line.
 const CONTINUATION_COLUMNS: usize = 1;
 pub(crate) const CONTINUATION_GLYPH: &str = "\\";
+/// A scrolled truncating window gives its first column to this glyph.
+const TRUNCATION_COLUMNS: usize = 1;
+pub(crate) const TRUNCATION_GLYPH: &str = "$";
 /// How a glyphless character shows: a blank, as Emacs's `thin-space`
 /// glyphless display is on a terminal.
 const GLYPHLESS_GLYPH: &str = " ";
@@ -44,6 +47,15 @@ pub(crate) const WINDOW_MIN_HEIGHT: u16 = 4;
 /// Emacs `window-min-width`: splitting leaves the split window at least
 /// this many columns, its vertical border included.
 pub(crate) const WINDOW_MIN_WIDTH: u16 = 10;
+/// Emacs `truncate-partial-width-windows`: a window not as wide as the
+/// frame and narrower than this truncates lines instead of wrapping them.
+pub(crate) const TRUNCATE_PARTIAL_WIDTH_WINDOWS: u16 = 50;
+/// Emacs `hscroll-margin`: how close point may come to an edge a
+/// truncating window can scroll past.
+pub(crate) const HSCROLL_MARGIN: u64 = 5;
+/// With point at the end of its line, auto-hscroll leaves it this many
+/// columns from the window's right edge (xdisp.c `hscroll_window_tree`).
+pub(crate) const HSCROLL_END_OF_LINE_ROOM: u64 = 4;
 /// Emacs `window-safe-min-height`: no size argument makes a window smaller.
 pub(crate) const WINDOW_SAFE_MIN_HEIGHT: u16 = 1;
 /// Emacs `window-safe-min-width`.
@@ -117,8 +129,8 @@ pub(crate) struct WindowArea {
 
 impl WindowBox {
     /// The rows a window gives its text, header line and modeline. A
-    /// one-row window keeps its modeline, as the single window of a
-    /// two-row terminal does.
+    /// one-row window has no modeline (xdisp.c `window_wants_mode_line`
+    /// wants more than one line), so every window shows text.
     pub(crate) fn area(&self, frame_cols: u16, wants_header: bool) -> WindowArea {
         let border = (self.cols >= BORDER_COLUMNS
             && u32::from(self.left) + u32::from(self.cols) < u32::from(frame_cols))
@@ -128,11 +140,13 @@ impl WindowBox {
         } else {
             self.cols
         };
-        let modeline_row = self
-            .rows
-            .checked_sub(MODELINE_ROWS)
-            .map(|body| self.top + body);
-        let body = self.rows.saturating_sub(MODELINE_ROWS);
+        let wants_modeline = self.rows > MODELINE_ROWS;
+        let modeline_row = wants_modeline.then(|| self.top + self.rows - MODELINE_ROWS);
+        let body = if wants_modeline {
+            self.rows - MODELINE_ROWS
+        } else {
+            self.rows
+        };
         let header = wants_header && body >= HEADER_LINE_MIN_BODY_ROWS;
         WindowArea {
             left: self.left,
@@ -639,8 +653,9 @@ fn window_area_rows(rows: u16) -> u16 {
     rows.saturating_sub(ECHO_ROWS)
 }
 
-/// Which terminal rows hold what. A short terminal gives up text rows
-/// first, then the modeline; the echo area is kept longest.
+/// Which terminal rows hold what. A short terminal gives up the modeline
+/// once its window is down to one row, then that row; the echo area is
+/// kept longest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FrameLayout {
     pub text_rows: u16,
@@ -650,9 +665,10 @@ pub(crate) struct FrameLayout {
 
 pub(crate) fn frame_layout(rows: u16) -> FrameLayout {
     let echo_row = rows.checked_sub(ECHO_ROWS);
-    let modeline_row = echo_row.and_then(|echo| echo.checked_sub(MODELINE_ROWS));
+    let window_rows = echo_row.unwrap_or(0);
+    let modeline_row = (window_rows > MODELINE_ROWS).then(|| window_rows - MODELINE_ROWS);
     FrameLayout {
-        text_rows: modeline_row.unwrap_or(0),
+        text_rows: modeline_row.unwrap_or(window_rows),
         modeline_row,
         echo_row,
     }
@@ -716,6 +732,8 @@ pub(crate) enum LineEvent<'a> {
     },
     /// A continuation glyph: the row goes on below.
     Continuation { row: u64, col: usize },
+    /// A truncation glyph: the line goes on past this edge of the window.
+    Truncation { row: u64, col: usize },
     /// The line ends at `pos`, its newline or the end of the buffer.
     End {
         pos: u64,
@@ -731,6 +749,7 @@ impl LineEvent<'_> {
             LineEvent::Unit { row, .. }
             | LineEvent::Cell { row, .. }
             | LineEvent::Continuation { row, .. }
+            | LineEvent::Truncation { row, .. }
             | LineEvent::End { row, .. } => *row,
         }
     }
@@ -740,7 +759,7 @@ impl LineEvent<'_> {
         match self {
             LineEvent::Unit { pos, .. } | LineEvent::End { pos, .. } => Some(*pos),
             LineEvent::Cell { unit, .. } => Some(*unit),
-            LineEvent::Continuation { .. } => None,
+            LineEvent::Continuation { .. } | LineEvent::Truncation { .. } => None,
         }
     }
 }
@@ -811,11 +830,34 @@ struct LineWalker<'v, 'w> {
     /// Columns of the rows above in this line, so tab stops count from
     /// the start of the line as Emacs's do.
     continued_columns: u64,
+    /// Lines are truncated instead of wrapped, scrolled this many columns
+    /// to the left.
+    hscroll: Option<u64>,
+    /// The right truncation glyph was given.
+    truncated_right: bool,
     visit: &'w mut Visit<'v>,
 }
 
 impl LineWalker<'_, '_> {
+    /// The window column of line column `column` in a truncating window,
+    /// and whether a glyph `width` wide there is shown: the first column
+    /// holds the left truncation glyph once the window is scrolled, the
+    /// last one the right truncation glyph.
+    fn truncated_place(&self, hscroll: u64, column: usize, width: usize) -> (usize, bool) {
+        let shown_from = if hscroll > 0 { TRUNCATION_COLUMNS } else { 0 };
+        let column = column as u64;
+        let window_column = column.saturating_sub(hscroll);
+        let shown = column >= hscroll + shown_from as u64
+            && window_column + width as u64 <= self.text_width as u64;
+        (usize::try_from(window_column).unwrap_or(usize::MAX), shown)
+    }
+
     fn place(&mut self, width: usize) -> ControlFlow<(), (u64, usize)> {
+        if self.hscroll.is_some() {
+            let at = (self.row, self.x);
+            self.x += width;
+            return ControlFlow::Continue(at);
+        }
         // At column 0 a glyph is placed even when it cannot fit, so a
         // window narrower than one glyph still advances.
         if self.x > 0 && self.x + width > self.text_width {
@@ -842,6 +884,38 @@ impl LineWalker<'_, '_> {
             tab_width,
             &mut |text, width, escape| {
                 let (row, col) = self.place(width)?;
+                if let Some(hscroll) = self.hscroll {
+                    let (window_column, shown) = self.truncated_place(hscroll, col, width);
+                    if first {
+                        first = false;
+                        (self.visit)(&LineEvent::Unit {
+                            pos,
+                            row,
+                            col: window_column,
+                        })?;
+                    }
+                    if shown {
+                        return (self.visit)(&LineEvent::Cell {
+                            unit: pos,
+                            row,
+                            col: window_column,
+                            text,
+                            width,
+                            escape,
+                        });
+                    }
+                    if !self.truncated_right
+                        && window_column + width > self.text_width
+                        && self.cols > 0
+                    {
+                        self.truncated_right = true;
+                        return (self.visit)(&LineEvent::Truncation {
+                            row,
+                            col: self.text_width,
+                        });
+                    }
+                    return ControlFlow::Continue(());
+                }
                 if first {
                     first = false;
                     (self.visit)(&LineEvent::Unit { pos, row, col })?;
@@ -926,14 +1000,35 @@ pub(crate) struct Layout<'a> {
     reader: Reader<'a>,
     cols: u16,
     tab_width: usize,
+    /// `Some` for a window that truncates lines: how far it is scrolled
+    /// to the left.
+    hscroll: Option<u64>,
 }
 
 impl<'a> Layout<'a> {
+    /// Lines wrap at the window's width.
     pub(crate) fn new(reader: Reader<'a>, cols: u16, tab_width: usize) -> Layout<'a> {
         Layout {
             reader,
             cols,
             tab_width,
+            hscroll: None,
+        }
+    }
+
+    /// Lines are truncated at the window's edges (Emacs `truncate-lines`),
+    /// scrolled `hscroll` columns to the left: each takes one row.
+    pub(crate) fn truncating(
+        reader: Reader<'a>,
+        cols: u16,
+        tab_width: usize,
+        hscroll: u64,
+    ) -> Layout<'a> {
+        Layout {
+            reader,
+            cols,
+            tab_width,
+            hscroll: Some(hscroll),
         }
     }
 
@@ -956,8 +1051,17 @@ impl<'a> Layout<'a> {
             row: 0,
             x: 0,
             continued_columns: 0,
+            hscroll: self.hscroll,
+            truncated_right: false,
             visit,
         };
+        // A scrolled window shows the left truncation glyph on every line.
+        if self.hscroll.is_some_and(|hscroll| hscroll > 0)
+            && cols > 0
+            && (walker.visit)(&LineEvent::Truncation { row: 0, col: 0 }).is_break()
+        {
+            return Ok(());
+        }
         let length = self.reader.len();
         let mut pos = line_start;
         let mut chunk = LINE_READ_CHUNK;
@@ -990,10 +1094,14 @@ impl<'a> Layout<'a> {
             }
             if complete {
                 pos += segment.len() as u64;
+                let col = match walker.hscroll {
+                    Some(hscroll) => walker.truncated_place(hscroll, walker.x, 0).0,
+                    None => walker.x,
+                };
                 let ending = LineEvent::End {
                     pos,
                     row: walker.row,
-                    col: walker.x,
+                    col,
                     newline: newline.is_some(),
                 };
                 // The line is done whether or not the visitor stops here.
@@ -1348,7 +1456,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_layout_gives_up_text_then_modeline() {
+    fn frame_layout_gives_up_the_modeline_then_text() {
         let none = FrameLayout {
             text_rows: 0,
             modeline_row: None,
@@ -1365,9 +1473,17 @@ mod tests {
         assert_eq!(
             frame_layout(2),
             FrameLayout {
-                text_rows: 0,
-                modeline_row: Some(0),
+                text_rows: 1,
+                modeline_row: None,
                 echo_row: Some(1),
+            }
+        );
+        assert_eq!(
+            frame_layout(3),
+            FrameLayout {
+                text_rows: 1,
+                modeline_row: Some(1),
+                echo_row: Some(2),
             }
         );
         assert_eq!(
