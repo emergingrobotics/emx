@@ -3,6 +3,7 @@
 pub mod autosave;
 mod buffer;
 pub mod command;
+pub mod completion;
 pub mod config;
 pub mod diff;
 mod editor;
@@ -26,7 +27,7 @@ pub use buffer::{
 pub use command::{CommandContext, CommandError, CommandSpec, PrefixArg};
 pub use config::{Config, ConfigError, InvalidSetting, KeyboardEncoding};
 pub use editor::{Editor, Session};
-pub use event::{AutoSaveJob, ClientId, Effect, Event, ReloadJob, TimerId};
+pub use event::{AutoSaveJob, ClientId, Effect, Event, ListingId, ReloadJob, TimerId};
 pub use journal::JournalOutbox;
 pub use keymap::{Binding, Keymap, Lookup, describe_keys};
 pub use killring::{KillRing, KillRingError};

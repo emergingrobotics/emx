@@ -1,0 +1,8 @@
+{"name": "yank-from-kill-ring-history", "text": "|a\nb\nc\n", "keys": "C-k C-f C-k C-f M-y M-p M-p C-j", "tier": 1}
+{"name": "yank-from-kill-ring-typed-text-is-a-new-kill", "text": "|a\nb\nc\n", "keys": "C-k C-f C-k C-f M-y x y C-j", "tier": 1}
+{"name": "yank-from-kill-ring-universal-argument", "text": "|a\nb\nc\n", "keys": "C-k C-f C-k C-f C-u M-y M-p C-j", "tier": 1}
+{"name": "yank-from-kill-ring-moves-the-yank-pointer", "text": "|a\nb\nc\n", "keys": "C-k C-f C-k C-f M-y M-p M-p C-j C-y", "tier": 1}
+{"name": "yank-from-kill-ring-undo", "text": "|a\nb\nc\n", "keys": "C-k C-f C-k C-f M-y M-p C-j C-/", "tier": 1}
+{"name": "yank-from-kill-ring-empty", "text": "a|bc", "keys": "M-y", "tier": 1}
+{"name": "execute-extended-command-prefix-argument", "text": "|abcdef", "keys": "C-u 3 M-x f o r w a r d - c h a r C-j", "tier": 1}
+{"name": "execute-extended-command-kill-line", "text": "a|bc\nd", "keys": "M-x k i l l - l i n e C-j C-y C-y", "tier": 1}

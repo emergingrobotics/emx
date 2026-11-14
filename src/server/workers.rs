@@ -1,6 +1,8 @@
 //! Work the editor thread hands off (DESIGN section 8: never block the UI
 //! thread): file reads and saves, auto-saves and cache prefetches on a pool
-//! of `IO_THREADS` threads, and one line indexer thread per file.
+//! of `IO_THREADS` threads, one line indexer thread per file, and
+//! directory listings for completion on `LISTING_THREADS` threads of their
+//! own.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -10,7 +12,9 @@ use std::thread::{self, JoinHandle};
 
 use emx_core::diff::{self, DiffJob};
 use emx_core::io::{self, SaveFailure, SavePlan};
-use emx_core::{AutoSaveJob, BufferId, Config, Event, PrefetchRequest, ReloadJob};
+use emx_core::{
+    AutoSaveJob, BufferId, ClientId, Config, Event, ListingId, PrefetchRequest, ReloadJob,
+};
 use emx_core::{autosave, reload};
 use emx_text::{BlockCache, FileIdentity, LineIndex, Original, Sources, index_file};
 
@@ -18,6 +22,10 @@ use super::journal_writer::JournalProgress;
 
 /// DESIGN section 8 sizes the I/O pool at four threads.
 pub const IO_THREADS: usize = 4;
+/// Threads that list directories for file-name completion. They are apart
+/// from the I/O pool because a directory on a hung network filesystem can
+/// block its reader forever: that may stall completion, never a save.
+pub const LISTING_THREADS: usize = 4;
 /// The indexer reports its progress every this many blocks.
 pub const INDEX_PROGRESS_BLOCKS: u64 = 256;
 
@@ -393,4 +401,93 @@ fn index_lines(
     };
     let result = index_file(cache, index, cancel, &mut progress).map_err(|error| error.to_string());
     deliver(Event::IndexFinished { buffer, result });
+}
+
+/// Who asked for a directory's listing: every request for a directory
+/// already queued or being read waits for that one read.
+type Requesters = Vec<(ClientId, ListingId)>;
+
+#[derive(Default)]
+struct ListingQueue {
+    waiting: VecDeque<PathBuf>,
+    requesters: HashMap<PathBuf, Requesters>,
+    closed: bool,
+}
+
+/// Lists directories for completion (`Effect::ListDirectory`). The threads
+/// are never joined: one stuck reading a hung mount must not keep the
+/// server from exiting.
+pub struct Listers {
+    shared: Arc<(Mutex<ListingQueue>, Condvar)>,
+}
+
+impl Listers {
+    pub fn new(deliver: Deliver) -> Listers {
+        let shared = Arc::new((Mutex::new(ListingQueue::default()), Condvar::new()));
+        for index in 0..LISTING_THREADS {
+            let shared = shared.clone();
+            let deliver = deliver.clone();
+            // Dropping the handle detaches the thread.
+            thread::Builder::new()
+                .name(format!("emx-list-{index}"))
+                .spawn(move || list_directories(&shared, &deliver))
+                .expect("spawning a directory lister");
+        }
+        Listers { shared }
+    }
+
+    pub fn submit(&self, client: ClientId, id: ListingId, directory: PathBuf) {
+        let (queue, ready) = &*self.shared;
+        let mut state = queue.lock().expect("listing lock");
+        match state.requesters.get_mut(&directory) {
+            Some(requesters) => requesters.push((client, id)),
+            None => {
+                state
+                    .requesters
+                    .insert(directory.clone(), vec![(client, id)]);
+                state.waiting.push_back(directory);
+                ready.notify_one();
+            }
+        }
+    }
+}
+
+impl Drop for Listers {
+    fn drop(&mut self) {
+        let (queue, ready) = &*self.shared;
+        queue.lock().expect("listing lock").closed = true;
+        ready.notify_all();
+    }
+}
+
+fn list_directories(shared: &(Mutex<ListingQueue>, Condvar), deliver: &Deliver) {
+    let (queue, ready) = shared;
+    loop {
+        let directory = {
+            let mut state = queue.lock().expect("listing lock");
+            loop {
+                if state.closed {
+                    return;
+                }
+                if let Some(directory) = state.waiting.pop_front() {
+                    break directory;
+                }
+                state = ready.wait(state).expect("listing lock");
+            }
+        };
+        let result = io::list_directory(&directory);
+        let requesters = queue
+            .lock()
+            .expect("listing lock")
+            .requesters
+            .remove(&directory)
+            .unwrap_or_default();
+        for (client, id) in requesters {
+            deliver(Event::DirectoryListed {
+                client,
+                id,
+                result: result.clone(),
+            });
+        }
+    }
 }

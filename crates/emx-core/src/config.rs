@@ -47,6 +47,12 @@ pub const LONG_LINE_THRESHOLD: u64 = 4096;
 pub const ECHO_KEYSTROKES_MS: u64 = 1000;
 /// `emx events` reports a client's cursor at most once per this interval.
 pub const CURSOR_EVENT_INTERVAL_MS: u64 = 50;
+/// At most this many completion candidates are listed above a prompt
+/// (vertico's `vertico-count`).
+pub const COMPLETION_ROWS: u64 = 10;
+/// Widest `completion_rows` accepted from config; a terminal is never this
+/// tall.
+pub const COMPLETION_ROWS_MAX: u64 = 1000;
 pub const MAX_WIRE_MESSAGE: u64 = 16 * MIB;
 pub const FRAME_QUEUE_DEPTH: u64 = 8;
 
@@ -89,6 +95,7 @@ pub struct Config {
     /// Zero is valid: Emacs `echo-keystrokes` 0 turns echoing off.
     pub echo_keystrokes_ms: u64,
     pub cursor_event_interval_ms: u64,
+    pub completion_rows: u64,
 }
 
 impl Default for Config {
@@ -121,6 +128,7 @@ impl Default for Config {
             long_line_threshold: LONG_LINE_THRESHOLD,
             echo_keystrokes_ms: ECHO_KEYSTROKES_MS,
             cursor_event_interval_ms: CURSOR_EVENT_INTERVAL_MS,
+            completion_rows: COMPLETION_ROWS,
         }
     }
 }
@@ -220,6 +228,12 @@ impl Config {
                 reason: format!("must be between 1 and {TAB_WIDTH_MAX}"),
             });
         }
+        if !(1..=COMPLETION_ROWS_MAX).contains(&self.completion_rows) {
+            return Err(InvalidSetting {
+                key: "completion_rows",
+                reason: format!("must be between 1 and {COMPLETION_ROWS_MAX}"),
+            });
+        }
         if self.undo_strong_limit < self.undo_limit {
             return Err(InvalidSetting {
                 key: "undo_strong_limit",
@@ -314,7 +328,7 @@ mod tests {
              auto_save_timeout_s = 16\ntab_width = 4\nnext_screen_context_lines = 0\n\
              amalgamation_limit = 17\ncolumn_checkpoint_interval = 18\n\
              long_line_threshold = 19\necho_keystrokes_ms = 0\nmark_ring_max = 20\n\
-             indent_tabs_mode = false\ncursor_event_interval_ms = 21\n",
+             indent_tabs_mode = false\ncursor_event_interval_ms = 21\ncompletion_rows = 22\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -345,6 +359,7 @@ mod tests {
             long_line_threshold: 19,
             echo_keystrokes_ms: 0,
             cursor_event_interval_ms: 21,
+            completion_rows: 22,
         };
         assert_eq!(config, expected);
     }
@@ -353,6 +368,7 @@ mod tests {
     fn defaults_cover_the_new_fields() {
         let config = Config::default();
         assert_eq!(config.kill_ring_max, 120);
+        assert_eq!(config.completion_rows, 10);
         assert_eq!(config.tab_width, 8);
         assert_eq!(config.next_screen_context_lines, 2);
         assert_eq!(config.amalgamation_limit, 20);
@@ -428,6 +444,8 @@ mod tests {
     fn tab_width_must_be_1_to_16() {
         assert_eq!(invalid_key("tab_width = 0\n"), "tab_width");
         assert_eq!(invalid_key("tab_width = 17\n"), "tab_width");
+        assert_eq!(invalid_key("completion_rows = 0\n"), "completion_rows");
+        assert_eq!(invalid_key("completion_rows = 1001\n"), "completion_rows");
         assert_eq!(load_str("tab_width = 16\n").expect("valid").tab_width, 16);
         assert_eq!(load_str("tab_width = 1\n").expect("valid").tab_width, 1);
     }

@@ -16,6 +16,8 @@ pub enum Face {
     Error,
     Warning,
     ChangedMarker,
+    /// The selected completion candidate (Emacs `icomplete-selected-match`).
+    CompletionSelected,
 }
 
 /// A width of 0 marks the trailing half of a wide character.

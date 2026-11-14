@@ -9,8 +9,10 @@
 //! target. Where a rename would lose something (hardlinks, ownership, a
 //! read-only directory) the file is rewritten in place instead (`inplace`).
 
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +25,7 @@ use xattr::FileExt;
 use crate::autosave;
 pub use crate::buffer::CodingMnemonic;
 use crate::buffer::FileBinding;
+use crate::completion::{Candidate, sort_by_length_then_name};
 use crate::config::Config;
 use crate::inplace::{self, Move};
 
@@ -904,64 +907,117 @@ pub fn strerror(error: &io::Error) -> String {
 }
 
 /// Emacs `abbreviate-file-name`: the home directory shows as `~`.
+/// Invalid UTF-8 in the name is replaced; `abbreviate_bytes` keeps it.
 pub fn abbreviate(path: &Path) -> String {
-    let text = path.to_string_lossy().into_owned();
+    String::from_utf8_lossy(&abbreviate_bytes(path)).into_owned()
+}
+
+/// `abbreviate` keeping the file name's bytes, so a name that is not UTF-8
+/// can be typed back into a file prompt and still name the same file.
+pub fn abbreviate_bytes(path: &Path) -> Vec<u8> {
+    let text = path.as_os_str().as_bytes();
     let Some(home) = std::env::var_os("HOME") else {
-        return text;
+        return text.to_vec();
     };
-    let home = home.to_string_lossy().trim_end_matches('/').to_string();
+    let home = trim_trailing_slashes(home.as_bytes());
     if home.is_empty() {
-        return text;
+        return text.to_vec();
     }
     if text == home {
-        return HOME_ABBREVIATION.to_string();
+        return HOME_ABBREVIATION.as_bytes().to_vec();
     }
-    match text.strip_prefix(&home) {
-        Some(rest) if rest.starts_with('/') => format!("{HOME_ABBREVIATION}{rest}"),
-        _ => text,
+    match text.strip_prefix(home) {
+        Some(rest) if rest.starts_with(b"/") => {
+            let mut abbreviated = HOME_ABBREVIATION.as_bytes().to_vec();
+            abbreviated.extend_from_slice(rest);
+            abbreviated
+        }
+        _ => text.to_vec(),
     }
+}
+
+fn trim_trailing_slashes(mut bytes: &[u8]) -> &[u8] {
+    while let Some(rest) = bytes.strip_suffix(b"/") {
+        bytes = rest;
+    }
+    bytes
 }
 
 /// Emacs `substitute-in-file-name` followed by `expand-file-name` for
 /// minibuffer input: `//` or `/~` restart the name, `~` is the home
 /// directory, relative names are relative to `default_directory`, and `.`
-/// and `..` are removed. A trailing slash is kept.
-pub fn expand_file_name(input: &str, default_directory: &Path) -> PathBuf {
-    let substituted = substitute_restart(input);
-    let home = std::env::var_os("HOME").map(|home| home.to_string_lossy().into_owned());
-    let absolute = match (substituted, home) {
-        ("~", Some(home)) => home,
-        (name, Some(home)) if name.starts_with("~/") => format!("{home}{}", &name[1..]),
-        (name, _) if name.starts_with('/') => name.to_string(),
-        (name, _) => format!("{}/{name}", default_directory.display()),
+/// and `..` are removed. A trailing slash is kept. The input is bytes: a
+/// file name need not be UTF-8.
+pub fn expand_file_name(input: impl AsRef<[u8]>, default_directory: &Path) -> PathBuf {
+    let substituted = substitute_restart(input.as_ref());
+    let home = std::env::var_os("HOME").map(|home| home.as_bytes().to_vec());
+    let absolute: Vec<u8> = match (substituted, home) {
+        (b"~", Some(home)) => home,
+        (name, Some(mut home)) if name.starts_with(b"~/") => {
+            home.extend_from_slice(&name[1..]);
+            home
+        }
+        (name, _) if name.starts_with(b"/") => name.to_vec(),
+        (name, _) => {
+            let mut joined = default_directory.as_os_str().as_bytes().to_vec();
+            joined.push(b'/');
+            joined.extend_from_slice(name);
+            joined
+        }
     };
-    let trailing_slash = absolute.ends_with('/') && absolute.len() > 1;
-    let mut parts: Vec<&str> = Vec::new();
-    for part in absolute.split('/') {
+    let trailing_slash = absolute.ends_with(b"/") && absolute.len() > 1;
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for part in absolute.split(|byte| *byte == b'/') {
         match part {
-            "" | "." => {}
-            ".." => {
+            b"" | b"." => {}
+            b".." => {
                 parts.pop();
             }
             other => parts.push(other),
         }
     }
-    let mut expanded = format!("/{}", parts.join("/"));
-    if trailing_slash && expanded != "/" {
-        expanded.push('/');
+    let mut expanded = b"/".to_vec();
+    expanded.extend_from_slice(&parts.join(&b'/'));
+    if trailing_slash && expanded != b"/" {
+        expanded.push(b'/');
     }
-    PathBuf::from(expanded)
+    PathBuf::from(OsString::from_vec(expanded))
 }
 
-fn substitute_restart(input: &str) -> &str {
-    let bytes = input.as_bytes();
+/// Lists `directory` for file-name completion: every entry but `.` and
+/// `..`, a directory (or a link to one) with a `/` appended as Emacs
+/// `file-name-all-completions` gives it, sorted shortest first and then by
+/// name. Names are bytes, so names that are not UTF-8 round-trip.
+pub fn list_directory(directory: &Path) -> Result<Vec<Candidate>, String> {
+    let entries = fs::read_dir(directory).map_err(|error| strerror(&error))?;
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| strerror(&error))?;
+        let file_type = entry.file_type().map_err(|error| strerror(&error))?;
+        // A link whose target cannot be looked at is not a directory.
+        let is_directory = if file_type.is_symlink() {
+            fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_dir())
+        } else {
+            file_type.is_dir()
+        };
+        let mut name = entry.file_name().into_vec();
+        if is_directory {
+            name.push(b'/');
+        }
+        candidates.push(Candidate::new(name));
+    }
+    sort_by_length_then_name(&mut candidates);
+    Ok(candidates)
+}
+
+fn substitute_restart(bytes: &[u8]) -> &[u8] {
     let mut start = 0;
     for index in 1..bytes.len() {
         if bytes[index - 1] == b'/' && (bytes[index] == b'/' || bytes[index] == b'~') {
             start = index;
         }
     }
-    &input[start..]
+    &bytes[start..]
 }
 
 #[cfg(test)]

@@ -72,13 +72,17 @@ fn undo_and_redo_report_in_the_echo_area() {
     assert_eq!(harness.text(), "a");
 }
 
+/// Emacs 28: `M-y` after a command other than a yank is
+/// `yank-from-kill-ring`, which reads the kill to insert.
 #[test]
-fn yank_pop_after_other_commands_signals() {
+fn yank_pop_after_other_commands_reads_from_the_kill_ring() {
     let mut harness = Harness::with_text("|ab");
-    harness.keys("C-k C-y C-f");
+    harness.keys("C-k C-y C-a");
     harness.keys("M-y");
-    assert!(harness.signaled());
-    assert_eq!(harness.echo(), "Previous command was not a yank");
+    assert!(!harness.signaled());
+    assert_eq!(harness.echo_line(), "Yank from kill-ring: ");
+    harness.keys("RET");
+    assert_eq!(harness.text(), "abab");
 }
 
 #[test]

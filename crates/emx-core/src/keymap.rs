@@ -27,7 +27,7 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 60] = [
+const DEFAULT_BINDINGS: [(&str, &str); 61] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
@@ -85,6 +85,7 @@ const DEFAULT_BINDINGS: [(&str, &str); 60] = [
     ("C-x o", "other-window"),
     ("C-x b", "switch-to-buffer"),
     ("C-x C-b", "list-buffers"),
+    ("M-x", "execute-extended-command"),
     ("M--", NEGATIVE_ARGUMENT),
     ("C--", NEGATIVE_ARGUMENT),
     ("C-M--", NEGATIVE_ARGUMENT),

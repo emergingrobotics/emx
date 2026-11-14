@@ -15,7 +15,7 @@ use crate::buffer::{Buffer, BufferId};
 use crate::config::Config;
 use crate::diff;
 use crate::editor::{Editor, Session};
-use crate::event::{ClientId, Effect, Event, ReloadJob, TimerId};
+use crate::event::{ClientId, Effect, Event, ListingId, ReloadJob, TimerId};
 use crate::io::{self, SaveFailure, SavePlan, SaveSink, SinkFactory};
 use crate::journal::{JournalError, JournalOp, JournalWriter, RecoveredBuffer, replay_dir};
 use crate::marker::InsertionType;
@@ -91,6 +91,8 @@ pub struct Harness {
     hold_loads: bool,
     held_loads: Vec<(BufferId, PathBuf)>,
     held_reloads: Vec<ReloadJob>,
+    hold_listings: bool,
+    held_listings: Vec<(ClientId, ListingId, PathBuf)>,
     sinks: Option<Sinks>,
     /// Auto-save files that could not be deleted.
     io_errors: Vec<String>,
@@ -137,6 +139,8 @@ impl Harness {
             hold_loads: false,
             held_loads: Vec::new(),
             held_reloads: Vec::new(),
+            hold_listings: false,
+            held_listings: Vec::new(),
             sinks: None,
             io_errors: Vec::new(),
             journal_ops: Vec::new(),
@@ -303,9 +307,82 @@ impl Harness {
         self.editor.echo(client).to_string()
     }
 
-    /// `client`'s echo area line.
+    /// `client`'s echo area line; invalid UTF-8 is replaced.
     pub fn echo_line_of(&self, client: ClientId) -> String {
-        self.editor.echo_area(client).0
+        String::from_utf8_lossy(&self.editor.echo_area(client).0).into_owned()
+    }
+
+    /// The echo area line as bytes, file names that are not UTF-8 intact.
+    pub fn echo_line_bytes(&self) -> Vec<u8> {
+        self.editor.echo_area(self.client).0
+    }
+
+    /// The completion candidates listed above `client`'s prompt, top first,
+    /// as shown; invalid UTF-8 is replaced.
+    pub fn candidates_of(&self, client: ClientId) -> Vec<String> {
+        self.editor
+            .candidate_lines(client)
+            .into_iter()
+            .map(|(text, _)| String::from_utf8_lossy(&text).into_owned())
+            .collect()
+    }
+
+    /// The candidates listed above the prompt, top first.
+    pub fn candidates(&self) -> Vec<String> {
+        self.candidates_of(self.client)
+    }
+
+    /// The selected candidate as shown, if one is listed.
+    pub fn selected_candidate(&self) -> Option<String> {
+        self.editor
+            .candidate_lines(self.client)
+            .into_iter()
+            .find(|(_, selected)| *selected)
+            .map(|(text, _)| String::from_utf8_lossy(&text).into_owned())
+    }
+
+    /// The selected candidate's position among all matches, and how many
+    /// match, while the prompt completes.
+    pub fn completion_selection(&self) -> Option<(usize, usize)> {
+        self.editor.completion_selection(self.client)
+    }
+
+    /// Keeps directory listings instead of running them, as a slow (or
+    /// hung) file system would.
+    pub fn hold_listings(&mut self) {
+        self.hold_listings = true;
+    }
+
+    /// The directories asked to be listed and not yet answered.
+    pub fn held_listings(&self) -> Vec<PathBuf> {
+        self.held_listings
+            .iter()
+            .map(|(_, _, directory)| directory.clone())
+            .collect()
+    }
+
+    /// Runs the held listings, oldest first, and stops holding.
+    pub fn release_listings(&mut self) {
+        self.hold_listings = false;
+        for (client, id, directory) in std::mem::take(&mut self.held_listings) {
+            self.handle(Event::DirectoryListed {
+                client,
+                id,
+                result: io::list_directory(&directory),
+            });
+        }
+    }
+
+    /// Answers only the newest held listing, as a fast directory would
+    /// after a slow one.
+    pub fn release_newest_listing(&mut self) {
+        if let Some((client, id, directory)) = self.held_listings.pop() {
+            self.handle(Event::DirectoryListed {
+                client,
+                id,
+                result: io::list_directory(&directory),
+            });
+        }
     }
 
     /// The text of the buffer named `name`; invalid UTF-8 is replaced.
@@ -430,6 +507,21 @@ impl Harness {
             }
             Effect::Unwatch { path } => {
                 assert!(self.watched.remove(&path), "only watched paths are let go");
+            }
+            Effect::ListDirectory {
+                client,
+                id,
+                directory,
+            } => {
+                if self.hold_listings {
+                    self.held_listings.push((client, id, directory));
+                } else {
+                    return Some(Event::DirectoryListed {
+                        client,
+                        id,
+                        result: io::list_directory(&directory),
+                    });
+                }
             }
             Effect::Diff(job) => {
                 return Some(Event::DiffReady {
@@ -561,7 +653,7 @@ impl Harness {
     /// The echo area's whole line: the message, or the minibuffer's
     /// prompt, input and any message over it.
     pub fn echo_line(&self) -> String {
-        self.editor.echo_area(self.client).0
+        String::from_utf8_lossy(&self.editor.echo_area(self.client).0).into_owned()
     }
 
     /// Fires the timers pending now, oldest first, as if their delays passed

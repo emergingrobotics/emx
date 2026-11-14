@@ -64,6 +64,27 @@ impl KillRing {
         self.yank_pointer = 0;
     }
 
+    /// Where `kill-ring-yank-pointer` is: 0 for the newest kill.
+    pub fn yank_pointer(&self) -> usize {
+        self.yank_pointer
+    }
+
+    /// Emacs `(setq kill-ring-yank-pointer (nthcdr INDEX kill-ring))`.
+    pub fn set_yank_pointer(&mut self, index: usize) {
+        assert!(
+            index < self.entries.len(),
+            "the yank pointer points at a kill"
+        );
+        self.yank_pointer = index;
+    }
+
+    /// The index of the newest kill equal to `text` (`seq-position`).
+    pub fn position(&self, text: &[u8]) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.as_slice() == text)
+    }
+
     /// Emacs `current-kill`: rotate the yank pointer by `n` (wrapping, either
     /// direction) and return the kill it then points at.
     pub fn current_kill(&mut self, n: i64) -> Result<&[u8], KillRingError> {

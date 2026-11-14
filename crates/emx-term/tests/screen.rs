@@ -194,6 +194,7 @@ fn assert_only_screen_escapes(output: &[u8]) {
         Face::Error,
         Face::Warning,
         Face::ChangedMarker,
+        Face::CompletionSelected,
     ]
     .iter()
     .map(|face| face_sgr(*face).to_string())
@@ -264,6 +265,7 @@ fn screen_output_for_every_face_is_well_formed() {
         Face::Error,
         Face::Warning,
         Face::ChangedMarker,
+        Face::CompletionSelected,
     ];
     let mut grid = Grid::new(faces.len() as u16, 1);
     for (col, face) in faces.iter().enumerate() {

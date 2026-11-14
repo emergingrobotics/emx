@@ -13,11 +13,14 @@ use emx_types::Key;
 use super::{Editor, Session, TimerPurpose};
 use crate::autosave;
 use crate::buffer::{BufferId, CodingMnemonic, EditError, FileBinding};
-use crate::command::CommandError;
+use crate::command::{CommandError, PrefixArg};
+use crate::completion::{Candidate, Completer};
+use crate::event::ListingId;
 use crate::event::{AutoSaveJob, ClientId, Effect};
 use crate::inplace::Move;
 use crate::io::{
-    self, Loaded, SaveFailure, SavePlan, SavedFile, abbreviate, expand_file_name, strerror,
+    self, Loaded, SaveFailure, SavePlan, SavedFile, abbreviate, abbreviate_bytes, expand_file_name,
+    strerror,
 };
 use crate::journal::{
     CHANGED_ON_DISK, Header, JournalId, LEFT_PARTLY_REWRITTEN, RecoveredBuffer,
@@ -102,6 +105,17 @@ pub(crate) enum Purpose {
     /// `switch-to-buffer`: the buffer to show; empty input means `default`.
     SwitchToBuffer {
         default: String,
+    },
+    /// `execute-extended-command` (`M-x`): the command to run, with the
+    /// prefix argument and `last-command` it was invoked with.
+    ExecuteCommand {
+        prefix_arg: PrefixArg,
+        last_command: Option<&'static str>,
+    },
+    /// `yank-from-kill-ring` (`M-y` after a command other than a yank).
+    YankFromKillRing {
+        prefix_arg: PrefixArg,
+        last_command: Option<&'static str>,
     },
 }
 
@@ -311,10 +325,10 @@ impl Editor {
 
     /// The default directory as file prompts start with it: abbreviated,
     /// with a trailing slash.
-    fn directory_input(&self, buffer: BufferId) -> String {
-        let mut text = abbreviate(&self.directory_of(buffer));
-        if !text.ends_with('/') {
-            text.push('/');
+    fn directory_input(&self, buffer: BufferId) -> Vec<u8> {
+        let mut text = abbreviate_bytes(&self.directory_of(buffer));
+        if !text.ends_with(b"/") {
+            text.push(b'/');
         }
         text
     }
@@ -325,20 +339,29 @@ impl Editor {
         &mut self,
         client: ClientId,
         prompt: String,
-        initial: String,
+        initial: impl Into<Vec<u8>>,
         mode: Mode,
         purpose: Purpose,
     ) {
-        self.client_mut(client).minibuffer = Some(Minibuffer::new(prompt, initial, mode, purpose));
+        let minibuffer = Minibuffer::new(prompt, initial.into(), mode, purpose);
+        self.start_minibuffer(client, minibuffer);
     }
 
+    /// Opens `minibuffer` for the client; a completing prompt asks for its
+    /// first directory listing.
+    pub(super) fn start_minibuffer(&mut self, client: ClientId, minibuffer: Minibuffer) {
+        self.put_back_minibuffer(client, minibuffer);
+    }
+
+    /// Emacs `read-file-name` with file-name completion over the input's
+    /// directory.
     fn read_file_name(&mut self, client: ClientId, prompt: &str, purpose: Purpose) {
         let buffer = self.selected_buffer(client);
         let initial = self.directory_input(buffer);
         let defaults = self.buffers[buffer]
             .file
             .as_ref()
-            .map(|file| abbreviate(&file.path))
+            .map(|file| abbreviate_bytes(&file.path))
             .into_iter()
             .collect();
         let mode = Mode::Line {
@@ -347,7 +370,10 @@ impl Editor {
             require: None,
             allow_empty: true,
         };
-        self.read_from_minibuffer(client, prompt.to_string(), initial, mode, purpose);
+        let completer = Completer::files(self.directory_of(buffer), self.completion_rows());
+        let minibuffer =
+            Minibuffer::new(prompt.to_string(), initial, mode, purpose).with_completion(completer);
+        self.start_minibuffer(client, minibuffer);
     }
 
     /// Emacs `yes-or-no-p`.
@@ -379,14 +405,14 @@ impl Editor {
 
     /// What the echo area shows, and where the cursor is in it while the
     /// minibuffer is active.
-    pub(crate) fn echo_area(&self, client: ClientId) -> (String, Option<usize>) {
+    pub(crate) fn echo_area(&self, client: ClientId) -> (Vec<u8>, Option<usize>) {
         let client = self.client(client);
         match &client.minibuffer {
             Some(minibuffer) => {
                 let (line, cursor) = minibuffer.display();
                 (line, Some(cursor))
             }
-            None => (client.echo.clone(), None),
+            None => (client.echo.as_bytes().to_vec(), None),
         }
     }
 
@@ -400,7 +426,12 @@ impl Editor {
             .minibuffer
             .take()
             .expect("keys reach the minibuffer only while it is active");
-        match minibuffer.handle_key(key, &mut self.histories, &mut self.kill_ring) {
+        let outcome = minibuffer.handle_key(key, &mut self.histories, &mut self.kill_ring);
+        self.minibuffer_outcome(client, minibuffer, outcome);
+    }
+
+    fn minibuffer_outcome(&mut self, client: ClientId, minibuffer: Minibuffer, outcome: Outcome) {
+        match outcome {
             Outcome::Continue => self.restore_minibuffer(client, minibuffer),
             Outcome::Ding => {
                 self.ring_bell(client);
@@ -408,6 +439,7 @@ impl Editor {
             }
             Outcome::Quit => {
                 self.client_mut(client).exit_wait = None;
+                self.fit_frame(client);
                 self.signal(client, None, &CommandError::Quit);
             }
             Outcome::Exit(answer) => {
@@ -448,7 +480,45 @@ impl Editor {
                 MINIBUFFER_MESSAGE_MS,
             );
         }
+        self.put_back_minibuffer(client, minibuffer);
+    }
+
+    /// Makes `minibuffer` the client's again, first asking for the
+    /// directory listing its completion needs, if any.
+    fn put_back_minibuffer(&mut self, client: ClientId, mut minibuffer: Minibuffer) {
+        if let Some(completion) = minibuffer.completion.as_mut()
+            && let Some(directory) = completion.take_listing_request()
+        {
+            let id = self.next_listing_id();
+            completion.await_listing(id, directory.clone());
+            self.effects.push(Effect::ListDirectory {
+                client,
+                id,
+                directory,
+            });
+        }
         self.client_mut(client).minibuffer = Some(minibuffer);
+    }
+
+    /// A directory listing for a client's file-name completion arrived. It
+    /// is ignored when the client or its prompt is gone, or when the prompt
+    /// moved on to another directory.
+    pub(super) fn directory_listed(
+        &mut self,
+        client: ClientId,
+        id: ListingId,
+        result: Result<Vec<Candidate>, String>,
+    ) {
+        let Some(state) = self.clients.get_mut(&client) else {
+            return;
+        };
+        let Some(mut minibuffer) = state.minibuffer.take() else {
+            return;
+        };
+        match minibuffer.listing_arrived(id, result, &mut self.histories) {
+            Some(outcome) => self.minibuffer_outcome(client, minibuffer, outcome),
+            None => self.put_back_minibuffer(client, minibuffer),
+        }
     }
 
     pub(super) fn minibuffer_message_expired(&mut self, client: ClientId, serial: u64) {
@@ -478,6 +548,9 @@ impl Editor {
     }
 
     fn answer(&mut self, client: ClientId, purpose: Purpose, answer: Answer) {
+        // The minibuffer has closed: the windows get its rows back before
+        // anything acts on them.
+        self.fit_frame(client);
         let result = match (purpose, answer) {
             (Purpose::FindFile, Answer::Line(input)) => {
                 let directory = self.directory_of(self.selected_buffer(client));
@@ -514,6 +587,7 @@ impl Editor {
                 self.answer_save_check(client, flow, question, answer)
             }
             (Purpose::KillBufferName, Answer::Line(name)) => {
+                let name = String::from_utf8_lossy(&name).into_owned();
                 let buffer = if name.is_empty() {
                     Some(self.selected_buffer(client))
                 } else {
@@ -528,17 +602,35 @@ impl Editor {
                 }
             }
             (Purpose::SwitchToBuffer { default }, Answer::Line(name)) => {
+                let name = String::from_utf8_lossy(&name).into_owned();
                 let name = if name.is_empty() { default } else { name };
                 self.switch_to_buffer_named(client, &name);
+                Ok(())
+            }
+            (
+                Purpose::ExecuteCommand {
+                    prefix_arg,
+                    last_command,
+                },
+                Answer::Line(name),
+            ) => self.execute_named_command(client, &name, prefix_arg, last_command),
+            (
+                Purpose::YankFromKillRing {
+                    prefix_arg,
+                    last_command,
+                },
+                Answer::Line(text),
+            ) => {
+                self.yank_chosen_kill(client, text, prefix_arg, last_command);
                 Ok(())
             }
             (Purpose::KillModified { buffer }, Answer::Line(choice)) => {
                 if !self.buffers.contains_key(buffer) {
                     Ok(())
-                } else if choice == KILL_YES {
+                } else if choice == KILL_YES.as_bytes() {
                     self.kill_buffer(buffer);
                     Ok(())
-                } else if choice == KILL_SAVE {
+                } else if choice == KILL_SAVE.as_bytes() {
                     self.continue_save(client, SaveFlow::new(buffer, false, AfterSave::Kill, None))
                 } else {
                     Ok(())
@@ -741,21 +833,23 @@ impl Editor {
         let names = self
             .buffers
             .values()
-            .map(|buffer| buffer.name.clone())
+            .map(|buffer| buffer.name.as_bytes().to_vec())
             .collect();
         let mode = Mode::Line {
             history: HistoryKind::BufferName,
-            defaults: vec![current.clone()],
+            defaults: vec![current.as_bytes().to_vec()],
             require: Some(names),
             allow_empty: true,
         };
-        self.read_from_minibuffer(
-            client,
+        let completer = self.buffer_completer(client, &current, true);
+        let minibuffer = Minibuffer::new(
             format!("Kill buffer (default {current}): "),
-            String::new(),
+            Vec::new(),
             mode,
             Purpose::KillBufferName,
-        );
+        )
+        .with_completion(completer);
+        self.start_minibuffer(client, minibuffer);
     }
 
     /// Emacs `kill-buffer` interactively: a modified file buffer asks
@@ -774,9 +868,9 @@ impl Editor {
                 history: HistoryKind::MultipleChoice,
                 defaults: Vec::new(),
                 require: Some(vec![
-                    KILL_YES.to_string(),
-                    KILL_NO.to_string(),
-                    KILL_SAVE.to_string(),
+                    KILL_YES.as_bytes().to_vec(),
+                    KILL_NO.as_bytes().to_vec(),
+                    KILL_SAVE.as_bytes().to_vec(),
                 ]),
                 allow_empty: false,
             };
@@ -876,11 +970,11 @@ impl Editor {
         &mut self,
         client: ClientId,
         buffer: BufferId,
-        input: &str,
+        input: &[u8],
     ) -> Result<(), CommandError> {
         let directory = self.directory_of(buffer);
         let mut path = expand_file_name(input, &directory);
-        if input.ends_with('/') || path.is_dir() {
+        if input.ends_with(b"/") || path.is_dir() {
             let name = match &self.buffers[buffer].file {
                 Some(file) => file_name(&file.path),
                 None => self.buffers[buffer].name.clone(),
@@ -894,7 +988,7 @@ impl Editor {
         &mut self,
         client: ClientId,
         buffer: BufferId,
-        input: &str,
+        input: &[u8],
     ) -> Result<(), CommandError> {
         let directory = self.directory_of(buffer);
         let path = expand_file_name(input, &directory);

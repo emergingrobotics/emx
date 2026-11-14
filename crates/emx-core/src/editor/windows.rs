@@ -13,7 +13,7 @@ use crate::command::CommandError;
 use crate::event::ClientId;
 use crate::keymap::Lookup;
 use crate::marker::InsertionType;
-use crate::minibuffer::{HistoryKind, Mode};
+use crate::minibuffer::{HistoryKind, Minibuffer, Mode};
 use crate::window::{
     Fetch, HSCROLL_END_OF_LINE_ROOM, HSCROLL_MARGIN, Layout, LineEvent, PrevBuffer, Reader,
     ScreenLine, TRUNCATE_PARTIAL_WIDTH_WINDOWS, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH,
@@ -500,17 +500,19 @@ impl Editor {
         };
         let mode = Mode::Line {
             history: HistoryKind::BufferName,
-            defaults: vec![default.clone()],
+            defaults: vec![default.as_bytes().to_vec()],
             require: None,
             allow_empty: true,
         };
-        self.read_from_minibuffer(
-            client,
+        let completer = self.buffer_completer(client, &default, false);
+        let minibuffer = Minibuffer::new(
             format!("Switch to buffer (default {default}): "),
-            String::new(),
+            Vec::new(),
             mode,
             Purpose::SwitchToBuffer { default },
-        );
+        )
+        .with_completion(completer);
+        self.start_minibuffer(client, minibuffer);
     }
 
     /// Switches to the buffer named `name`, creating it when there is

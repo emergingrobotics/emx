@@ -7,7 +7,7 @@ mod r#move;
 mod window;
 mod word_syntax;
 
-pub(crate) use kill::xterm_paste;
+pub(crate) use kill::{xterm_paste, yank_from_kill_ring};
 pub(crate) use misc::RecenterPosition;
 
 use emx_text::ReadError;
@@ -214,6 +214,10 @@ static COMMANDS: &[CommandSpec] = &[
         run: misc::keyboard_quit,
     },
     CommandSpec {
+        name: "execute-extended-command",
+        run: misc::execute_extended_command,
+    },
+    CommandSpec {
         name: "scroll-up-command",
         run: misc::scroll_up_command,
     },
@@ -313,6 +317,11 @@ static COMMANDS: &[CommandSpec] = &[
 
 pub fn lookup(name: &str) -> Option<&'static CommandSpec> {
     COMMANDS.iter().find(|spec| spec.name == name)
+}
+
+/// Every command's name, which `M-x` completes over.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    COMMANDS.iter().map(|spec| spec.name)
 }
 
 /// What a running command sees: the editor, the client and window it runs

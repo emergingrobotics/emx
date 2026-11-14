@@ -40,6 +40,9 @@ pub fn face_sgr(face: Face) -> &'static str {
         Face::Error => "0;1;31",
         Face::Warning => "0;1;33",
         Face::ChangedMarker => "0;35",
+        // `icomplete-selected-match` is `highlight`: darkseagreen2 behind
+        // the text on a light terminal, nearest ANSI green.
+        Face::CompletionSelected => "0;30;42",
     }
 }
 

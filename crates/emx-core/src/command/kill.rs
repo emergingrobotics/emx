@@ -13,9 +13,8 @@ const YANK: &str = "yank";
 /// Emacs `yank` sets `this-command` to t until it finishes, so a failed
 /// yank is not taken for one by the next `yank-pop`.
 const YANK_UNFINISHED: &str = "t";
-/// Emacs 28 `yank-pop` reads a kill from the minibuffer when the previous
-/// command was not a yank; emx has no minibuffer yet, so it signals as
-/// Emacs 27 did.
+/// A yank whose text another client changed the buffer under cannot be
+/// replaced: there is no yanked text left to find.
 const NOT_A_YANK: &str = "Previous command was not a yank";
 
 /// Emacs `kill-region` from Lisp: kills between `beg` and `end`, appending
@@ -214,7 +213,11 @@ pub(super) fn yank(ctx: &mut CommandContext) -> Result<(), CommandError> {
 /// range the client's own yank recorded is used instead.
 pub(super) fn yank_pop(ctx: &mut CommandContext) -> Result<(), CommandError> {
     if !ctx.last_command_is(YANK) {
-        return Err(ctx.error(NOT_A_YANK));
+        // Emacs 28: after any other command, `M-y` is `yank-from-kill-ring`.
+        let (client, prefix_arg, last_command) = (ctx.client, ctx.prefix_arg, ctx.last_command);
+        return ctx
+            .editor()
+            .yank_from_kill_ring_command(client, prefix_arg, last_command);
     }
     // Another client may have killed the buffer or shown another one.
     let Some((start, end)) = ctx.yank_range() else {
@@ -232,6 +235,27 @@ pub(super) fn yank_pop(ctx: &mut CommandContext) -> Result<(), CommandError> {
     ctx.insert(&kill)?;
     ctx.record_yank(start, ctx.point());
     if point_first {
+        swap_point_and_mark_quietly(ctx);
+    }
+    Ok(())
+}
+
+/// Emacs `yank-from-kill-ring` with the kill read: set the mark, insert
+/// the text, and point the yank pointer at that kill (a kill edited in the
+/// minibuffer becomes a new kill). `C-u` leaves point before the text.
+pub(crate) fn yank_from_kill_ring(
+    ctx: &mut CommandContext,
+    text: &[u8],
+) -> Result<(), CommandError> {
+    let point = ctx.point();
+    push_mark(ctx, point, false, false);
+    ctx.insert(text)?;
+    let ring = ctx.kill_ring_mut();
+    match ring.position(text) {
+        Some(index) => ring.set_yank_pointer(index),
+        None => ring.kill_new(text.to_vec()),
+    }
+    if matches!(ctx.prefix_arg, PrefixArg::Raw(_)) {
         swap_point_and_mark_quietly(ctx);
     }
     Ok(())

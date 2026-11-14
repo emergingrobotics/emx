@@ -244,3 +244,12 @@ pub(super) fn recenter_if_past_window_end(ctx: &mut CommandContext) -> Result<()
     }
     Ok(())
 }
+
+/// `M-x`: reads a command name and runs the command with this prefix
+/// argument.
+pub(super) fn execute_extended_command(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let (client, prefix_arg, last_command) = (ctx.client, ctx.prefix_arg, ctx.last_command);
+    ctx.editor()
+        .execute_extended_command_command(client, prefix_arg, last_command);
+    Ok(())
+}

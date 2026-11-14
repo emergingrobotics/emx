@@ -25,25 +25,33 @@ fn find_file_prompt_edits_a_line() {
         Some((prefix.chars().count() as u16, rows - 1)),
         "the cursor is in the minibuffer"
     );
+    // The directory is empty: completion says so after the input.
+    let no_matches = " [No matches]";
     harness.type_text("abc");
     harness.keys("C-b C-b x");
-    assert_eq!(harness.echo_line(), format!("{prefix}axbc"));
+    assert_eq!(harness.echo_line(), format!("{prefix}axbc{no_matches}"));
     harness.keys("C-e DEL");
-    assert_eq!(harness.echo_line(), format!("{prefix}axb"));
+    assert_eq!(harness.echo_line(), format!("{prefix}axb{no_matches}"));
     harness.keys("C-b C-b C-d");
-    assert_eq!(harness.echo_line(), format!("{prefix}ab"));
+    assert_eq!(harness.echo_line(), format!("{prefix}ab{no_matches}"));
     harness.keys("C-a C-k");
     assert_eq!(harness.echo_line(), "Find file: ");
     harness.keys("C-y C-y");
     let typed = format!("{}/ab", directory.path().display());
-    assert_eq!(harness.echo_line(), format!("Find file: {typed}{typed}"));
+    assert_eq!(
+        harness.echo_line(),
+        format!("Find file: {typed}{typed} [No such file or directory]")
+    );
     assert_eq!(
         harness.kill_ring()[0],
         format!("{}/ab", directory.path().display())
     );
     harness.keys("C-a C-k");
     harness.paste(b"pasted");
-    assert_eq!(harness.echo_line(), "Find file: pasted");
+    assert_eq!(
+        harness.echo_line(),
+        format!("Find file: pasted{no_matches}")
+    );
     harness.keys("C-g");
     assert_eq!(harness.echo(), "Quit");
     assert!(harness.signaled());

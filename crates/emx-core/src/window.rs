@@ -247,6 +247,20 @@ impl Node {
         }
     }
 
+    fn min_rows(&self) -> u16 {
+        match &self.kind {
+            NodeKind::Live(_) => WINDOW_SAFE_MIN_HEIGHT + MODELINE_ROWS,
+            NodeKind::Combination {
+                side_by_side: true,
+                children,
+            } => children.iter().map(Node::min_rows).max().unwrap_or(0),
+            NodeKind::Combination {
+                side_by_side: false,
+                children,
+            } => children.iter().map(Node::min_rows).sum(),
+        }
+    }
+
     fn size_of_combination(&self) -> u16 {
         match &self.kind {
             NodeKind::Combination { side_by_side, .. } => self.size(*side_by_side),
@@ -645,6 +659,13 @@ impl Frame {
         children[taller].set_size(false, taller_rows);
         children[shorter].set_size(false, shorter_rows);
         parent.renormalize();
+    }
+
+    /// The most rows a growing minibuffer can take from the windows of a
+    /// terminal `terminal_rows` high: each window keeps a text line and
+    /// its modeline (Emacs `window-safe-min-height`).
+    pub(crate) fn spare_rows(&self, terminal_rows: u16) -> u16 {
+        window_area_rows(terminal_rows).saturating_sub(self.root.min_rows())
     }
 }
 

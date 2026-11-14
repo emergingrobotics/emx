@@ -95,6 +95,13 @@ pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>)
         }
     }
     if let Some(row) = frame_layout(rows).echo_row {
+        let lines = editor.candidate_lines(client);
+        let first = usize::from(row) - lines.len();
+        for (index, (text, selected)) in lines.iter().enumerate() {
+            let line_row =
+                u16::try_from(first + index).expect("candidate rows are above the echo row");
+            draw_candidate(&mut grid, line_row, text, *selected, tab_width(editor));
+        }
         let (line, minibuffer_cursor) = editor.echo_area(client);
         match minibuffer_cursor {
             Some(at) => {
@@ -523,9 +530,22 @@ fn external_badge(binding: &FileBinding) -> Option<String> {
     }
 }
 
-fn draw_echo(grid: &mut Grid, row: u16, echo: &str, tab_width: usize) {
+fn draw_echo(grid: &mut Grid, row: u16, echo: &[u8], tab_width: usize) {
     let mut writer = RowWriter::full_row(grid, row, tab_width);
-    writer.write(echo.as_bytes(), Face::Default, Face::EscapeGlyph);
+    writer.write(echo, Face::Default, Face::EscapeGlyph);
+}
+
+/// One completion candidate above the echo area; the selected one is
+/// highlighted (`icomplete-selected-match`). Bytes that are not text show
+/// escaped, as everywhere else.
+fn draw_candidate(grid: &mut Grid, row: u16, text: &[u8], selected: bool, tab_width: usize) {
+    let face = if selected {
+        Face::CompletionSelected
+    } else {
+        Face::Default
+    };
+    let mut writer = RowWriter::full_row(grid, row, tab_width);
+    writer.write(text, face, Face::EscapeGlyph);
 }
 
 /// Draws the minibuffer line with the cursor at byte `cursor`; a line too
@@ -534,27 +554,23 @@ fn draw_echo(grid: &mut Grid, row: u16, echo: &str, tab_width: usize) {
 fn draw_minibuffer(
     grid: &mut Grid,
     row: u16,
-    line: &str,
+    line: &[u8],
     cursor: usize,
     tab_width: usize,
 ) -> Option<(u16, u16)> {
     let cols = usize::from(grid.cols);
     let last_col = cols.checked_sub(1)?;
     let mut start = 0;
-    while text_width(&line.as_bytes()[start..cursor], tab_width) > last_col {
-        let rest = &line.as_bytes()[start..];
+    while text_width(&line[start..cursor], tab_width) > last_col {
+        let rest = &line[start..];
         let mut units = display_units(rest);
         units.next();
         start += units.next().map_or(rest.len(), |(offset, _)| offset);
     }
     let mut writer = RowWriter::full_row(grid, row, tab_width);
-    writer.write(
-        &line.as_bytes()[start..cursor],
-        Face::Default,
-        Face::EscapeGlyph,
-    );
+    writer.write(&line[start..cursor], Face::Default, Face::EscapeGlyph);
     let cursor_col = writer.col;
-    writer.write(&line.as_bytes()[cursor..], Face::Default, Face::EscapeGlyph);
+    writer.write(&line[cursor..], Face::Default, Face::EscapeGlyph);
     let col = u16::try_from(cursor_col.min(last_col)).expect("inside the u16 grid width");
     Some((col, row))
 }
@@ -605,7 +621,7 @@ mod tests {
     #[test]
     fn echo_escapes_control_and_invalid_bytes() {
         let mut grid = Grid::new(20, 1);
-        draw_echo(&mut grid, 0, "a\u{1b}b\u{9b}\tc", 8);
+        draw_echo(&mut grid, 0, "a\u{1b}b\u{9b}\tc".as_bytes(), 8);
         assert_eq!(row_text(&grid, 0), "a^[b\\233        c   ");
         assert_eq!(grid.row(0)[1].face, Face::EscapeGlyph);
         assert_eq!(grid.row(0)[0].face, Face::Default);
@@ -614,10 +630,10 @@ mod tests {
     #[test]
     fn echo_clips_a_wide_glyph_at_the_edge() {
         let mut grid = Grid::new(3, 1);
-        draw_echo(&mut grid, 0, "a\u{4e2d}\u{4e2d}", 8);
+        draw_echo(&mut grid, 0, "a\u{4e2d}\u{4e2d}".as_bytes(), 8);
         assert_eq!(row_text(&grid, 0), "a\u{4e2d}");
         let mut grid = Grid::new(2, 1);
-        draw_echo(&mut grid, 0, "a\u{4e2d}", 8);
+        draw_echo(&mut grid, 0, "a\u{4e2d}".as_bytes(), 8);
         assert_eq!(row_text(&grid, 0), "a ");
     }
 }

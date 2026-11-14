@@ -6,6 +6,7 @@ use emx_text::{FileIdentity, Text};
 use emx_types::Key;
 
 use crate::buffer::BufferId;
+use crate::completion::Candidate;
 use crate::diff::{DiffJob, DiffRequester};
 use crate::io::{Loaded, SaveFailure, SavePlan, SavedFile};
 use crate::journal::{JournalOp, RecoveredBuffer};
@@ -17,6 +18,11 @@ pub struct ClientId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TimerId(pub u64);
+
+/// Names one `Effect::ListDirectory` request, so a listing that arrives
+/// after the prompt moved on is recognized as stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ListingId(pub u64);
 
 /// Input to the editor state machine. The server (or the test harness)
 /// turns sockets, worker results and timers into these.
@@ -132,6 +138,13 @@ pub enum Event {
         buffer: BufferId,
         result: Result<(), String>,
     },
+    /// The result of an `Effect::ListDirectory`, as `io::list_directory`
+    /// returned it.
+    DirectoryListed {
+        client: ClientId,
+        id: ListingId,
+        result: Result<Vec<Candidate>, String>,
+    },
 }
 
 /// Output of the editor state machine, carried out by the server.
@@ -198,6 +211,15 @@ pub enum Effect {
     },
     /// Diff with `diff::run_diff` and deliver `Event::DiffReady`.
     Diff(DiffJob),
+    /// List `directory` with `io::list_directory` for a client's file-name
+    /// completion and deliver `Event::DirectoryListed`. A directory on a
+    /// hung network filesystem may never answer, so listings must not hold
+    /// up any other work.
+    ListDirectory {
+        client: ClientId,
+        id: ListingId,
+        directory: PathBuf,
+    },
     /// Report changes to `path`, a visited file, as `Event::FileChanged`
     /// and `Event::FileRenamed` (or `Event::FilePolled` when it can only be
     /// polled) until `Effect::Unwatch`. Each visited path is watched once,

@@ -1,4 +1,5 @@
 mod buffer_menu;
+mod completing;
 mod files;
 mod messages;
 mod reload;
@@ -144,6 +145,8 @@ struct Client {
     /// the next report.
     cursor_reported: Option<(BufferId, u64)>,
     cursor_timer: Option<TimerId>,
+    /// Rows the minibuffer's candidate list takes from the windows.
+    candidate_rows: u16,
 }
 
 #[derive(Debug, Default)]
@@ -263,6 +266,8 @@ pub struct Editor {
     /// The next Emacs window sequence number; every client's windows
     /// share the count, as one Emacs process's do.
     next_window_number: u64,
+    /// Names the next `Effect::ListDirectory`.
+    next_listing: u64,
     /// Emacs `window_select_count`, the clock of `window-use-time`.
     window_select_count: u64,
     /// `Buffer-menu-mode-map`, active in Buffer Menu buffers.
@@ -332,6 +337,7 @@ impl Editor {
             appending: HashMap::new(),
             revert_pending: HashMap::new(),
             follow_edit: false,
+            next_listing: 0,
             next_window_number: match session {
                 Session::NoServer => FIRST_WINDOW_NUMBER,
                 Session::Server => FIRST_SERVER_WINDOW_NUMBER,
@@ -380,11 +386,13 @@ impl Editor {
                 self.note_terminal_activity(client);
                 self.paste_chunk(client, data, last);
             }
-            Event::Resize(client, cols, rows) => {
-                let client = self.client_mut(client);
+            Event::Resize(client_id, cols, rows) => {
+                let client = self.client_mut(client_id);
                 client.cols = cols;
                 client.rows = rows;
+                client.candidate_rows = 0;
                 client.frame.resize(cols, rows);
+                self.fit_frame(client_id);
             }
             Event::Request(client, id, request) => self.handle_request(client, id, request),
             Event::Redraw(client) => self.request_full_redraw(client),
@@ -409,6 +417,9 @@ impl Editor {
             Event::DiffReady {
                 requester, result, ..
             } => self.diff_ready(requester, result),
+            Event::DirectoryListed { client, id, result } => {
+                self.directory_listed(client, id, result);
+            }
         }
         self.sync_watches();
         self.redisplay();
@@ -422,6 +433,7 @@ impl Editor {
     fn redisplay(&mut self) {
         let client_ids: Vec<ClientId> = self.clients.keys().copied().collect();
         for client_id in &client_ids {
+            self.fit_frame(*client_id);
             self.keep_points_visible(*client_id);
         }
         for client_id in client_ids {
@@ -610,6 +622,7 @@ impl Editor {
                 yank: None,
                 cursor_reported: None,
                 cursor_timer: None,
+                candidate_rows: 0,
             },
         );
         if kind == ClientKind::Tui {

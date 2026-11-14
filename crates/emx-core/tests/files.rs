@@ -28,11 +28,12 @@ fn harness_with(config: Config, directory: &Path) -> Harness {
     harness
 }
 
-/// `C-x C-f`, replace the default directory with `path`, `RET`.
+/// `C-x C-f`, replace the default directory with `path`, `C-j`: the path
+/// as typed, not the completion candidate `RET` would take.
 fn visit(harness: &mut Harness, path: &Path) {
     harness.keys("C-x C-f C-a C-k");
     harness.type_text(path.to_str().expect("test paths are UTF-8"));
-    harness.keys("RET");
+    harness.keys("C-j");
 }
 
 fn modeline(harness: &Harness) -> String {
@@ -1060,7 +1061,7 @@ fn save_with_no_clients_rearms_the_daemon_grace_timer() {
             },
         ));
     }
-    keys(&mut editor, "RET");
+    keys(&mut editor, "C-j");
     let (buffer, load_path) = editor
         .take_effects()
         .into_iter()
@@ -1136,7 +1137,7 @@ fn buffer_is_read_only_and_marked_while_loading() {
             },
         ));
     }
-    for key in emx_types::parse_kbd("RET x").expect("kbd") {
+    for key in emx_types::parse_kbd("C-j x").expect("kbd") {
         editor.handle(Event::Key(client, key));
     }
     let row = |editor: &emx_core::Editor, row: u16| -> String {
@@ -1382,7 +1383,8 @@ fn editor_visiting(path: &Path, clients: &[emx_core::ClientId]) -> emx_core::Edi
     let client = clients[0];
     editor_keys(&mut editor, client, "C-x C-f C-a C-k");
     editor_type(&mut editor, client, path.to_str().expect("utf-8"));
-    editor_keys(&mut editor, client, "RET");
+    // The path as typed: no directory listing is delivered here.
+    editor_keys(&mut editor, client, "C-j");
     editor
 }
 
@@ -1468,7 +1470,7 @@ fn a_question_answered_after_another_client_saved_starts_no_second_save() {
     editor_keys(&mut editor, first, "x");
     editor_keys(&mut editor, second, "C-x C-f C-a C-k");
     editor_type(&mut editor, second, path.to_str().expect("utf-8"));
-    editor_keys(&mut editor, second, "RET");
+    editor_keys(&mut editor, second, "C-j");
     write_file(&path, b"changed on disk\n");
     editor_keys(&mut editor, first, "C-x C-s");
     editor_keys(&mut editor, second, "C-x C-s");
