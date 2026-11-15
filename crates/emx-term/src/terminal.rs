@@ -1,4 +1,4 @@
-//! Terminal setup, restore and the Kitty keyboard protocol probe.
+//! Terminal setup, restore and the keyboard protocol probe.
 //!
 //! The escape sequences are built by pure functions so they can be tested;
 //! the code that touches the TTY (raw mode, writing stdout, polling stdin) is
@@ -7,19 +7,20 @@
 use std::io::{self, Read, Stdin, Write};
 use std::os::fd::AsFd;
 use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
 
-use crate::kitty::{InputEvent, KittyDecoder};
+use crate::decoder::{Decoder, InputEvent, Protocol};
 
 /// Progressive enhancement flags pushed on entry: 1 "disambiguate escape
 /// codes" | 4 "report alternate keys", so alt+shift+5 arrives with its
 /// shifted key and decodes as M-% rather than M-S-5.
 pub const KITTY_FLAGS: u32 = 5;
 
-pub const UNSUPPORTED_TERMINAL_MESSAGE: &str = "emx: this terminal does not support the Kitty keyboard protocol. Supported in this release: kitty, WezTerm, Ghostty, foot.";
+/// Overrides the probe: `kitty` or `legacy`.
+pub const KEYBOARD_ENV: &str = "EMX_KEYBOARD";
 
 const KITTY_FLAGS_QUERY: &[u8] = b"\x1b[?u";
 const PRIMARY_DEVICE_ATTRIBUTES_QUERY: &[u8] = b"\x1b[c";
@@ -28,6 +29,21 @@ const LEAVE_ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049l";
 const BRACKETED_PASTE_ON: &[u8] = b"\x1b[?2004h";
 const BRACKETED_PASTE_OFF: &[u8] = b"\x1b[?2004l";
 const POP_KITTY_FLAGS: &[u8] = b"\x1b[<u";
+/// xterm `modifyOtherKeys` level 1: keys with no legacy encoding (C-%,
+/// C-M-%) are reported as `CSI 27 ; modifiers ; code ~`; keys that have one
+/// are unchanged.
+const MODIFY_OTHER_KEYS_ON: &[u8] = b"\x1b[>4;1m";
+const MODIFY_OTHER_KEYS_RESET: &[u8] = b"\x1b[>4m";
+/// xterm's `metaSendsEscape` (mode 1036), saved and set so Alt sends an ESC
+/// prefix instead of setting the eighth bit; restored on exit.
+const META_SENDS_ESCAPE_SAVE_AND_SET: &[u8] = b"\x1b[?1036s\x1b[?1036h";
+const META_SENDS_ESCAPE_RESTORE: &[u8] = b"\x1b[?1036r";
+/// Button-event mouse tracking (presses, releases, drags) with SGR reports.
+const MOUSE_ON: &[u8] = b"\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l";
+/// Cleared before leaving the alternate screen, so a terminal without one
+/// (the Linux console) is not left showing the editor.
+const CLEAR_SCREEN: &[u8] = b"\x1b[H\x1b[2J";
 const RESET_ATTRIBUTES: &[u8] = b"\x1b[0m";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const PROBE_READ_SIZE: usize = 1024;
@@ -40,6 +56,8 @@ pub enum TermError {
     InputClosed,
     #[error("a Terminal is already active")]
     AlreadyActive,
+    #[error("{KEYBOARD_ENV} must be kitty or legacy, not {0:?}")]
+    BadKeyboardOverride(String),
 }
 
 /// Terminal input that can wait for readability with a timeout, which a
@@ -93,21 +111,33 @@ impl InputSource for StdinSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeResult {
-    pub supported: bool,
+    pub protocol: Protocol,
     /// Bytes read during the probe that were not probe replies (keys typed
     /// meanwhile, a partial sequence), in arrival order, for the caller's
     /// decoder.
     pub leftover: Vec<u8>,
 }
 
+/// The protocol `EMX_KEYBOARD` names, if it is set.
+pub fn keyboard_override(value: Option<&std::ffi::OsStr>) -> Result<Option<Protocol>, TermError> {
+    match value.map(|value| value.to_str()) {
+        None => Ok(None),
+        Some(Some("kitty")) => Ok(Some(Protocol::Kitty)),
+        Some(Some("legacy")) => Ok(Some(Protocol::Legacy)),
+        Some(other) => Err(TermError::BadKeyboardOverride(
+            other.unwrap_or("(not UTF-8)").to_string(),
+        )),
+    }
+}
+
 /// Asks for the Kitty keyboard flags, then for the primary device
 /// attributes, which every terminal answers. A flags reply before the
-/// attributes reply means the protocol is supported. A terminal that stays
-/// silent until `timeout` is unsupported unless it already sent flags.
+/// attributes reply means the Kitty protocol; anything else, including a
+/// terminal that stays silent until `timeout`, is a legacy terminal.
 ///
 /// Requires raw mode, so call it after `Terminal::enter`: in cooked mode the
 /// replies are echoed and line-buffered and may never reach `input`.
-pub fn probe_kitty(
+pub fn probe_protocol(
     input: &mut impl InputSource,
     output: &mut impl Write,
     timeout: Duration,
@@ -116,7 +146,7 @@ pub fn probe_kitty(
     output.write_all(PRIMARY_DEVICE_ATTRIBUTES_QUERY)?;
     output.flush()?;
     let deadline = Instant::now() + timeout;
-    let mut decoder = KittyDecoder::new();
+    let mut decoder = Decoder::new(Protocol::Kitty);
     let mut raw = Vec::new();
     let mut leftover = Vec::new();
     let mut decoded_until = 0;
@@ -149,26 +179,48 @@ pub fn probe_kitty(
     }
     leftover.extend_from_slice(&raw[decoded_until..]);
     Ok(ProbeResult {
-        supported: flags_seen,
+        protocol: if flags_seen {
+            Protocol::Kitty
+        } else {
+            Protocol::Legacy
+        },
         leftover,
     })
 }
 
-/// Kitty keeps separate flag stacks for the main and alternate screens, so
-/// the flags are pushed after switching screens and popped before leaving.
+/// What every terminal gets on entry, before the probe.
 pub fn setup_sequence() -> Vec<u8> {
-    let mut sequence = Vec::new();
-    sequence.extend_from_slice(ENTER_ALTERNATE_SCREEN);
-    sequence.extend_from_slice(BRACKETED_PASTE_ON);
-    sequence.extend_from_slice(format!("\x1b[>{KITTY_FLAGS}u").as_bytes());
-    sequence
+    [ENTER_ALTERNATE_SCREEN, BRACKETED_PASTE_ON].concat()
 }
 
-pub fn restore_sequence() -> Vec<u8> {
+/// The keyboard modes of `protocol`, set once the probe chose it. Kitty
+/// keeps separate flag stacks for the main and alternate screens, so the
+/// flags are pushed after switching screens and popped before leaving.
+pub fn protocol_sequence(protocol: Protocol) -> Vec<u8> {
+    match protocol {
+        Protocol::Kitty => format!("\x1b[>{KITTY_FLAGS}u").into_bytes(),
+        Protocol::Legacy => [MODIFY_OTHER_KEYS_ON, META_SENDS_ESCAPE_SAVE_AND_SET].concat(),
+    }
+}
+
+pub fn mouse_sequence(on: bool) -> &'static [u8] {
+    if on { MOUSE_ON } else { MOUSE_OFF }
+}
+
+/// Undoes `setup_sequence`, `protocol_sequence(protocol)` when a protocol
+/// was set, and any mouse reporting.
+pub fn restore_sequence(protocol: Option<Protocol>) -> Vec<u8> {
+    let keyboard = match protocol {
+        None => Vec::new(),
+        Some(Protocol::Kitty) => POP_KITTY_FLAGS.to_vec(),
+        Some(Protocol::Legacy) => [MODIFY_OTHER_KEYS_RESET, META_SENDS_ESCAPE_RESTORE].concat(),
+    };
     [
-        POP_KITTY_FLAGS,
+        &keyboard,
+        MOUSE_OFF,
         BRACKETED_PASTE_OFF,
         RESET_ATTRIBUTES,
+        CLEAR_SCREEN,
         SHOW_CURSOR,
         LEAVE_ALTERNATE_SCREEN,
     ]
@@ -178,11 +230,16 @@ pub fn restore_sequence() -> Vec<u8> {
 /// True while a `Terminal` has the TTY set up; whoever flips it back to
 /// false (drop or panic hook) is the one that restores.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The protocol whose modes are set, for whoever restores.
+static PROTOCOL: AtomicU8 = AtomicU8::new(NO_PROTOCOL);
+const NO_PROTOCOL: u8 = 0;
+const KITTY_PROTOCOL: u8 = 1;
+const LEGACY_PROTOCOL: u8 = 2;
 static PANIC_HOOK: Once = Once::new();
 
-/// Raw mode, alternate screen, bracketed paste and Kitty flags for as long
-/// as it lives. Dropping it, or a panic anywhere, restores the terminal
-/// exactly once.
+/// Raw mode, alternate screen, bracketed paste and the keyboard protocol's
+/// modes for as long as it lives. Dropping it, or a panic anywhere,
+/// restores the terminal exactly once.
 pub struct Terminal {
     _not_constructible_elsewhere: (),
 }
@@ -202,6 +259,18 @@ impl Terminal {
         };
         write_stdout(&setup_sequence())?;
         Ok(terminal)
+    }
+
+    /// Sets the keyboard modes of the protocol the probe chose.
+    pub fn set_protocol(&mut self, protocol: Protocol) -> Result<(), TermError> {
+        PROTOCOL.store(
+            match protocol {
+                Protocol::Kitty => KITTY_PROTOCOL,
+                Protocol::Legacy => LEGACY_PROTOCOL,
+            },
+            Ordering::SeqCst,
+        );
+        Ok(write_stdout(&protocol_sequence(protocol))?)
     }
 
     /// Columns and rows.
@@ -236,7 +305,12 @@ fn restore() -> io::Result<()> {
     if !ACTIVE.swap(false, Ordering::SeqCst) {
         return Ok(());
     }
-    let written = write_stdout(&restore_sequence());
+    let protocol = match PROTOCOL.swap(NO_PROTOCOL, Ordering::SeqCst) {
+        KITTY_PROTOCOL => Some(Protocol::Kitty),
+        LEGACY_PROTOCOL => Some(Protocol::Legacy),
+        _ => None,
+    };
+    let written = write_stdout(&restore_sequence(protocol));
     let cooked = crossterm::terminal::disable_raw_mode();
     written.and(cooked)
 }

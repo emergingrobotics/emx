@@ -22,7 +22,9 @@ use emx_proto::{ClientMsg, LineReader, RowUpdate, ServerMsg, write_msg};
 use emx_types::{Cell, Face};
 
 const POLL: Duration = Duration::from_millis(20);
-const UNSUPPORTED: &str = "emx: this terminal does not support the Kitty keyboard protocol";
+/// xterm `modifyOtherKeys` level 1 on, and reset.
+const MODIFY_OTHER_KEYS_ON: &[u8] = b"\x1b[>4;1m";
+const MODIFY_OTHER_KEYS_RESET: &[u8] = b"\x1b[>4m";
 const CONNECTION_LOST: &str = "emx: server connection lost";
 const RACERS: usize = 4;
 const STARTUP_DELAY_MS: &str = "1500";
@@ -129,20 +131,64 @@ fn type_and_save_noserver() {
     );
 }
 
+/// A legacy terminal, one that answers only device attributes and one
+/// that answers nothing, is driven with legacy key encodings: Meta as an
+/// ESC prefix, Ctrl keys as control bytes.
 #[test]
-fn unsupported_terminal_exits_with_message() {
+fn legacy_terminals_edit_and_restore() {
+    for probe in [Probe::Legacy, Probe::Silent] {
+        for server in [false, true] {
+            let env = TestEnv::new();
+            let _reaper = SessionReaper::new(&env);
+            let path = env.file("f.txt", "one\ntwo\n");
+            let args: &[&str] = if server {
+                &["f.txt"]
+            } else {
+                &["--no-server", "f.txt"]
+            };
+            let mut pty = Pty::spawn_with(&env, args, probe, &[]);
+            pty.wait_modeline(|modeline| {
+                modeline.contains("f.txt") && !modeline.contains("Loading")
+            });
+            pty.keys("M->");
+            pty.type_text("end");
+            pty.keys("M-<");
+            pty.type_text("start ");
+            pty.keys("C-e M-b M-u");
+            pty.keys("C-x C-s");
+            wait_file(&path, "start ONE\ntwo\nend");
+            pty.keys("C-x C-c");
+            let status = pty.wait_exit();
+            assert!(status.success(), "{probe:?} server {server}: {status}");
+            let tail = output_after_setup(&pty);
+            let text = String::from_utf8_lossy(&tail);
+            assert!(find(&tail, PUSH_KITTY_FLAGS).is_none(), "{text:?}");
+            let on = find(&tail, MODIFY_OTHER_KEYS_ON).expect("modifyOtherKeys set");
+            let reset = rfind(&tail, MODIFY_OTHER_KEYS_RESET).expect("modifyOtherKeys reset");
+            assert!(on < reset, "{text:?}");
+            assert!(!pty.alternate_screen(), "{probe:?}: terminal restored");
+            assert!(!pty.bracketed_paste(), "{probe:?}: terminal restored");
+        }
+    }
+}
+
+/// A legacy terminal's Escape key, typed alone, reaches the editor once
+/// the escape timeout passes, and is still a Meta prefix for the next key
+/// (Emacs's `esc-map`): ESC, a pause, then `x` is `M-x`.
+#[test]
+fn legacy_lone_escape_is_the_escape_key() {
     let env = TestEnv::new();
     let _reaper = SessionReaper::new(&env);
     env.file("f.txt", "text\n");
-    for args in [&["--no-server", "f.txt"][..], &["f.txt"][..]] {
-        let mut pty = Pty::spawn_with(&env, args, Probe::Silent, &[]);
-        let status = pty.wait_exit();
-        assert_eq!(status.exit_code(), 1, "{args:?}: {status}");
-        let output = pty.raw_output_text();
-        assert!(output.contains(UNSUPPORTED), "{args:?}: {output:?}");
-        assert!(!pty.alternate_screen(), "{args:?}: terminal restored");
-        assert!(!pty.bracketed_paste(), "{args:?}: terminal restored");
-    }
+    let mut pty = Pty::spawn_with(&env, &["--no-server", "f.txt"], Probe::Legacy, &[]);
+    pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
+    pty.write(b"\x1b");
+    pty.wait_text("ESC-");
+    pty.type_text("x");
+    pty.wait_text("M-x ");
+    pty.keys("C-g");
+    pty.keys("C-x C-c");
+    assert!(pty.wait_exit().success());
 }
 
 #[test]
@@ -740,7 +786,4 @@ fn noserver_messages_after_exit_reach_the_terminal() {
         output.contains("EMX_TEST_EDITOR_FAILURE is set: the editor thread fails"),
         "{output:?}"
     );
-    let mut unsupported = Pty::spawn_with(&env, &["--no-server", "f.txt"], Probe::Silent, &[]);
-    assert_eq!(unsupported.wait_exit().exit_code(), 1);
-    assert!(unsupported.raw_output_text().contains(UNSUPPORTED));
 }

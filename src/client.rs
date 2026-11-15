@@ -14,7 +14,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::Duration;
 
@@ -23,8 +23,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use emx_proto::{ClientKind, ClientMsg, LineReader, Request, ServerMsg, WirePath, write_msg};
 use emx_term::{
-    InputEvent, KittyDecoder, Screen, StdinSource, Terminal, UNSUPPORTED_TERMINAL_MESSAGE,
-    probe_kitty,
+    Decoder, InputEvent, KEYBOARD_ENV, Screen, StdinSource, Terminal, keyboard_override,
+    probe_protocol,
 };
 use emx_types::Grid;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
@@ -36,6 +36,10 @@ use crate::server::client_conn::{MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, peer_uid}
 /// How long a terminal has to answer the keyboard protocol probe; one
 /// that stays silent this long does not speak it.
 pub const KITTY_PROBE_TIMEOUT_MS: u64 = 1000;
+/// How long a legacy terminal's ESC waits for the rest of a key sequence
+/// before it is the Escape key. Terminals send a sequence's bytes together,
+/// so this only needs to cover a slow link.
+pub const LEGACY_ESCAPE_TIMEOUT_MS: u64 = 50;
 pub const CONNECTION_LOST: &str = "emx: server connection lost";
 /// Debug builds panic after drawing the first frame when this is set, so
 /// tests can check that a panicking client restores the terminal.
@@ -395,16 +399,20 @@ fn session(
     wait: bool,
 ) -> anyhow::Result<End> {
     let mut input = StdinSource::new();
-    let probe = probe_kitty(
-        &mut input,
-        &mut io::stdout(),
-        Duration::from_millis(KITTY_PROBE_TIMEOUT_MS),
-    )?;
-    if !probe.supported {
-        return Ok(End::failure(UNSUPPORTED_TERMINAL_MESSAGE));
-    }
-    let mut decoder = KittyDecoder::new();
-    let typed_during_probe = decoder.feed(&probe.leftover);
+    let (protocol, leftover) = match keyboard_override(std::env::var_os(KEYBOARD_ENV).as_deref())? {
+        Some(protocol) => (protocol, Vec::new()),
+        None => {
+            let probe = probe_protocol(
+                &mut input,
+                &mut io::stdout(),
+                Duration::from_millis(KITTY_PROBE_TIMEOUT_MS),
+            )?;
+            (probe.protocol, probe.leftover)
+        }
+    };
+    terminal.set_protocol(protocol)?;
+    let mut decoder = Decoder::new(protocol);
+    let typed_during_probe = decoder.feed(&leftover);
     startup_delay_seam();
     let link = connect(&sender)?;
     let (cols, rows) = clamp_size(terminal.size()?);
@@ -433,9 +441,24 @@ fn session(
     start_input_thread(input, sender.clone())?;
     start_signal_thread(signals, sender)?;
     loop {
-        let event = events
-            .recv()
-            .context("every source of client events closed")?;
+        let event = if client.decoder.waiting_for_escape() {
+            match events.recv_timeout(Duration::from_millis(LEGACY_ESCAPE_TIMEOUT_MS)) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(end) = client.escape_timeout() {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("every source of client events closed")
+                }
+            }
+        } else {
+            events
+                .recv()
+                .context("every source of client events closed")?
+        };
         if let Some(end) = client.handle(event, terminal)? {
             return Ok(end);
         }
@@ -534,7 +557,7 @@ fn start_signal_thread(mut signals: Signals, sender: Sender<UiEvent>) -> anyhow:
 
 struct Client {
     link: Box<dyn Link>,
-    decoder: KittyDecoder,
+    decoder: Decoder,
     display: Display,
     cwd: PathBuf,
     files: Vec<FileArgument>,
@@ -624,6 +647,12 @@ impl Client {
         })
     }
 
+    /// A legacy terminal's ESC was not followed by the rest of a sequence.
+    fn escape_timeout(&mut self) -> Option<End> {
+        let events = self.decoder.timeout();
+        events.into_iter().find_map(|event| self.input_event(event))
+    }
+
     fn input_event(&mut self, event: InputEvent) -> Option<End> {
         match event {
             InputEvent::Key(key) => self.send(ClientMsg::Key { key }),
@@ -631,8 +660,10 @@ impl Client {
                 data_b64: STANDARD.encode(data),
                 r#final: last,
             }),
-            // Late probe replies and sequences no key maps to.
-            InputEvent::KittyFlags(_)
+            // Late probe replies, sequences no key maps to, and mouse
+            // reports, which are never asked for yet.
+            InputEvent::Mouse(_)
+            | InputEvent::KittyFlags(_)
             | InputEvent::PrimaryDeviceAttributes
             | InputEvent::Unknown(_) => None,
         }

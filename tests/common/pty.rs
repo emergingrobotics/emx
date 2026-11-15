@@ -1,7 +1,7 @@
-//! Runs `emx` on a pseudo-terminal the way a Kitty-protocol terminal would
-//! drive it: the harness answers the keyboard protocol probe (unless told
-//! not to), encodes keys with the Kitty encoding for flags 5, and keeps the
-//! screen the program draws in a `vt100` parser.
+//! Runs `emx` on a pseudo-terminal the way a terminal would drive it: the
+//! harness answers the keyboard protocol probe as a Kitty-protocol terminal
+//! (or as a legacy one, or not at all), encodes keys the way that terminal
+//! would, and keeps the screen the program draws in a `vt100` parser.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -49,9 +49,18 @@ const KITTY_BACKSPACE: u32 = 127;
 /// What the terminal answers when emx probes for the Kitty protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Probe {
+    /// A Kitty-protocol terminal: both queries are answered.
     Answer,
-    /// A terminal that never answers either query.
+    /// A legacy terminal: only the device attributes query is answered.
+    Legacy,
+    /// A terminal that never answers either query, so also legacy.
     Silent,
+}
+
+impl Probe {
+    fn kitty(self) -> bool {
+        self == Probe::Answer
+    }
 }
 
 struct Output {
@@ -72,6 +81,7 @@ pub struct Pty {
     pid: u32,
     cols: u16,
     rows: u16,
+    probe: Probe,
 }
 
 impl Pty {
@@ -131,6 +141,7 @@ impl Pty {
             pid,
             cols: COLS,
             rows: ROWS,
+            probe,
         }
     }
 
@@ -144,10 +155,15 @@ impl Pty {
         writer.flush().expect("flush the pty");
     }
 
-    /// Sends an Emacs `kbd` sequence, each key Kitty-encoded.
+    /// Sends an Emacs `kbd` sequence, each key encoded as the terminal
+    /// would: Kitty-encoded, or the legacy way.
     pub fn keys(&self, kbd: &str) {
         for key in parse_kbd(kbd).expect("valid kbd") {
-            self.write(&encode_key(key));
+            self.write(&if self.probe.kitty() {
+                encode_key(key)
+            } else {
+                encode_legacy_key(key)
+            });
         }
     }
 
@@ -292,6 +308,7 @@ fn read_loop(
     probe: Probe,
 ) {
     let mut buffer = [0; READ_SIZE];
+    let kitty = probe.kitty();
     loop {
         let count = match reader.read(&mut buffer) {
             Ok(0) | Err(_) => {
@@ -304,9 +321,9 @@ fn read_loop(
             let mut output = output.lock().expect("output lock");
             output.parser.process(&buffer[..count]);
             output.raw.extend_from_slice(&buffer[..count]);
-            output.replies()
+            output.replies(kitty)
         };
-        if probe == Probe::Answer && !replies.is_empty() {
+        if probe != Probe::Silent && !replies.is_empty() {
             let mut writer = writer.lock().expect("writer lock");
             // The program may already be gone.
             drop(writer.write_all(&replies).and_then(|()| writer.flush()));
@@ -315,13 +332,14 @@ fn read_loop(
 }
 
 impl Output {
-    /// Replies to the queries that arrived since the last call, in order.
-    fn replies(&mut self) -> Vec<u8> {
+    /// Replies to the queries that arrived since the last call, in order;
+    /// a legacy terminal answers only the device attributes query.
+    fn replies(&mut self, kitty: bool) -> Vec<u8> {
         let mut found = Vec::new();
         for (query, reply, from) in [
             (
                 KITTY_FLAGS_QUERY,
-                KITTY_FLAGS_REPLY,
+                if kitty { KITTY_FLAGS_REPLY } else { b"" },
                 &mut self.flags_query_from,
             ),
             (
@@ -418,6 +436,88 @@ pub fn encode_key(key: Key) -> Vec<u8> {
         }
     }
 }
+
+/// A key as a legacy terminal sends it, with Alt sending an ESC prefix and
+/// xterm's `modifyOtherKeys` at level 1 for Ctrl keys without a byte.
+pub fn encode_legacy_key(key: Key) -> Vec<u8> {
+    if key.mods.meta {
+        let mut bytes = vec![0x1b];
+        bytes.extend(encode_legacy_key(Key {
+            code: key.code,
+            mods: Mods {
+                meta: false,
+                ..key.mods
+            },
+        }));
+        return bytes;
+    }
+    let modifiers = kitty_modifiers(key.mods);
+    let letter = |final_byte: char| {
+        if modifiers == 0 {
+            format!("\x1b[{final_byte}").into_bytes()
+        } else {
+            format!("\x1b[1;{}{final_byte}", modifiers + 1).into_bytes()
+        }
+    };
+    let tilde = |number: u32| {
+        if modifiers == 0 {
+            format!("\x1b[{number}~").into_bytes()
+        } else {
+            format!("\x1b[{number};{}~", modifiers + 1).into_bytes()
+        }
+    };
+    match key.code {
+        KeyCode::Char(character) if modifiers == 0 => character.to_string().into_bytes(),
+        KeyCode::Char(' ') if key.mods.ctrl && !key.mods.shift => vec![0],
+        KeyCode::Char(character @ ('a'..='z' | '@' | '[' | '\\' | ']' | '^' | '_'))
+            if key.mods.ctrl && !key.mods.shift =>
+        {
+            vec![(character.to_ascii_uppercase() as u8) & 0x1f]
+        }
+        KeyCode::Char(character) => {
+            format!("\x1b[27;{};{}~", modifiers + 1, u32::from(character)).into_bytes()
+        }
+        KeyCode::Enter if modifiers == 0 => b"\r".to_vec(),
+        KeyCode::Tab if modifiers == 0 => b"\t".to_vec(),
+        KeyCode::Tab if key.mods == SHIFT_ONLY => b"\x1b[Z".to_vec(),
+        KeyCode::Backspace if modifiers == 0 => vec![0x7f],
+        KeyCode::Escape if modifiers == 0 => vec![0x1b],
+        KeyCode::Enter => format!("\x1b[27;{};13~", modifiers + 1).into_bytes(),
+        KeyCode::Tab => format!("\x1b[27;{};9~", modifiers + 1).into_bytes(),
+        KeyCode::Backspace => format!("\x1b[27;{};127~", modifiers + 1).into_bytes(),
+        KeyCode::Escape => format!("\x1b[27;{};27~", modifiers + 1).into_bytes(),
+        KeyCode::Up => letter('A'),
+        KeyCode::Down => letter('B'),
+        KeyCode::Right => letter('C'),
+        KeyCode::Left => letter('D'),
+        KeyCode::Home => letter('H'),
+        KeyCode::End => letter('F'),
+        KeyCode::Insert => tilde(2),
+        KeyCode::Delete => tilde(3),
+        KeyCode::PageUp => tilde(5),
+        KeyCode::PageDown => tilde(6),
+        KeyCode::F(number @ 1..=4) if modifiers == 0 => {
+            format!("\x1bO{}", char::from(b'P' + number - 1)).into_bytes()
+        }
+        KeyCode::F(number @ 1..=4) => letter(char::from(b'P' + number - 1)),
+        KeyCode::F(number) => {
+            let tilde_number = match number {
+                5 => 15,
+                6..=10 => u32::from(number) + 11,
+                11 | 12 => u32::from(number) + 12,
+                other => panic!("the harness does not encode F{other}"),
+            };
+            tilde(tilde_number)
+        }
+    }
+}
+
+const SHIFT_ONLY: Mods = Mods {
+    ctrl: false,
+    meta: false,
+    shift: true,
+    super_: false,
+};
 
 fn kitty_modifiers(mods: Mods) -> u32 {
     let mut bits = 0;
