@@ -797,6 +797,13 @@ impl Harness {
         self.client
     }
 
+    /// Gives the selected buffer these face spans, replacing any.
+    pub fn set_faces(&mut self, spans: Vec<(std::ops::Range<u64>, emx_types::Face)>) {
+        let buffer = self.buffer_mut();
+        let length = buffer.text.len();
+        buffer.faces.replace_range(0..length, spans);
+    }
+
     pub fn editor(&self) -> &Editor {
         &self.editor
     }

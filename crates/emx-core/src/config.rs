@@ -60,7 +60,10 @@ pub const FRAME_QUEUE_DEPTH: u64 = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyboardEncoding {
+    /// Ask the terminal at startup.
+    Auto,
     Kitty,
+    Legacy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -111,7 +114,7 @@ impl Default for Config {
             journal_snapshot_max: JOURNAL_SNAPSHOT_MAX,
             large_save_warn: LARGE_SAVE_WARN,
             search_match_cap: SEARCH_MATCH_CAP,
-            keyboard_encoding: KeyboardEncoding::Kitty,
+            keyboard_encoding: KeyboardEncoding::Auto,
             daemon_grace_ms: DAEMON_GRACE_MS,
             undo_limit: UNDO_LIMIT,
             undo_strong_limit: UNDO_STRONG_LIMIT,
@@ -290,7 +293,7 @@ mod tests {
         assert_eq!(config.undo_strong_limit, 240_000);
         assert_eq!(config.undo_outer_limit, 24_000_000);
         assert_eq!(config.in_memory_max, 16 * 1024 * 1024);
-        assert_eq!(config.keyboard_encoding, KeyboardEncoding::Kitty);
+        assert_eq!(config.keyboard_encoding, KeyboardEncoding::Auto);
     }
 
     #[test]
@@ -317,8 +320,14 @@ mod tests {
     fn invalid_value_is_an_error_naming_the_key() {
         let error = load_str("undo_limit = \"big\"\n").expect_err("bad value rejected");
         assert!(error.to_string().contains("undo_limit"), "{error}");
-        let error = load_str("keyboard_encoding = \"legacy\"\n").expect_err("only kitty");
+        let error = load_str("keyboard_encoding = \"vt100\"\n").expect_err("unknown encoding");
         assert!(error.to_string().contains("keyboard_encoding"), "{error}");
+        assert_eq!(
+            load_str("keyboard_encoding = \"legacy\"\n")
+                .expect("legacy")
+                .keyboard_encoding,
+            KeyboardEncoding::Legacy
+        );
     }
 
     #[test]
@@ -340,7 +349,8 @@ mod tests {
              auto_save_timeout_s = 16\ntab_width = 4\nnext_screen_context_lines = 0\n\
              amalgamation_limit = 17\ncolumn_checkpoint_interval = 18\n\
              long_line_threshold = 19\necho_keystrokes_ms = 0\nmark_ring_max = 20\n\
-             indent_tabs_mode = false\ncursor_event_interval_ms = 21\ncompletion_rows = 22\n",
+             indent_tabs_mode = false\ncursor_event_interval_ms = 21\ncompletion_rows = 22\n\
+             keyboard_encoding = \"legacy\"\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -354,7 +364,7 @@ mod tests {
             journal_fsync_ms: 7,
             journal_snapshot_max: 8,
             large_save_warn: 9,
-            keyboard_encoding: KeyboardEncoding::Kitty,
+            keyboard_encoding: KeyboardEncoding::Legacy,
             daemon_grace_ms: 10,
             undo_limit: 11,
             undo_strong_limit: 12,

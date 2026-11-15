@@ -787,3 +787,30 @@ fn noserver_messages_after_exit_reach_the_terminal() {
         "{output:?}"
     );
 }
+
+/// `keyboard_encoding` in the config skips the probe, and `EMX_KEYBOARD`
+/// overrides the config.
+#[test]
+fn keyboard_encoding_is_configurable() {
+    let env = TestEnv::with_config("keyboard_encoding = \"legacy\"\n");
+    let _reaper = SessionReaper::new(&env);
+    env.file("f.txt", "text\n");
+    let legacy = Pty::spawn_with(&env, &["--no-server", "f.txt"], Probe::Legacy, &[]);
+    legacy.wait_modeline(|modeline| modeline.contains("f.txt"));
+    legacy.keys("C-x C-c");
+    let mut legacy = legacy;
+    assert!(legacy.wait_exit().success());
+    let output = legacy.raw_output();
+    assert!(find(&output, b"\x1b[?u").is_none(), "no probe was sent");
+    assert!(find(&output, MODIFY_OTHER_KEYS_ON).is_some());
+    let mut kitty = Pty::spawn_with(
+        &env,
+        &["--no-server", "f.txt"],
+        Probe::Answer,
+        &[("EMX_KEYBOARD", "kitty")],
+    );
+    kitty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    kitty.keys("C-x C-c");
+    assert!(kitty.wait_exit().success());
+    assert_restored(&kitty);
+}

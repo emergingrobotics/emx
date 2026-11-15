@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use emx_text::{ColumnCheckpoints, FileIdentity, ReadError, Text};
 use slotmap::SlotMap;
 
+use crate::faces::FaceSpans;
 use crate::marker::{InsertionType, Marker, MarkerId};
 use crate::reload::ExternalState;
 use crate::undo::{ChangeContext, UndoLimits, UndoList};
@@ -245,6 +246,9 @@ pub struct Buffer {
     /// start. Cleared whenever the text changes, since edits shift the byte
     /// offsets the checkpoints are keyed by.
     pub(crate) checkpoints: ColumnCheckpoints,
+    /// Faces the text is drawn in (Emacs `face` text properties): the file
+    /// panel's markers, syntax highlighting. They move with edits.
+    pub(crate) faces: FaceSpans,
     markers: SlotMap<MarkerId, Marker>,
     modified_tick: u64,
     save_tick: u64,
@@ -284,6 +288,7 @@ impl Buffer {
             special_mode: None,
             auto_saved_since_save: false,
             checkpoints,
+            faces: FaceSpans::new(),
             markers: SlotMap::with_key(),
             modified_tick: 0,
             save_tick: 0,
@@ -322,6 +327,7 @@ impl Buffer {
         self.undo = UndoList::new(limits);
         self.modified_tick += 1;
         self.checkpoints.clear();
+        self.faces.clear();
         self.set_unmodified();
     }
 
@@ -336,6 +342,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.adjust_for_insert(at, bytes.len() as u64);
         }
+        self.faces.adjust_for_insert(at, bytes.len() as u64);
         self.modified_tick += 1;
         self.checkpoints.clear();
         Ok(())
@@ -350,6 +357,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.adjust_for_delete(&range);
         }
+        self.faces.adjust_for_delete(&range);
         self.modified_tick += 1;
         self.checkpoints.clear();
         Ok(())
@@ -500,6 +508,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.adjust_for_insert(at, length);
         }
+        self.faces.adjust_for_insert(at, length);
         self.modified_tick += 1;
         self.checkpoints.clear();
         recorder.record(
@@ -594,6 +603,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.adjust_for_delete(&range);
         }
+        self.faces.adjust_for_delete(&range);
         self.modified_tick += 1;
         self.checkpoints.clear();
         recorder.record(
@@ -614,6 +624,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.pos = marker.pos.min(length);
         }
+        self.faces.clear();
         self.modified_tick += 1;
         self.checkpoints.clear();
         recorder.record(self.id, &Change::ReplaceAll { text });
@@ -636,6 +647,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.adjust_for_insert(at, length);
         }
+        self.faces.adjust_for_insert(at, length);
         self.modified_tick += 1;
         self.checkpoints.clear();
     }

@@ -12,6 +12,7 @@ use emx_types::{Cell, Face, Grid};
 use crate::buffer::{Buffer, BufferId, FileBinding};
 use crate::editor::Editor;
 use crate::event::ClientId;
+use crate::faces::FaceSpans;
 use crate::reload::ExternalState;
 use crate::window::{
     CONTINUATION_GLYPH, CursorTracker, Fetch, LineEvent, ScreenLine, TRUNCATION_GLYPH, WindowArea,
@@ -153,6 +154,7 @@ fn draw_window(
         }
     };
     let marks = Marks {
+        faces: &buffer.faces,
         region: active_region(buffer, point),
         search: search_marks(
             editor,
@@ -237,7 +239,9 @@ fn draw_window(
 }
 
 /// The parts of a window's text drawn in another face.
-struct Marks {
+struct Marks<'a> {
+    /// The buffer's own faces, under every other.
+    faces: &'a FaceSpans,
     region: Option<Range<u64>>,
     search: SearchMarks,
 }
@@ -354,7 +358,7 @@ fn draw_event(
             } else if *escape {
                 Face::EscapeGlyph
             } else {
-                Face::Default
+                marks.faces.face_at(*unit).unwrap_or(Face::Default)
             };
             put_window_glyph(grid, area, row, *col, text, *width, face);
         }

@@ -21,9 +21,10 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use emx_core::KeyboardEncoding;
 use emx_proto::{ClientKind, ClientMsg, LineReader, Request, ServerMsg, WirePath, write_msg};
 use emx_term::{
-    Decoder, InputEvent, KEYBOARD_ENV, Screen, StdinSource, Terminal, keyboard_override,
+    Decoder, InputEvent, KEYBOARD_ENV, Protocol, Screen, StdinSource, Terminal, keyboard_override,
     probe_protocol,
 };
 use emx_types::Grid;
@@ -120,6 +121,7 @@ pub fn parse_file_arguments(arguments: &[OsString]) -> Vec<FileArgument> {
 /// Runs the terminal client of the session server.
 pub fn run(options: ClientOptions) -> anyhow::Result<ExitCode> {
     let files = parse_file_arguments(&options.files);
+    let keyboard = crate::server::load_config()?.keyboard_encoding;
     let socket = socket_path()?;
     // Connect before taking over the terminal, so a server that cannot
     // start is reported on a usable terminal.
@@ -133,6 +135,7 @@ pub fn run(options: ClientOptions) -> anyhow::Result<ExitCode> {
         events,
         &files,
         options.wait,
+        keyboard,
     )?;
     Ok(end.report())
 }
@@ -369,6 +372,7 @@ pub fn run_tui(
     events: Receiver<UiEvent>,
     files: &[FileArgument],
     wait: bool,
+    keyboard: KeyboardEncoding,
 ) -> anyhow::Result<End> {
     // Registered before the terminal is taken over: from here on SIGTERM
     // and SIGWINCH queue until the client handles them, instead of killing
@@ -382,11 +386,22 @@ pub fn run_tui(
         connect,
         sender,
         &events,
-        files,
-        wait,
+        Startup {
+            files,
+            wait,
+            keyboard,
+        },
     );
     drop(terminal);
     outcome
+}
+
+/// What the client starts with: the files to open, whether to wait for
+/// them, and the configured keyboard encoding.
+struct Startup<'a> {
+    files: &'a [FileArgument],
+    wait: bool,
+    keyboard: KeyboardEncoding,
 }
 
 fn session(
@@ -395,11 +410,21 @@ fn session(
     connect: impl FnOnce(&Sender<UiEvent>) -> anyhow::Result<Box<dyn Link>>,
     sender: Sender<UiEvent>,
     events: &Receiver<UiEvent>,
-    files: &[FileArgument],
-    wait: bool,
+    startup: Startup,
 ) -> anyhow::Result<End> {
+    let Startup {
+        files,
+        wait,
+        keyboard,
+    } = startup;
     let mut input = StdinSource::new();
-    let (protocol, leftover) = match keyboard_override(std::env::var_os(KEYBOARD_ENV).as_deref())? {
+    let configured = match keyboard {
+        KeyboardEncoding::Auto => None,
+        KeyboardEncoding::Kitty => Some(Protocol::Kitty),
+        KeyboardEncoding::Legacy => Some(Protocol::Legacy),
+    };
+    let overridden = keyboard_override(std::env::var_os(KEYBOARD_ENV).as_deref())?;
+    let (protocol, leftover) = match overridden.or(configured) {
         Some(protocol) => (protocol, Vec::new()),
         None => {
             let probe = probe_protocol(

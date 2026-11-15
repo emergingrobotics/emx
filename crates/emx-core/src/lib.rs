@@ -8,6 +8,7 @@ pub mod config;
 pub mod diff;
 mod editor;
 mod event;
+pub mod faces;
 pub mod inplace;
 pub mod io;
 mod isearch;
