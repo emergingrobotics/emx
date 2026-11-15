@@ -11,6 +11,7 @@ mod rect;
 mod register;
 mod replace;
 mod search;
+mod syntax;
 mod window;
 
 pub(crate) use dabbrev::DabbrevState;
@@ -256,6 +257,10 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "xterm-mouse-mode",
         run: misc::xterm_mouse_mode,
+    },
+    CommandSpec {
+        name: "comment-dwim",
+        run: syntax::comment_dwim,
     },
     CommandSpec {
         name: "scroll-up-command",
@@ -682,6 +687,11 @@ impl<'a> CommandContext<'a> {
     }
 
     /// The command's `last-command` is `name`.
+    /// Emacs `tab-width`.
+    pub(crate) fn tab_width(&self) -> u64 {
+        self.editor.config().tab_width
+    }
+
     pub fn last_command_is(&self, name: &str) -> bool {
         self.last_command == Some(name)
     }

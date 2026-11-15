@@ -90,7 +90,12 @@ pub(super) fn newline(ctx: &mut CommandContext) -> Result<(), CommandError> {
         })?;
     let count = usize::try_from(count).expect("a count within in_memory_max fits in usize");
     ctx.insert(&vec![NEWLINE; count])?;
-    electric_indent_after_newline(ctx)
+    electric_indent_after_newline(ctx)?;
+    // A language's mode indents the new line by its own rules.
+    if let Some(language) = super::syntax::buffer_language(ctx) {
+        super::syntax::indent_line(ctx, language)?;
+    }
+    Ok(())
 }
 
 /// `electric-indent-post-self-insert-function` after a newline, where
@@ -662,6 +667,9 @@ fn at_line_start(text: &Text, pos: u64) -> Result<bool, ReadError> {
 /// `indent-relative`, spacing out under the next indent point of the
 /// previous non-blank line, or to the next tab stop when there is none.
 pub(super) fn indent_for_tab_command(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    if let Some(language) = super::syntax::buffer_language(ctx) {
+        return super::syntax::indent_line(ctx, language);
+    }
     ctx.check_editable()?;
     let indent = relative_indent_column(ctx)?;
     match indent {

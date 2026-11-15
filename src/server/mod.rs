@@ -51,7 +51,8 @@ use journal_writer::{JournalBackend, JournalFailure, JournalThread};
 use tree_watcher::TreeWatcher;
 use watcher::Watcher;
 use workers::{
-    Deliver, Indexers, Job, Listers, Pool, PrefetchTracker, Searchers, TreeTasks, prefetch_cache,
+    Deliver, Highlighters, Indexers, Job, Listers, Pool, PrefetchTracker, Searchers, TreeTasks,
+    prefetch_cache,
 };
 
 /// A server that finds the lock held retries for this long, so one
@@ -310,6 +311,7 @@ pub struct Server {
     watcher: Watcher,
     tree_tasks: TreeTasks,
     tree_watcher: TreeWatcher,
+    highlighters: Highlighters,
     deliver: Deliver,
     /// Events the server itself raised while carrying out effects.
     raised: VecDeque<Event>,
@@ -372,6 +374,8 @@ impl Server {
             Watcher::spawn(&config, deliver.clone()).context("starting the file watcher")?;
         let tree_watcher =
             TreeWatcher::spawn(deliver.clone()).context("starting the tree watcher")?;
+        let highlighters =
+            Highlighters::spawn(deliver.clone()).context("starting the highlighter")?;
         let editor = Editor::with_session(config, session)?;
         Ok(Server {
             editor,
@@ -388,6 +392,7 @@ impl Server {
             watcher,
             tree_tasks: TreeTasks::new(deliver.clone()),
             tree_watcher,
+            highlighters,
             deliver,
             raised: VecDeque::new(),
             shutdown: false,
@@ -644,6 +649,7 @@ impl Server {
                 Effect::Watch { path } => self.watcher.watch(path),
                 Effect::Unwatch { path } => self.watcher.unwatch(path),
                 Effect::Tree { client, job } => self.tree_tasks.submit(client, job),
+                Effect::Highlight(job) => self.highlighters.submit(job),
                 Effect::WatchTree { dir } => self.tree_watcher.watch(dir),
                 Effect::UnwatchTree { dir } => self.tree_watcher.unwatch(dir),
                 Effect::Shutdown => self.shutdown = true,

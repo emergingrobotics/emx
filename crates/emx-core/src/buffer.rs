@@ -242,6 +242,10 @@ pub struct Buffer {
     pub(crate) special_mode: Option<&'static str>,
     /// Set while the buffer is a client's file panel.
     pub(crate) tree: Option<Box<crate::editor::TreeData>>,
+    /// The language the buffer's file is in, for highlighting,
+    /// indentation and comments.
+    pub(crate) language: crate::editor::LanguageState,
+    pub(crate) highlight: crate::editor::HighlightState,
     /// Emacs `recent-auto-save-p`: auto-saved since last read or saved, so
     /// the auto-save file is this session's and a save may delete it.
     pub(crate) auto_saved_since_save: bool,
@@ -291,6 +295,8 @@ impl Buffer {
             occur: None,
             special_mode: None,
             tree: None,
+            language: crate::editor::LanguageState::default(),
+            highlight: crate::editor::HighlightState::default(),
             auto_saved_since_save: false,
             checkpoints,
             faces: FaceSpans::new(),
@@ -311,6 +317,8 @@ impl Buffer {
             mode
         } else if self.messages {
             MESSAGES_MODE
+        } else if let Some(language) = self.language.language {
+            language.mode_name()
         } else {
             FUNDAMENTAL_MODE
         }

@@ -13,6 +13,7 @@ use crate::buffer::{Buffer, BufferId, FileBinding};
 use crate::editor::Editor;
 use crate::event::ClientId;
 use crate::faces::FaceSpans;
+use crate::paren::{ParenMatch, show_paren};
 use crate::reload::ExternalState;
 use crate::window::{
     CONTINUATION_GLYPH, CursorTracker, Fetch, LineEvent, ScreenLine, TRUNCATION_GLYPH, WindowArea,
@@ -159,7 +160,19 @@ fn draw_window(
             requested
         }
     };
+    // Emacs highlights the parens of the selected window only.
+    let parens = (selected && editor.config().show_paren_mode)
+        .then(|| {
+            show_paren(
+                &buffer.text,
+                &buffer.faces,
+                point,
+                editor.config().show_paren_max_distance,
+            )
+        })
+        .flatten();
     let marks = Marks {
+        parens,
         faces: &buffer.faces,
         region: active_region(buffer, point),
         search: search_marks(
@@ -249,6 +262,9 @@ fn draw_window(
 
 /// The parts of a window's text drawn in another face.
 struct Marks<'a> {
+    /// `show-paren-mode`'s parens, drawn over the region (its overlay
+    /// priority is higher).
+    parens: Option<ParenMatch>,
     /// The buffer's own faces, under every other.
     faces: &'a FaceSpans,
     region: Option<Range<u64>>,
@@ -358,10 +374,19 @@ fn draw_event(
             escape,
             ..
         } => {
+            let paren = marks
+                .parens
+                .filter(|found| found.here == *unit || found.there == Some(*unit));
             let face = if marks.search.current_contains(*unit) {
                 Face::IsearchMatch
             } else if marks.search.lazy_contains(*unit) {
                 Face::LazyHighlight
+            } else if let Some(found) = paren {
+                if found.matched {
+                    Face::ShowParenMatch
+                } else {
+                    Face::ShowParenMismatch
+                }
             } else if in_region(*unit) {
                 Face::Region
             } else if *escape {

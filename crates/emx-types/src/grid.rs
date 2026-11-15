@@ -26,6 +26,19 @@ pub enum Face {
     GitAdded,
     GitUntracked,
     GitIgnored,
+    /// Syntax highlighting, after Emacs's font-lock faces.
+    Comment,
+    String,
+    Keyword,
+    Type,
+    Function,
+    Variable,
+    Constant,
+    Builtin,
+    Preprocessor,
+    /// Emacs `show-paren-match` and `show-paren-mismatch`.
+    ShowParenMatch,
+    ShowParenMismatch,
 }
 
 /// A width of 0 marks the trailing half of a wide character.

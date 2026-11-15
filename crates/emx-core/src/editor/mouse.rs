@@ -464,7 +464,7 @@ fn unit_range(text: &Text, pos: u64, unit: SelectUnit) -> Range<u64> {
     let from = pos.saturating_sub(SELECTION_SCAN_BYTES);
     let to = pos.saturating_add(SELECTION_SCAN_BYTES).min(length);
     let mut bytes = Vec::new();
-    if text.read(from..to, &mut bytes).is_err() {
+    if text.read_cached(from..to, &mut bytes).is_err() {
         return pos..pos;
     }
     let at = usize::try_from(pos - from).expect("within the scan window");

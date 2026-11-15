@@ -875,3 +875,24 @@ fn file_panel_lists_opens_and_updates_live() {
     pty.keys("C-x C-c");
     assert!(pty.wait_exit().success());
 }
+
+/// Highlighting through the real server: the highlighter thread's faces
+/// reach the terminal (keywords are cyan).
+#[test]
+fn rust_files_are_highlighted_through_the_server() {
+    let env = TestEnv::new();
+    let _reaper = SessionReaper::new(&env);
+    env.file("main.rs", "fn main() {}\n");
+    let pty = Pty::spawn(&env, &["main.rs"]);
+    pty.wait_modeline(|modeline| modeline.contains("(Rust)"));
+    let keyword = b"\x1b[0;36mfn";
+    let deadline = std::time::Instant::now() + WAIT;
+    while find(&pty.raw_output(), keyword).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no highlighted keyword: {:?}",
+            pty.raw_output_text()
+        );
+        thread::sleep(POLL);
+    }
+}

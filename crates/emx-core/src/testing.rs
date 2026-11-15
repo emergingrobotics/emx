@@ -105,6 +105,7 @@ pub struct Harness {
     watched: BTreeSet<PathBuf>,
     /// The directories the file panel watches.
     watched_trees: BTreeSet<PathBuf>,
+    highlighter: crate::syntax::Highlighter,
     /// Every message sent, to whom.
     messages: Vec<(ClientId, ServerMsg)>,
     next_client: u64,
@@ -154,6 +155,7 @@ impl Harness {
             journal_ops: Vec::new(),
             watched: BTreeSet::new(),
             watched_trees: BTreeSet::new(),
+            highlighter: crate::syntax::Highlighter::new(),
             messages: Vec::new(),
             next_client: HARNESS_CLIENT.0 + 1,
             next_request: 1,
@@ -559,6 +561,7 @@ impl Harness {
                     result: diff::run_diff(&job),
                 });
             }
+            Effect::Highlight(job) => return Some(self.highlighter.run(&job)),
             Effect::Tree { client, job } => {
                 return Some(crate::tree::run_tree_job(client, &job));
             }

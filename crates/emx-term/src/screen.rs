@@ -48,6 +48,19 @@ pub fn face_sgr(face: Face) -> &'static str {
         Face::GitAdded => "0;32",
         Face::GitUntracked => "0;31",
         Face::GitIgnored => "0;2",
+        // font-lock on a dark terminal (`emacs -nw` with
+        // `frame-background-mode` dark), nearest ANSI colors.
+        Face::Comment => "0;31",
+        Face::String => "0;33",
+        Face::Keyword => "0;36",
+        Face::Type => "0;32",
+        Face::Function => "0;34",
+        Face::Variable => "0;93",
+        Face::Constant => "0;35",
+        Face::Builtin => "0;94",
+        Face::Preprocessor => "0;95",
+        Face::ShowParenMatch => "0;30;46",
+        Face::ShowParenMismatch => "0;97;45",
     }
 }
 

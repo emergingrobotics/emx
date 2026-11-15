@@ -69,6 +69,15 @@ pub const PANEL_WIDTH_MIN: u64 = 11;
 pub const PANEL_WIDTH_MAX: u64 = 1000;
 /// The most files `project-find-file` lists.
 pub const QUICK_OPEN_MAX_FILES: u64 = 100_000;
+/// Highlighting is off for files above this size, and for lines above
+/// this length (DESIGN section 5).
+pub const HIGHLIGHT_MAX_FILE: u64 = 50 * 1000 * 1000;
+pub const HIGHLIGHT_MAX_LINE: u64 = 10 * 1000;
+/// Emacs `show-paren-mode`, on by default since Emacs 28.
+pub const SHOW_PAREN_MODE: bool = true;
+/// How far a paren's match is looked for (Emacs
+/// `blink-matching-paren-distance`).
+pub const SHOW_PAREN_MAX_DISTANCE: u64 = 100 * 1024;
 pub const MAX_WIRE_MESSAGE: u64 = 16 * MIB;
 pub const FRAME_QUEUE_DEPTH: u64 = 8;
 
@@ -119,6 +128,10 @@ pub struct Config {
     pub mouse_wheel_lines: u64,
     pub panel_width: u64,
     pub quick_open_max_files: u64,
+    pub highlight_max_file: u64,
+    pub highlight_max_line: u64,
+    pub show_paren_mode: bool,
+    pub show_paren_max_distance: u64,
 }
 
 impl Default for Config {
@@ -156,6 +169,10 @@ impl Default for Config {
             mouse_wheel_lines: MOUSE_WHEEL_LINES,
             panel_width: PANEL_WIDTH,
             quick_open_max_files: QUICK_OPEN_MAX_FILES,
+            highlight_max_file: HIGHLIGHT_MAX_FILE,
+            highlight_max_line: HIGHLIGHT_MAX_LINE,
+            show_paren_mode: SHOW_PAREN_MODE,
+            show_paren_max_distance: SHOW_PAREN_MAX_DISTANCE,
         }
     }
 }
@@ -392,7 +409,8 @@ mod tests {
              long_line_threshold = 19\necho_keystrokes_ms = 0\nmark_ring_max = 20\n\
              indent_tabs_mode = false\ncursor_event_interval_ms = 21\ncompletion_rows = 22\n\
              keyboard_encoding = \"legacy\"\nmouse = true\nmouse_wheel_lines = 23\n\
-             panel_width = 24\nquick_open_max_files = 25\n",
+             panel_width = 24\nquick_open_max_files = 25\nhighlight_max_file = 26\n\
+             highlight_max_line = 27\nshow_paren_mode = false\nshow_paren_max_distance = 28\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -428,6 +446,10 @@ mod tests {
             mouse_wheel_lines: 23,
             panel_width: 24,
             quick_open_max_files: 25,
+            highlight_max_file: 26,
+            highlight_max_line: 27,
+            show_paren_mode: false,
+            show_paren_max_distance: 28,
         };
         assert_eq!(config, expected);
     }

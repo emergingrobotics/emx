@@ -2,6 +2,7 @@ mod buffer_menu;
 mod completing;
 mod files;
 mod goto;
+mod highlight;
 mod kmacro;
 mod messages;
 mod mouse;
@@ -41,6 +42,7 @@ use crate::render::{PrefetchRequest, render};
 use crate::undo::{UndoLimits, outer_limit_warning};
 pub(crate) use files::Purpose;
 use files::{AutoSaveRequest, ExitWait, SaveFlow, SaveRequest};
+pub(crate) use highlight::{HighlightState, LanguageState};
 pub(crate) use panel::TreeData;
 use registers::{RegisterRead, RegisterValue};
 use reload::ReloadRequest;
@@ -494,6 +496,12 @@ impl Editor {
                 }
             }
             Event::TreeChanged { dir } => self.tree_changed(&dir),
+            Event::Highlighted {
+                buffer,
+                generation,
+                range,
+                spans,
+            } => self.highlighted(buffer, generation, range, spans),
             Event::Paste { client, data, last } => {
                 self.note_terminal_activity(client);
                 self.paste_chunk(client, data, last);
@@ -565,6 +573,7 @@ impl Editor {
             self.fit_frame(*client_id);
             self.keep_points_visible(*client_id);
         }
+        self.request_highlights();
         for client_id in client_ids {
             if self.client(client_id).kind != ClientKind::Tui {
                 continue;

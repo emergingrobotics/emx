@@ -27,7 +27,7 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 96] = [
+const DEFAULT_BINDINGS: [(&str, &str); 97] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
@@ -123,6 +123,7 @@ const DEFAULT_BINDINGS: [(&str, &str); 96] = [
     ("C-x )", "kmacro-end-macro"),
     ("C-x e", "kmacro-end-and-call-macro"),
     ("<f8>", "toggle-tree"),
+    ("M-;", "comment-dwim"),
     ("C-x p f", "project-find-file"),
 ];
 const BUFFER_MENU_BINDINGS: [(&str, &str); 1] = [("RET", "Buffer-menu-this-window")];

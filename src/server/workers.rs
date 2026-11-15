@@ -6,13 +6,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use emx_core::completion::{Candidate, ListingError};
 use emx_core::diff::{self, DiffJob};
 use emx_core::io::{self, SaveFailure, SavePlan};
 use emx_core::search_job::{SearchJob, run_search_job};
+use emx_core::syntax::{HighlightJob, Highlighter};
 use emx_core::tree::{TreeJob, refused_tree_job, run_tree_job};
 use emx_core::{
     AutoSaveJob, BufferId, ClientId, Config, Event, ListingId, PrefetchRequest, ReloadJob,
@@ -596,6 +597,54 @@ impl Searchers {
             result: Err(TOO_MANY_SEARCHES.to_string()),
         });
     }
+}
+
+/// Highlights on a thread of its own (`Effect::Highlight`), which keeps
+/// the parsers and compiled queries. Jobs that queue up while it works are
+/// coalesced: for each buffer only those for its newest text are run.
+pub struct Highlighters {
+    jobs: mpsc::Sender<HighlightJob>,
+}
+
+impl Highlighters {
+    pub fn spawn(deliver: Deliver) -> std::io::Result<Highlighters> {
+        let (jobs, receiver) = mpsc::channel::<HighlightJob>();
+        thread::Builder::new()
+            .name("emx-highlight".to_string())
+            .spawn(move || {
+                let mut highlighter = Highlighter::new();
+                while let Ok(first) = receiver.recv() {
+                    let mut batch = vec![first];
+                    batch.extend(receiver.try_iter());
+                    for job in newest_jobs(batch) {
+                        deliver(highlighter.run(&job));
+                    }
+                }
+            })?;
+        Ok(Highlighters { jobs })
+    }
+
+    pub fn submit(&self, job: HighlightJob) {
+        // The thread is gone only when the server is exiting.
+        drop(self.jobs.send(job));
+    }
+}
+
+/// The jobs of `batch` for each buffer's newest text, without repeats, in
+/// the order they came.
+fn newest_jobs(batch: Vec<HighlightJob>) -> Vec<HighlightJob> {
+    let mut newest: HashMap<BufferId, u64> = HashMap::new();
+    for job in &batch {
+        let generation = newest.entry(job.buffer).or_insert(job.generation);
+        *generation = (*generation).max(job.generation);
+    }
+    let mut kept: Vec<HighlightJob> = Vec::new();
+    for job in batch {
+        if newest.get(&job.buffer) == Some(&job.generation) && !kept.contains(&job) {
+            kept.push(job);
+        }
+    }
+    kept
 }
 
 /// Runs the file panel's jobs (`Effect::Tree`), each on a thread of its

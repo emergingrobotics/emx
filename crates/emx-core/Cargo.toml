@@ -9,6 +9,16 @@ description = "Editor core (buffers, commands, persistence) for the emx editor"
 [dependencies]
 gix = { version = "0.90", default-features = false, features = ["status", "sha1"] }
 ignore = "0.4"
+tree-sitter = "0.27"
+tree-sitter-bash = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-go = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
 crc32fast.workspace = true
 emx-proto.workspace = true
 emx-text.workspace = true

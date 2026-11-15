@@ -13,7 +13,10 @@ use crate::journal::{JournalOp, RecoveredBuffer};
 use crate::reload::{AppendRead, Observation, Reloaded};
 use crate::render::PrefetchRequest;
 use crate::search_job::{SearchJob, SearchOutcome};
+use crate::syntax::HighlightJob;
 use crate::tree::{TreeJob, TreeOutcome};
+use emx_types::Face;
+use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientId(pub u64);
@@ -53,6 +56,14 @@ pub enum Event {
     /// deleted or renamed.
     TreeChanged {
         dir: PathBuf,
+    },
+    /// The faces of `range` of `buffer`'s text at change `generation`, from
+    /// an `Effect::Highlight`.
+    Highlighted {
+        buffer: BufferId,
+        generation: u64,
+        range: Range<u64>,
+        spans: Vec<(Range<u64>, Face)>,
     },
     /// A chunk of a bracketed paste. The chunks are collected until the
     /// `last` one, then inserted as one change, never looked up as keys.
@@ -188,6 +199,10 @@ pub enum Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Send(ClientId, ServerMsg),
+    /// Highlight with `syntax::Highlighter` off the editor thread and
+    /// deliver `Event::Highlighted`. A newer job for the same buffer may
+    /// replace one not started yet.
+    Highlight(HighlightJob),
     /// Run the file panel's `job` off the editor thread and deliver
     /// `Event::Tree`.
     Tree {
