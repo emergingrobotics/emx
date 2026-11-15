@@ -6,13 +6,15 @@ MUSL_TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 BENCH_SIZES := 10MB 100MB-line 1GB
 BENCH_FULL_SIZES := $(BENCH_SIZES) 10GB
 INSTALL_DIR ?= $(HOME)/.local/bin
+SYS_INSTALL_DIR ?= /usr/local/bin
 
-.PHONY: help build install test run-tests difftest check fmt fuzz bench bench-full static clean publish-dry-run publish
+.PHONY: help build install install-sys test run-tests difftest check fmt fuzz bench bench-full static deb clean publish-dry-run publish
 
 help:
 	@echo "Targets:"
 	@echo "  build            Release build of emx, copied to bin/emx"
 	@echo "  install          Build and copy emx to INSTALL_DIR (~/.local/bin)"
+	@echo "  install-sys      Build and copy emx to SYS_INSTALL_DIR (/usr/local/bin) via sudo"
 	@echo "  test             Run all workspace tests (TEST_ARGS to filter)"
 	@echo "  run-tests        Run all tests (includes the differential suite)"
 	@echo "  difftest         Run only the differential tests against Emacs"
@@ -22,6 +24,7 @@ help:
 	@echo "  bench            Benchmarks on 10 MB and 1 GB corpora"
 	@echo "  bench-full       Benchmarks on 10 MB, 1 GB and 10 GB corpora"
 	@echo "  static           Static musl builds for x86_64 and aarch64"
+	@echo "  deb              .deb packages (amd64, arm64) from the static builds"
 	@echo "  clean            Remove build artifacts"
 	@echo "  publish-dry-run  Validate packaging of all crates for crates.io"
 	@echo "  publish          Publish all crates to crates.io in dependency order"
@@ -34,6 +37,10 @@ build:
 
 install: build
 	install -D -m 0755 bin/emx $(INSTALL_DIR)/emx
+
+# Only the copy runs under sudo, so target/ and bin/ stay owned by the user.
+install-sys: build
+	sudo install -D -m 0755 bin/emx $(SYS_INSTALL_DIR)/emx
 
 test:
 	cargo test $(if $(TEST_ARGS),$(TEST_ARGS),--workspace)
@@ -87,6 +94,17 @@ static:
 		cargo zigbuild --release -p emx --target $$target || exit 1; \
 		ls -l target/$$target/release/emx; \
 	done
+
+# Packages the static musl binaries from `static` rather than rebuilding, so
+# the .debs carry no glibc dependency and install on any Debian or Ubuntu.
+# Those binaries are already stripped; the host strip cannot read aarch64.
+deb: static
+	cargo install cargo-deb
+	for target in $(MUSL_TARGETS); do \
+		echo cargo deb --no-build --no-strip --target $$target; \
+		cargo deb --no-build --no-strip --target $$target || exit 1; \
+	done
+	ls -l target/debian/*.deb
 
 clean:
 	cargo clean
