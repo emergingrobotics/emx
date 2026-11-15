@@ -4,12 +4,13 @@
 
 use std::fs::{self, File};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use emx_core::io::load_file;
 use emx_core::testing::Harness;
-use emx_core::{BufferId, Config, Event};
-use emx_text::{BLOCK_SIZE, Original, index_file};
+use emx_core::{BufferId, Config, Event, PrefetchRequest};
+use emx_text::{BLOCK_SIZE, BlockCache, Original, index_file};
 
 /// One byte over the small-file threshold forces the block-cache path. The
 /// fixtures here are a few hundred KiB, so a tiny limit keeps them off the
@@ -72,6 +73,14 @@ fn advance_index(harness: &mut Harness, buffer: BufferId, upto: u64, complete: b
         total_blocks: total,
         complete,
     });
+}
+
+/// The block cache behind the buffer's file-backed text.
+fn buffer_cache(harness: &Harness) -> Arc<BlockCache> {
+    match &harness.buffer().text.sources().original {
+        Original::File(cache) => cache.clone(),
+        Original::Memory(_) => panic!("fixture is file-backed"),
+    }
 }
 
 #[test]
@@ -233,4 +242,115 @@ fn goto_line_cancel() {
     // Even once the indexer reaches the line, the cancelled jump does not fire.
     advance_index(&mut harness, buffer, 3, true);
     assert_eq!(harness.point(), 0, "a cancelled goto never moves point");
+}
+
+#[test]
+fn modeline_badge_shows_indexing_percent() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("lines.log");
+    let line_count = 3 * LINES_PER_BLOCK;
+    fs::write(&path, fixed_width_lines(line_count)).expect("write fixture");
+
+    let mut harness = open_large(directory.path(), &path);
+    let buffer = harness.buffer().id;
+
+    // One of three blocks counted: the modeline carries the badge at 33%.
+    advance_index(&mut harness, buffer, 1, false);
+    assert!(
+        modeline(&harness).contains("[Indexing 33%]"),
+        "indexing badge shows the counted fraction: {}",
+        modeline(&harness)
+    );
+
+    // Once the whole file is indexed, the badge is gone.
+    advance_index(&mut harness, buffer, 3, true);
+    assert!(
+        !modeline(&harness).contains("Indexing"),
+        "the badge clears when indexing completes: {}",
+        modeline(&harness)
+    );
+}
+
+#[test]
+fn goto_line_index_failure_cancels_pending() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("lines.log");
+    let line_count = 3 * LINES_PER_BLOCK;
+    fs::write(&path, fixed_width_lines(line_count)).expect("write fixture");
+
+    let mut harness = open_large(directory.path(), &path);
+    let buffer = harness.buffer().id;
+    advance_index(&mut harness, buffer, 2, false);
+
+    let target_line = 2 * LINES_PER_BLOCK + 452;
+    harness.keys("M-g g");
+    harness.type_text(&target_line.to_string());
+    harness.keys("RET");
+    assert_eq!(harness.point(), 0);
+
+    // The indexer fails: the pending jump is abandoned instead of waiting
+    // forever for a line that will never be counted.
+    harness.handle(Event::IndexFinished {
+        buffer,
+        result: Err("i/o error".to_string()),
+    });
+    assert_eq!(harness.echo(), "Cannot reach line: indexing failed");
+
+    // A later block becoming cached must not revive the cancelled jump.
+    harness.handle(Event::BlockReady {
+        buffer,
+        block: 2,
+        result: Ok(()),
+    });
+    assert_eq!(harness.point(), 0, "a failed-index goto never moves point");
+}
+
+#[test]
+fn goto_line_completion_prefetches_uncached_block() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("lines.log");
+    // Five blocks: the target line sits in a middle block that opening does
+    // not cache (only the first, shown, block and the tail block are).
+    let line_count = 5 * LINES_PER_BLOCK;
+    fs::write(&path, fixed_width_lines(line_count)).expect("write fixture");
+
+    let mut harness = open_large(directory.path(), &path);
+    let buffer = harness.buffer().id;
+    advance_index(&mut harness, buffer, 2, false);
+
+    let target_line = 3 * LINES_PER_BLOCK + 500;
+    let target_block = (target_line - 1) * LINE_WIDTH as u64 / BLOCK_SIZE as u64;
+    harness.keys("M-g g");
+    harness.type_text(&target_line.to_string());
+    harness.keys("RET");
+    assert_eq!(harness.point(), 0);
+    harness.take_prefetches();
+
+    // Indexing completes, but the block holding the line is not cached. The
+    // autonomous progress path must not read it on the editor thread: it asks
+    // for a prefetch and keeps waiting rather than blocking.
+    advance_index(&mut harness, buffer, 5, true);
+    let prefetches = harness.take_prefetches();
+    assert!(
+        prefetches.contains(&PrefetchRequest {
+            buffer,
+            block: target_block,
+        }),
+        "the uncached landing block is prefetched: {prefetches:?}"
+    );
+    assert_eq!(
+        harness.point(),
+        0,
+        "the jump waits for the block, not an I/O stall"
+    );
+
+    // Once that block is cached, the block-ready event completes the jump.
+    let cache = buffer_cache(&harness);
+    cache.get(target_block).expect("read the landing block");
+    harness.handle(Event::BlockReady {
+        buffer,
+        block: target_block,
+        result: Ok(()),
+    });
+    assert_eq!(harness.point(), (target_line - 1) * LINE_WIDTH as u64);
 }

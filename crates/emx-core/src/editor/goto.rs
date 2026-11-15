@@ -6,10 +6,13 @@ use crate::buffer::{BufferId, IndexingProgress};
 use crate::command::{self, CommandError};
 use crate::event::{ClientId, Effect};
 use crate::minibuffer::{HistoryKind, Mode};
-use crate::window::WindowId;
+use crate::render::PrefetchRequest;
+use crate::window::{WindowId, not_cached_block};
 
 const GOTO_LINE_PROMPT: &str = "Goto line: ";
 const INVALID_NUMBER: &str = "Invalid number";
+/// Shown when a `goto-line` cannot complete because the line indexer failed.
+const GOTO_INDEX_FAILED: &str = "Cannot reach line: indexing failed";
 
 impl Editor {
     pub(crate) fn read_goto_line(&mut self, client_id: ClientId) {
@@ -64,12 +67,10 @@ impl Editor {
         let Some(target) = self.buffers.get_mut(buffer) else {
             return;
         };
-        // Refreshing fills piece newline counts that the index now knows. A
-        // partly covered edge block that is not cached fails; the next
-        // progress report tries again, so the error is dropped here.
-        if let Ok(refreshed) = target.text.refresh_newlines() {
-            target.text = refreshed;
-        }
+        // This runs autonomously on a progress tick, not from user input, so
+        // it must never block: a piece whose edge block is not cached is left
+        // unknown and refreshed on a later tick.
+        target.text = target.text.refresh_newlines_cached();
         target.indexing = if complete {
             None
         } else {
@@ -107,9 +108,25 @@ impl Editor {
         self.client_mut(client).pending_goto = None;
     }
 
-    fn resolve_pending_gotos(&mut self, buffer: BufferId) {
-        let clients: Vec<ClientId> = self
-            .clients
+    /// Retries every `goto-line` waiting on `buffer`, called from the indexer's
+    /// progress and from a block becoming cached.
+    pub(super) fn resolve_pending_gotos(&mut self, buffer: BufferId) {
+        for client in self.pending_goto_clients(buffer) {
+            self.resolve_pending_goto(client);
+        }
+    }
+
+    /// Abandons every `goto-line` waiting on `buffer` because its index can no
+    /// longer be built, telling each waiting client why.
+    pub(super) fn fail_pending_gotos(&mut self, buffer: BufferId) {
+        for client in self.pending_goto_clients(buffer) {
+            self.client_mut(client).pending_goto = None;
+            self.set_echo(client, GOTO_INDEX_FAILED.to_string());
+        }
+    }
+
+    fn pending_goto_clients(&self, buffer: BufferId) -> Vec<ClientId> {
+        self.clients
             .iter()
             .filter(|(_, client)| {
                 client
@@ -117,10 +134,7 @@ impl Editor {
                     .is_some_and(|goto| goto.buffer == buffer)
             })
             .map(|(id, _)| *id)
-            .collect();
-        for client in clients {
-            self.resolve_pending_goto(client);
-        }
+            .collect()
     }
 
     fn resolve_pending_goto(&mut self, client: ClientId) {
@@ -140,19 +154,28 @@ impl Editor {
             return;
         }
         let text = self.buffers[goto.buffer].text.clone();
-        match command::goto_line_offset(&text, goto.line) {
+        match command::goto_line_offset_cached(&text, goto.line) {
             Ok(Some(offset)) => {
                 self.client_mut(client).pending_goto = None;
                 self.set_window_point(client, goto.window, offset);
                 self.set_echo(client, String::new());
             }
+            // The line is still beyond the counted prefix: keep waiting.
             Ok(None) => {
                 let message = self.pending_goto_message(goto.buffer, goto.line);
                 self.set_echo(client, message);
             }
-            // A block needed to place the line was not readable this time;
-            // the next progress report retries.
-            Err(_) => {}
+            // The index reached the line, but the block that holds it is not
+            // cached. Reading it here would block the editor thread, so fetch
+            // it off-thread and retry when `Event::BlockReady` arrives.
+            Err(error) => {
+                self.effects.push(Effect::Prefetch(PrefetchRequest {
+                    buffer: goto.buffer,
+                    block: not_cached_block(error),
+                }));
+                let message = self.pending_goto_message(goto.buffer, goto.line);
+                self.set_echo(client, message);
+            }
         }
     }
 

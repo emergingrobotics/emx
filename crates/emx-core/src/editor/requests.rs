@@ -738,6 +738,9 @@ impl Editor {
     /// failed read is shown to the clients looking at the buffer.
     pub(super) fn block_ready(&mut self, buffer: BufferId, result: Result<(), String>) {
         let Err(message) = result else {
+            // A newly cached block may be the one a pending `goto-line` needed
+            // to place its line.
+            self.resolve_pending_gotos(buffer);
             return;
         };
         let Some(target) = self.buffers.get(buffer) else {
@@ -770,10 +773,14 @@ impl Editor {
         // The scan stopped early: drop the progress badge rather than leave it
         // frozen at the fraction it reached.
         target.indexing = None;
-        let target = &self.buffers[buffer];
-        let text = format!("Counting the lines of {} failed: {message}", target.name);
+        let text = format!(
+            "Counting the lines of {} failed: {message}",
+            self.buffers[buffer].name
+        );
         let terminals: Vec<ClientId> = self.terminal_recency.clone();
         self.show_echo_to(&terminals, text);
+        // Any `goto-line` waiting for this index will never be reached.
+        self.fail_pending_gotos(buffer);
     }
 }
 

@@ -18,8 +18,8 @@ pub(crate) use kill::{xterm_paste, yank_from_kill_ring};
 pub(crate) use mark::push_mark;
 pub(crate) use misc::RecenterPosition;
 pub(crate) use r#move::{
-    char_after, char_before, forward_line, goto_line_offset, goto_line_to, is_word, line_end,
-    line_start, scan_words,
+    char_after, char_before, forward_line, goto_line_offset_cached, goto_line_to, is_word,
+    line_end, line_start, scan_words,
 };
 pub(crate) use rect::apply_string_rectangle;
 pub(crate) use search::isearch_command;

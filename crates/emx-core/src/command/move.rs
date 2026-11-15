@@ -597,6 +597,20 @@ pub(crate) fn goto_line_offset(text: &Text, line: i64) -> Result<Option<u64>, Re
     })
 }
 
+/// Like `goto_line_offset`, but never reads the file: it fails with
+/// `NotCached` when the block that holds the line is not cached, so the
+/// autonomous indexer-progress path can prefetch that block and retry rather
+/// than block the editor thread. `Ok(None)` still means the line is beyond the
+/// counted prefix.
+pub(crate) fn goto_line_offset_cached(text: &Text, line: i64) -> Result<Option<u64>, ReadError> {
+    let zero_based = (line.max(1) as u64) - 1;
+    Ok(match text.line_start_cached(zero_based)? {
+        LineLookup::Found(offset) => Some(offset),
+        LineLookup::PastEnd => Some(text.len()),
+        LineLookup::Unknown => None,
+    })
+}
+
 /// The position of the start of line `line` (1-based), as Emacs `goto-line`
 /// reaches it: `(goto-char (point-min)) (forward-line (1- line))`.
 pub(crate) fn line_number_position(text: &Text, line: i64) -> Result<u64, ReadError> {

@@ -475,17 +475,28 @@ impl Text {
 
     /// Offset where 0-based `line` starts.
     pub fn line_start(&self, line: u64) -> Result<LineLookup, ReadError> {
+        self.line_start_with(line, Fetch::Io)
+    }
+
+    /// Like `line_start`, but fails with `NotCached` rather than reading the
+    /// file, for callers (the indexer's progress handler) that must not block
+    /// on I/O. The caller prefetches the missing block and retries.
+    pub fn line_start_cached(&self, line: u64) -> Result<LineLookup, ReadError> {
+        self.line_start_with(line, Fetch::CachedOnly)
+    }
+
+    fn line_start_with(&self, line: u64, fetch: Fetch) -> Result<LineLookup, ReadError> {
         if line == 0 {
             return Ok(LineLookup::Found(0));
         }
-        Ok(match self.nth_in_tree(&self.root, line - 1)? {
+        Ok(match self.nth_in_tree(&self.root, line - 1, fetch)? {
             Nth::Found(offset) => LineLookup::Found(offset + 1),
             Nth::NotFound { .. } => LineLookup::PastEnd,
             Nth::Unknown => LineLookup::Unknown,
         })
     }
 
-    fn nth_in_tree(&self, tree: &Tree, n: u64) -> Result<Nth, ReadError> {
+    fn nth_in_tree(&self, tree: &Tree, n: u64, fetch: Fetch) -> Result<Nth, ReadError> {
         let Some(node) = tree else {
             return Ok(Nth::NotFound { count: 0 });
         };
@@ -496,18 +507,18 @@ impl Text {
         }
         let mut remaining = n;
         let left_bytes = summary(&node.left).bytes;
-        match self.nth_in_tree(&node.left, remaining)? {
+        match self.nth_in_tree(&node.left, remaining, fetch)? {
             Nth::Found(offset) => return Ok(Nth::Found(offset)),
             Nth::NotFound { count } => remaining -= count,
             Nth::Unknown => return Ok(Nth::Unknown),
         }
-        match self.nth_in_piece(&node.piece, remaining)? {
+        match self.nth_in_piece(&node.piece, remaining, fetch)? {
             Nth::Found(offset) => return Ok(Nth::Found(left_bytes + offset)),
             Nth::NotFound { count } => remaining -= count,
             Nth::Unknown => return Ok(Nth::Unknown),
         }
         let right_base = left_bytes + node.piece.len;
-        Ok(match self.nth_in_tree(&node.right, remaining)? {
+        Ok(match self.nth_in_tree(&node.right, remaining, fetch)? {
             Nth::Found(offset) => Nth::Found(right_base + offset),
             Nth::NotFound { count } => Nth::NotFound {
                 count: n - remaining + count,
@@ -516,7 +527,7 @@ impl Text {
         })
     }
 
-    fn nth_in_piece(&self, piece: &Piece, n: u64) -> Result<Nth, ReadError> {
+    fn nth_in_piece(&self, piece: &Piece, n: u64, fetch: Fetch) -> Result<Nth, ReadError> {
         if let Some(count) = piece.newlines
             && n >= count
         {
@@ -530,7 +541,7 @@ impl Text {
                 .expect("an add piece holds its counted newlines");
             return Ok(Nth::Found(found));
         }
-        let reader = block_reader(&self.sources.original, Fetch::Io);
+        let reader = block_reader(&self.sources.original, fetch);
         let file_range = piece.start..piece.start + piece.len;
         Ok(
             match self.sources.index.nth_newline_in(reader, file_range, n)? {
@@ -615,6 +626,29 @@ impl Text {
             root,
             sources: self.sources.clone(),
         })
+    }
+
+    /// Like `refresh_newlines`, but never reads the file: a piece whose edge
+    /// block is not cached is left unknown rather than read in. For callers
+    /// (the background indexer's progress handler) that run on the editor
+    /// thread and must not block on I/O; the next progress event refreshes
+    /// whatever stayed unknown.
+    pub fn refresh_newlines_cached(&self) -> Text {
+        let sources = &self.sources;
+        let root = piece_tree::refresh(&self.root, &mut |piece| {
+            match count_piece(sources, piece, Fetch::CachedOnly) {
+                Ok(count) => Ok(count),
+                // An uncached edge block cannot be counted without a read;
+                // leave the piece unknown for now.
+                Err(ReadError::NotCached { .. }) => Ok(None),
+                Err(error) => Err(error),
+            }
+        });
+        let root = root.expect("cached-only refresh does no I/O that can fail");
+        Text {
+            root,
+            sources: self.sources.clone(),
+        }
     }
 
     pub fn pieces(&self) -> impl Iterator<Item = (u64, Piece)> + use<> {
