@@ -53,6 +53,10 @@ Keys follow Emacs: `C-x` means Control+x, `M-x` means Alt+x (or Esc then x).
 | `C-/` | Undo |
 | `C-x b` / `C-x C-b` | Switch buffer / list buffers |
 | `C-x 2` / `C-x 3` / `C-x o` / `C-x 1` | Split below / split right / other window / close other windows |
+| `F8` | Open or close the file panel |
+| `C-x p f` | Find a file in the project |
+| `TAB` | Indent the line (in a language file) |
+| `M-;` | Add or go to a comment; comment or uncomment the region |
 | `M-x` | Run any command by name |
 
 Driving emx from a script or a coding agent:
@@ -68,6 +72,31 @@ emx diff-external FILE   # show how FILE changed on disk against its buffer
 ```
 
 Run `emx --help` or `emx help COMMAND` for details. Key bindings can be overridden in `~/.config/emx/config.toml`.
+
+### File panel
+
+`F8` opens a file tree on the left, rooted at the project (the nearest directory holding `.git`). Files ignored by git are hidden. The first column shows git status (`M` modified, `A` added, `?` untracked, rolled up to directories), and `*` marks files changed on disk since you last looked at them. The panel updates as files are created, deleted or renamed.
+
+| Key | Action |
+|---|---|
+| `n` / `p` | Next / previous entry |
+| `RET` | Open a file in the main window, or open/close a directory |
+| `TAB` | Open/close a directory |
+| `^` | Go to the parent directory (on the root line: make the parent the root) |
+| `g` | Refresh, including git status |
+| `i` | Show/hide ignored files |
+| `+` / `R` / `d` | Create a directory / rename / delete (asks first) |
+| `q` | Close the panel |
+
+`C-x p f` lists every file in the project and opens the one you pick; type a few letters of the path in order (`smr` finds `src/main.rs`).
+
+### Languages
+
+Rust, C, Go, Python, JavaScript, Bash, JSON, TOML and YAML files are highlighted with tree-sitter, chosen by file name or a `#!` line. In those files `TAB` and `RET` indent by the language's rules and `M-;` comments. The matching paren of the one at point is highlighted in every file.
+
+### Mouse
+
+Mouse support is off by default, because turning it on takes over the terminal's own drag-to-select. Turn it on with `mouse = true` in the config, or for the session with `M-x xterm-mouse-mode`. Then a click moves the cursor or selects a window, a drag selects text, double and triple clicks select a word and a line, the right button extends the selection, the wheel scrolls the window under the pointer, and dragging a modeline or border resizes windows and the file panel. Hold Shift to use the terminal's own selection. Inside tmux, also `set -g mouse on`.
 
 ### Terminals
 

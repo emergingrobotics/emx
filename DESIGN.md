@@ -103,7 +103,7 @@ A side-panel file tree drawn in the terminal: a persistent, resizable column on 
 - Auto-save and recovery files.
 - **Clipboard via OSC 52, kill ring to system clipboard only.** Most terminals block or don't support reading the clipboard through OSC 52, so syncing from the system clipboard into the kill ring is not promised. Inside tmux, the default `set-clipboard external` ignores OSC 52 from programs, so users need `set -g set-clipboard on`; this is documented.
 - Line endings, tabs/spaces, trailing whitespace, and final-newline handling configurable per file type.
-- Tree-sitter syntax highlighting, auto-indent, and bracket matching (bundled grammars for a defined language set), within the highlighting budget and limits of section 5. No LSP client (VISION.md Non-Goals).
+- Tree-sitter syntax highlighting, auto-indent, and bracket matching (bundled grammars for a defined language set), within the highlighting budget and limits of section 5. No LSP client (VISION.md Non-Goals). The highlighter re-parses a buffer whole rather than incrementally; jobs for older text are coalesced away, and faces move with edits until a new answer arrives.
 - **Mouse:** click to place point and select a window, drag to set the region, double- and triple-click to select a word or line, wheel scrolling, clicking the modeline to select a window, dragging window dividers and the panel edge to resize, and clicks in the file panel. Decoded as SGR mouse reports (mode 1006) through the same pluggable input interface as keys, so it works in every supported terminal, including tmux and screen with their mouse options on. Mouse reporting is opt-in (`mouse = true`, or `M-x xterm-mouse-mode` for the session), because it takes over the terminal's native drag-to-select, which users rely on over SSH; Emacs `-nw` leaves `xterm-mouse-mode` off for the same reason. When enabled, the Shift-drag bypass is documented.
 
 ## 8. Performance Principles
@@ -190,6 +190,8 @@ The author's usual stack is Go. Rust is chosen here for `regex-automata` (revers
 ## 12. Milestones
 
 The **first release** is M1 through M4: the first build others are asked to use daily. It supports Kitty-protocol terminals only. The **next release** is M5 through M7: Linux terminal coverage, the file panel with mouse support, and syntax highlighting. M8 onward ship after that. Dogfooding starts after M2.
+
+Status (2026-11-15): M1 through M7 are done; M5-M7 follow `docs/superpowers/plans/2026-11-15-emx-next-release.md`. The static x86_64 binary is 13 MB with the bundled grammars and `gix` (5 MB before them).
 
 Revised 2026-11-15: terminal coverage moved ahead of the file panel; mouse support widened from the panel to the whole editor; sexp movement, fill, the help system, version control, running programs, LSP, three-way merge, and remote file support moved out of scope (VISION.md Non-Goals).
 
