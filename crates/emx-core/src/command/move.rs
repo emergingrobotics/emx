@@ -86,12 +86,68 @@ fn move_units(ctx: &mut CommandContext, count: i64) -> Result<(), CommandError> 
 
 pub(super) fn next_line(ctx: &mut CommandContext) -> Result<(), CommandError> {
     let count = ctx.prefix_arg.numeric_value();
-    line_move(ctx, count, false, None).map(|_| ())
+    line_move_command(ctx, count)
 }
 
 pub(super) fn previous_line(ctx: &mut CommandContext) -> Result<(), CommandError> {
     let count = ctx.prefix_arg.numeric_value();
-    line_move(ctx, count.saturating_neg(), false, None).map(|_| ())
+    line_move_command(ctx, count.saturating_neg())
+}
+
+/// `next-line`/`previous-line`: Emacs `line-move-visual` t (the default).
+/// A wrapping window moves by screen (visual) lines; a truncating window
+/// shows each logical line in one row, so there logical motion is already
+/// visual motion and the shared `line_move` is used unchanged.
+fn line_move_command(ctx: &mut CommandContext, count: i64) -> Result<(), CommandError> {
+    let wraps = {
+        let text = ctx.buffer().text.clone();
+        ctx.layout(&text).wraps()
+    };
+    if wraps {
+        visual_line_move(ctx, count, false).map(|_| ())
+    } else {
+        line_move(ctx, count, false, None).map(|_| ())
+    }
+}
+
+/// Moves COUNT screen rows (Emacs `line-move-visual`), keeping the window
+/// column as the goal column. Returns whether all rows were moved; on the
+/// buffer edge point goes to the end (going down) or start (going up) of the
+/// last screen row reached and, unless `noerror`, the motion signals.
+pub(super) fn visual_line_move(
+    ctx: &mut CommandContext,
+    count: i64,
+    noerror: bool,
+) -> Result<bool, CommandError> {
+    let text = ctx.buffer().text.clone();
+    let layout = ctx.layout(&text);
+    let origin = ctx.point();
+    if !(ctx.last_command_is(NEXT_LINE) || ctx.last_command_is(PREVIOUS_LINE)) {
+        let column = layout.visual_column(origin)?;
+        ctx.set_temporary_goal_column(column);
+    }
+    let goal = ctx.temporary_goal_column();
+    let from = layout.screen_line_of(origin)?;
+    let (reached, moved) = layout.move_lines(from, count)?;
+    if moved != count.unsigned_abs() {
+        let stop = if count > 0 {
+            line_end(&text, reached.line_start)?
+        } else {
+            reached.line_start
+        };
+        ctx.set_point(stop);
+        if noerror {
+            return Ok(false);
+        }
+        return Err(if count > 0 {
+            CommandError::EndOfBuffer
+        } else {
+            CommandError::BeginningOfBuffer
+        });
+    }
+    let target = layout.position_on_row(reached, goal)?;
+    ctx.set_point(target);
+    Ok(true)
 }
 
 /// Emacs `move-beginning-of-line`: with N other than 1, move N - 1 lines

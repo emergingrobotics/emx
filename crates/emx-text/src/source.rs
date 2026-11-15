@@ -1,5 +1,6 @@
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
@@ -98,6 +99,10 @@ pub struct Sources {
     pub original: Original,
     pub add: Arc<AddStore>,
     pub index: Arc<LineIndex>,
+    /// Total bytes delivered by successful segment reads. Used by tests to
+    /// confirm that a path reads only a bounded amount, such as rendering a
+    /// single very long line.
+    read_bytes: AtomicU64,
 }
 
 impl Sources {
@@ -107,6 +112,7 @@ impl Sources {
             original: Original::Memory(content),
             add: AddStore::new(),
             index,
+            read_bytes: AtomicU64::new(0),
         })
     }
 
@@ -121,6 +127,22 @@ impl Sources {
             original: Original::File(cache),
             add: AddStore::new(),
             index,
+            read_bytes: AtomicU64::new(0),
         })
+    }
+
+    /// Records that `count` bytes were delivered by a segment read.
+    pub(crate) fn count_read(&self, count: u64) {
+        self.read_bytes.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Total bytes delivered by segment reads since the last reset.
+    pub fn read_bytes(&self) -> u64 {
+        self.read_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Resets the delivered-byte counter to zero.
+    pub fn reset_read_bytes(&self) {
+        self.read_bytes.store(0, Ordering::Relaxed);
     }
 }

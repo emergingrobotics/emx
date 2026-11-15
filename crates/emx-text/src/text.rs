@@ -124,8 +124,9 @@ fn read_segment(
     within: Range<u64>,
     fetch: Fetch,
 ) -> Result<(Arc<[u8]>, Range<usize>), ReadError> {
-    let length = usize::try_from(within.end - within.start).expect("segment fits in memory");
-    match (piece.source, &sources.original) {
+    let delta = within.end - within.start;
+    let length = usize::try_from(delta).expect("segment fits in memory");
+    let result = match (piece.source, &sources.original) {
         (PieceSource::Add, _) => {
             let mut copy = Vec::with_capacity(length);
             sources
@@ -152,7 +153,11 @@ fn read_segment(
             );
             Ok((data, start..start + length))
         }
+    };
+    if result.is_ok() {
+        sources.count_read(delta);
     }
+    result
 }
 
 /// Iterates the chunks of a buffer range in order. After an error it yields

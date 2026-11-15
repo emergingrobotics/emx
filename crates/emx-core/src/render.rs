@@ -133,11 +133,23 @@ fn draw_window(
     let window = editor.window(window_client, window_id);
     let buffer = editor.buffer(window.buffer);
     let point = buffer.marker_pos(window.point);
-    let start = ScreenLine {
+    let requested = ScreenLine {
         line_start: buffer.marker_pos(window.start),
         row: u64::from(window.start_row_skip),
     };
     let layout = editor.window_layout(window_client, window_id, &buffer.text, Fetch::CachedOnly);
+    // A long line scrolled part way down begins the window mid-line, reached
+    // through the column checkpoints so the walk reads only the visible rows.
+    let start = match layout.resolve_start(requested, &buffer.checkpoints, &buffer.text) {
+        Ok(start) => start,
+        Err(error) => {
+            prefetch.push(PrefetchRequest {
+                buffer: buffer.id,
+                block: not_cached_block(error),
+            });
+            requested
+        }
+    };
     let marks = Marks {
         region: active_region(buffer, point),
         search: search_marks(

@@ -8,7 +8,14 @@ use emx_core::{
     Buffer, BufferId, Change, ChangeRecorder, Config, InsertionType, UndoEntry, UndoError,
     UndoLimits,
 };
-use emx_text::{Sources, Text};
+use emx_text::{COLUMN_CHECKPOINT_INTERVAL, ColumnCheckpoints, LONG_LINE_THRESHOLD, Sources, Text};
+
+/// A checkpoint cache for a test buffer; these tests never render long lines,
+/// so its configuration is immaterial.
+fn test_checkpoints() -> ColumnCheckpoints {
+    const TAB_WIDTH: usize = 8;
+    ColumnCheckpoints::new(TAB_WIDTH, COLUMN_CHECKPOINT_INTERVAL, LONG_LINE_THRESHOLD)
+}
 
 const SELF_INSERT: &str = "self-insert-command";
 const UNDO: &str = "undo";
@@ -53,6 +60,7 @@ impl Session {
             "t".to_string(),
             text_of(content),
             limits,
+            test_checkpoints(),
         );
         buffer.undo.boundary(point);
         Session {
@@ -398,6 +406,7 @@ fn markers_shift_on_insert_and_delete() {
         "m".to_string(),
         text_of("0123456789"),
         UndoLimits::from(&Config::default()),
+        test_checkpoints(),
     );
     let mut log = Log::default();
     let before = buffer.create_marker(4, InsertionType::StayBefore);
@@ -451,6 +460,7 @@ fn markers_without_undo_record_no_adjustment() {
         "w".to_string(),
         text_of("0123456789"),
         UndoLimits::from(&Config::default()),
+        test_checkpoints(),
     );
     let mut log = Log::default();
     buffer.undo.boundary(0);

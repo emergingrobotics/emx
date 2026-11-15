@@ -843,6 +843,7 @@ impl Editor {
             .map(|file| file_name(&file.path))
             .expect("a loading buffer visits a file");
         target.text = Text::from_original(loaded.sources);
+        target.checkpoints.clear();
         target.loading = false;
         target.coding = loaded.coding;
         target.auto_saved_since_save = false;
@@ -1802,6 +1803,7 @@ impl Editor {
         let target = &mut self.buffers[buffer];
         if let Some((sources, needs_index)) = replacement {
             target.text = Text::from_original(sources);
+            target.checkpoints.clear();
             if needs_index {
                 self.start_indexing(buffer);
             }

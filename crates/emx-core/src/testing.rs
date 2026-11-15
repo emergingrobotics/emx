@@ -727,6 +727,22 @@ impl Harness {
         self.handle(Event::Resize(self.client, cols, rows));
     }
 
+    /// Scrolls the selected window so `skip` screen rows of its start line lie
+    /// above the top, as a scroll into a long wrapped line leaves it. For
+    /// tests of long-line windowing.
+    pub fn set_window_start_row(&mut self, skip: u32) {
+        let window = self.editor.selected_window_id(self.client);
+        let line_start = self.editor.window_start(self.client, window).line_start;
+        self.editor.set_window_start(
+            self.client,
+            window,
+            crate::window::ScreenLine {
+                line_start,
+                row: u64::from(skip),
+            },
+        );
+    }
+
     /// The client's frame as it is rendered now.
     pub fn grid(&self) -> Grid {
         render(&self.editor, self.client).0

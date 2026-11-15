@@ -5,7 +5,7 @@
 
 use std::ops::{ControlFlow, Range};
 
-use emx_text::{DisplayUnit, ReadError, Text, display_units, grapheme_text};
+use emx_text::{ColumnCheckpoints, DisplayUnit, ReadError, Text, display_units, grapheme_text};
 use slotmap::{SecondaryMap, SlotMap};
 
 use crate::buffer::BufferId;
@@ -1205,6 +1205,101 @@ impl<'a> Layout<'a> {
             }
         })?;
         Ok(found.expect("every line walk ends with an End event"))
+    }
+
+    /// The screen line to begin a window's walk at. A long line scrolled part
+    /// way down (its window start skips rows) is reached through the column
+    /// checkpoints rather than by laying the line out again from its start, so
+    /// the walk reads only the visible rows and not the whole scrolled-off
+    /// prefix. A short line, or a window start already at a row boundary, is
+    /// returned unchanged. Reads only cached bytes, like the rest of redisplay.
+    pub(crate) fn resolve_start(
+        &self,
+        start: ScreenLine,
+        checkpoints: &ColumnCheckpoints,
+        text: &Text,
+    ) -> Result<ScreenLine, ReadError> {
+        if start.row == 0 || !self.wraps() {
+            return Ok(start);
+        }
+        let text_width = usize::from(self.cols).saturating_sub(CONTINUATION_COLUMNS);
+        if text_width == 0 {
+            return Ok(start);
+        }
+        let column = start.row.saturating_mul(text_width as u64);
+        match checkpoints.seek_column_cached(text, start.line_start, column)? {
+            Some(offset) => Ok(ScreenLine {
+                line_start: offset,
+                row: 0,
+            }),
+            None => Ok(start),
+        }
+    }
+
+    /// Whether lines wrap (rather than truncate). Visual line motion applies
+    /// only to wrapping windows; a truncating window shows each logical line
+    /// in one screen row, where visual and logical motion coincide.
+    pub(crate) fn wraps(&self) -> bool {
+        self.hscroll.is_none()
+    }
+
+    /// The window column `pos` occupies on its screen row: Emacs's visual
+    /// column, which `line-move-visual` keeps as the goal column.
+    pub(crate) fn visual_column(&self, pos: u64) -> Result<u64, ReadError> {
+        let line_start = self.line_start(pos)?;
+        let mut column = 0;
+        self.walk_line(line_start, &mut |event| match event {
+            LineEvent::Unit { pos: at, col, .. } | LineEvent::End { pos: at, col, .. }
+                if *at == pos =>
+            {
+                column = *col as u64;
+                ControlFlow::Break(())
+            }
+            LineEvent::Unit { pos: at, .. } | LineEvent::End { pos: at, .. } if *at > pos => {
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        })?;
+        Ok(column)
+    }
+
+    /// The buffer position at window column `goal` on screen row `line`: the
+    /// first unit at or past the goal, the row's end when the goal is beyond
+    /// the text on the row, or the start of the next row when the row wraps
+    /// before reaching the goal. Mirrors `move-to-column` within one screen
+    /// row.
+    pub(crate) fn position_on_row(&self, line: ScreenLine, goal: u64) -> Result<u64, ReadError> {
+        let mut result = None;
+        self.walk_line(line.line_start, &mut |event| {
+            let row = event.row();
+            if row < line.row {
+                return ControlFlow::Continue(());
+            }
+            if row > line.row {
+                // The row wrapped before the goal: point stops at the row's
+                // end, which is the first position of the row below.
+                if let Some(pos) = event.pos() {
+                    result = Some(pos);
+                    return ControlFlow::Break(());
+                }
+                return ControlFlow::Continue(());
+            }
+            match event {
+                LineEvent::Unit { pos, col, .. } => {
+                    if *col as u64 >= goal {
+                        result = Some(*pos);
+                        return ControlFlow::Break(());
+                    }
+                    ControlFlow::Continue(())
+                }
+                LineEvent::End { pos, .. } => {
+                    result = Some(*pos);
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        })?;
+        Ok(result.expect("every line walk ends with an End event"))
     }
 
     /// The number of screen rows the line at `line_start` takes.

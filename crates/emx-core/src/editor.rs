@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use emx_proto::{ClientKind, ServerMsg, diff_grids};
-use emx_text::{ReadError, Sources, Text};
+use emx_text::{ColumnCheckpoints, ReadError, Sources, Text};
 use emx_types::{Grid, Key, KeyCode, Mods};
 use slotmap::SlotMap;
 
@@ -426,13 +426,23 @@ impl Editor {
     fn create_buffer(&mut self, name: &str) -> BufferId {
         let limits = UndoLimits::from(&self.config);
         let text = Text::empty(Sources::memory(Arc::from(Vec::new())));
+        let checkpoints = self.new_checkpoints();
         let id = self
             .buffers
-            .insert_with_key(|id| Buffer::new(id, name.to_string(), text, limits));
+            .insert_with_key(|id| Buffer::new(id, name.to_string(), text, limits, checkpoints));
         // Creating a buffer is a command's change: it gets its boundary.
         self.buffers[id].undo.boundary(0);
         self.recency.push(id);
         id
+    }
+
+    /// A fresh column-checkpoint cache sized by the current configuration.
+    pub(crate) fn new_checkpoints(&self) -> ColumnCheckpoints {
+        ColumnCheckpoints::new(
+            self.tab_width(),
+            self.config.column_checkpoint_interval,
+            self.config.long_line_threshold,
+        )
     }
 
     pub fn handle(&mut self, event: Event) {

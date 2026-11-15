@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::PathBuf;
 
-use emx_text::{FileIdentity, ReadError, Text};
+use emx_text::{ColumnCheckpoints, FileIdentity, ReadError, Text};
 use slotmap::SlotMap;
 
 use crate::marker::{InsertionType, Marker, MarkerId};
@@ -213,6 +213,11 @@ pub struct Buffer {
     /// Emacs `recent-auto-save-p`: auto-saved since last read or saved, so
     /// the auto-save file is this session's and a save may delete it.
     pub(crate) auto_saved_since_save: bool,
+    /// Column checkpoints for the buffer's long lines, so a scrolled long
+    /// line is navigated and rendered without rescanning it from the line
+    /// start. Cleared whenever the text changes, since edits shift the byte
+    /// offsets the checkpoints are keyed by.
+    pub(crate) checkpoints: ColumnCheckpoints,
     markers: SlotMap<MarkerId, Marker>,
     modified_tick: u64,
     save_tick: u64,
@@ -220,7 +225,13 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn new(id: BufferId, name: String, text: Text, limits: UndoLimits) -> Buffer {
+    pub fn new(
+        id: BufferId,
+        name: String,
+        text: Text,
+        limits: UndoLimits,
+        checkpoints: ColumnCheckpoints,
+    ) -> Buffer {
         Buffer {
             id,
             name,
@@ -243,6 +254,7 @@ impl Buffer {
             occur: None,
             special_mode: None,
             auto_saved_since_save: false,
+            checkpoints,
             markers: SlotMap::with_key(),
             modified_tick: 0,
             save_tick: 0,
@@ -280,6 +292,7 @@ impl Buffer {
         }
         self.undo = UndoList::new(limits);
         self.modified_tick += 1;
+        self.checkpoints.clear();
         self.set_unmodified();
     }
 
@@ -295,6 +308,7 @@ impl Buffer {
             marker.adjust_for_insert(at, bytes.len() as u64);
         }
         self.modified_tick += 1;
+        self.checkpoints.clear();
         Ok(())
     }
 
@@ -308,6 +322,7 @@ impl Buffer {
             marker.adjust_for_delete(&range);
         }
         self.modified_tick += 1;
+        self.checkpoints.clear();
         Ok(())
     }
 
@@ -344,6 +359,7 @@ impl Buffer {
     pub(crate) fn mark_modified(&mut self) {
         if !self.is_modified() {
             self.modified_tick += 1;
+            self.checkpoints.clear();
         }
     }
 
@@ -456,6 +472,7 @@ impl Buffer {
             marker.adjust_for_insert(at, length);
         }
         self.modified_tick += 1;
+        self.checkpoints.clear();
         recorder.record(
             self.id,
             &Change::Insert {
@@ -549,6 +566,7 @@ impl Buffer {
             marker.adjust_for_delete(&range);
         }
         self.modified_tick += 1;
+        self.checkpoints.clear();
         recorder.record(
             self.id,
             &Change::Delete {
@@ -568,6 +586,7 @@ impl Buffer {
             marker.pos = marker.pos.min(length);
         }
         self.modified_tick += 1;
+        self.checkpoints.clear();
         recorder.record(self.id, &Change::ReplaceAll { text });
     }
 
@@ -589,6 +608,7 @@ impl Buffer {
             marker.adjust_for_insert(at, length);
         }
         self.modified_tick += 1;
+        self.checkpoints.clear();
     }
 
     /// Positions past the end are clamped, as Emacs `set-marker` does.

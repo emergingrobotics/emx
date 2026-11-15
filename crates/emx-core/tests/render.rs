@@ -10,7 +10,9 @@ use std::sync::atomic::AtomicBool;
 use emx_core::testing::Harness;
 use emx_core::{ClientId, Config, Event, PrefetchRequest, Session, render};
 use emx_proto::{ClientKind, ServerMsg};
-use emx_text::{BLOCK_SIZE, BlockCache, LineIndex, Sources, Text, index_file};
+use emx_text::{
+    BLOCK_SIZE, BlockCache, COLUMN_CHECKPOINT_INTERVAL, LineIndex, Sources, Text, index_file,
+};
 use emx_types::{Face, parse_kbd};
 
 /// Lines `L00` to `L39`, each with its newline, point at the start.
@@ -270,8 +272,12 @@ fn wrap_with_backslash() {
         Some((9, 12)),
         "a full row keeps EOL in its last column"
     );
+    // next-line/previous-line move by screen rows (Emacs line-move-visual t).
+    // From the end of the buffer, three C-p reach a row of the "abcdefghi<TAB>XY"
+    // line, and C-e goes to that logical line's end: emacs -nw -Q leaves point
+    // at the newline after "XY", shown at the end of its second screen row.
     harness.keys("C-p C-p C-p C-e");
-    assert_eq!(harness.cursor(), Some((1, 7)));
+    assert_eq!(harness.cursor(), Some((9, 11)));
 }
 
 #[test]
@@ -649,6 +655,79 @@ fn notcached_block_requests_prefetch() {
 
     harness.keys("C-n");
     assert!(harness.take_prefetches().is_empty());
+}
+
+#[test]
+fn render_100mb_single_line_reads_bounded_bytes() {
+    const MEGABYTE: usize = 1024 * 1024;
+    const MEGABYTES: usize = 100;
+    // A 100 MB file of one line (no newline), generated in memory.
+    let content = vec![b'x'; MEGABYTES * MEGABYTE];
+    let text = Text::from_original(Sources::memory(Arc::from(content)));
+    let sources = text.sources().clone();
+
+    let mut harness = Harness::new();
+    harness.buffer_mut().text = text;
+    // Scroll far into the single line: the window begins thousands of rows in.
+    harness.set_window_start_row(10_000);
+    // The first frame builds the column checkpoints up to the scrolled row.
+    let _ = render(harness.editor(), harness.client());
+
+    sources.reset_read_bytes();
+    let _ = render(harness.editor(), harness.client());
+    let read = sources.read_bytes();
+
+    // A single full-width 80x24 window: 80 text columns, 22 text rows.
+    let window_cells: u64 = 80 * 22;
+    let bytes_per_cell: u64 = 4;
+    let bound = 2 * window_cells * bytes_per_cell + COLUMN_CHECKPOINT_INTERVAL;
+    assert!(
+        read <= bound,
+        "rendering one frame read {read} bytes, which exceeds the bound {bound}"
+    );
+    // The frame really drew the scrolled-in text, not the file start.
+    assert_eq!(top_line(&harness), "x".repeat(79) + "\\");
+}
+
+#[test]
+fn visual_line_motion_in_wrapped_line() {
+    // A 30-character line wraps across four rows of a 10-column window
+    // (nine text columns per row), then a short line.
+    let text = "|abcdefghijklmnopqrstuvwxyzABCD\nnext";
+    let mut harness = sized(10, 8, text);
+    // next-line steps one screen row at a time within the wrapped line.
+    harness.keys("C-n");
+    assert_eq!(harness.point(), 9, "down one screen row");
+    harness.keys("C-n");
+    assert_eq!(harness.point(), 18, "down a second screen row");
+    harness.keys("C-n");
+    assert_eq!(harness.point(), 27, "down a third screen row");
+    harness.keys("C-n");
+    assert_eq!(harness.point(), 31, "down onto the next logical line");
+    // previous-line retraces the screen rows back up.
+    harness.keys("C-p");
+    assert_eq!(harness.point(), 27);
+    harness.keys("C-p");
+    assert_eq!(harness.point(), 18);
+    harness.keys("C-p C-p");
+    assert_eq!(harness.point(), 0);
+}
+
+#[test]
+fn goal_column_preserved() {
+    // Visual motion keeps the goal column across a short visual line: the
+    // column is clamped on the short line, then restored on the next.
+    let mut harness = Harness::with_text("|abcdef\ngh\nijklmn");
+    harness.keys("C-f C-f C-f C-f");
+    assert_eq!(harness.point(), 4, "at column 4 of the first line");
+    harness.keys("C-n");
+    assert_eq!(harness.point(), 9, "clamped to the end of the short line");
+    harness.keys("C-n");
+    assert_eq!(
+        harness.point(),
+        14,
+        "goal column 4 restored on the next line"
+    );
 }
 
 #[test]
