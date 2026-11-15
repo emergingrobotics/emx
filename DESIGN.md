@@ -191,7 +191,7 @@ The author's usual stack is Go. Rust is chosen here for `regex-automata` (revers
 
 The **first release** is M1 through M4: the first build others are asked to use daily. It supports Kitty-protocol terminals only. The **next release** is M5 through M7: Linux terminal coverage, the file panel with mouse support, and syntax highlighting. M8 onward ship after that. Dogfooding starts after M2.
 
-Revised 2026-11-15: terminal coverage moved ahead of the file panel; mouse support widened from the panel to the whole editor; sexp movement, fill, the help system, version control, running programs, LSP, and three-way merge moved out of scope (VISION.md Non-Goals).
+Revised 2026-11-15: terminal coverage moved ahead of the file panel; mouse support widened from the panel to the whole editor; sexp movement, fill, the help system, version control, running programs, LSP, three-way merge, and remote file support moved out of scope (VISION.md Non-Goals).
 
 1. **Core and server.** Piece tree over the `pread` block cache, byte-oriented storage, client/server split with per-client windows and point, `--no-server` mode, daemon lifetime rules, edit journal with crash replay, terminal renderer with control-character escaping, Kitty keyboard protocol decoding behind a pluggable input interface, basic movement and editing, open/save with the save policy, kill ring, Emacs-model undo, protocol v1 (`open`, `--wait`, `events`), UID-keyed sockets, auto-save, and the differential-testing harness.
 2. **External edits and live reload.** Watcher with settle detection, append detection, conflict UX (diff / reload / keep mine), atomic-save and truncation handling, network-filesystem detection and polling of open buffers, undoable reloads with the save-after-undo warning, change markers, `diff-external`, multi-file summary notifications, follow-edit mode.
@@ -202,7 +202,7 @@ Revised 2026-11-15: terminal coverage moved ahead of the file panel; mouse suppo
 7. **Syntax highlighting.** Tree-sitter highlighting, bracket matching, and the tier-2 commands (`TAB` indentation, `M-;` comments) for the bundled language set.
 8. **Polish.** macOS Terminal.app and iTerm2, OSC 52 clipboard, themes, ANSI-color log view, encoding detection, binary-file view, per-filetype line-ending/tab/whitespace handling. (Packaging, static musl builds with `mimalloc` and `.deb`, shipped early with the first release.)
 9. **Agent patch API.** `emx apply-patch` with clean failure on mismatched hunks.
-10. **Later / optional.** Rectangle editing enhancements, remote file support.
+10. **Later / optional.** Rectangle editing enhancements.
 
 TOML config is not a polish item: it lands incrementally from M1 as each configurable value appears.
 

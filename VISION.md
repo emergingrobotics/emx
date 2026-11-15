@@ -67,6 +67,7 @@ Goals are ranked. When two conflict, the higher one wins.
 - Not a GUI editor and not an IDE: an editor only. Tree-sitter is used for highlighting, indentation, and comments; there is no LSP client, completion popup, diagnostics, or go-to-definition.
 - No running programs: no `compile`, `grep`, `shell`, `eshell`, `term`, `gdb`, or `shell-command` (`M-!`).
 - No version control: no `vc` (`C-x v`), `ediff`, or `smerge`, and no three-way merge of on-disk conflicts (the conflict UX is diff / reload / keep mine). The file panel's read-only git status markers stay.
+- No remote file editing (Emacs's TRAMP). `emx` opens files through the local filesystem only; to edit on another machine, SSH to it and run `emx` there.
 - No built-in help system: no `C-h` prefix, `describe-key`, `describe-function`, tutorial, or Info.
 - No sexp movement (`C-M-f/b`) or filling (`M-q`).
 - Not planned among Emacs's everyday commands: `zap-to-char` (`M-z`), `just-one-space` and `delete-horizontal-space` (`M-SPC`, `M-\`), `transpose-lines`, `upcase-region` and `downcase-region`, `indent-region`, `replace-string`, narrowing (`C-x n n`), `repeat` (`C-x z`), `find-alternate-file`, `insert-file`, bookmarks, `count-words`, `what-line`, and the `C-x 4` and `C-x 5` prefixes.
