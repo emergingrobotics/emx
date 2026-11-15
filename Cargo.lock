@@ -290,7 +290,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "emx"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "emx-bench"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "portable-pty",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "emx-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "crc32fast",
  "emx-proto",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "emx-proto"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64",
  "emx-types",
@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "emx-term"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "crossterm",
  "emx-types",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "emx-text"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "lru",
  "memchr",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "emx-types"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",

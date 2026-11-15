@@ -5,12 +5,14 @@ FUZZ_SECONDS ?= 60
 MUSL_TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 BENCH_SIZES := 10MB 100MB-line 1GB
 BENCH_FULL_SIZES := $(BENCH_SIZES) 10GB
+INSTALL_DIR ?= $(HOME)/.local/bin
 
-.PHONY: help build test run-tests difftest check fmt fuzz bench bench-full static clean publish-dry-run publish
+.PHONY: help build install test run-tests difftest check fmt fuzz bench bench-full static clean publish-dry-run publish
 
 help:
 	@echo "Targets:"
 	@echo "  build            Release build of emx, copied to bin/emx"
+	@echo "  install          Build and copy emx to INSTALL_DIR (~/.local/bin)"
 	@echo "  test             Run all workspace tests (TEST_ARGS to filter)"
 	@echo "  run-tests        Run all tests (includes the differential suite)"
 	@echo "  difftest         Run only the differential tests against Emacs"
@@ -21,14 +23,17 @@ help:
 	@echo "  bench-full       Benchmarks on 10 MB, 1 GB and 10 GB corpora"
 	@echo "  static           Static musl builds for x86_64 and aarch64"
 	@echo "  clean            Remove build artifacts"
-	@echo "  publish-dry-run  Validate crate packaging for crates.io"
-	@echo "  publish          Publish crate to crates.io"
+	@echo "  publish-dry-run  Validate packaging of all crates for crates.io"
+	@echo "  publish          Publish all crates to crates.io in dependency order"
 
 # Warnings fail the release build too, as clippy -D warnings fails check.
 build:
 	RUSTFLAGS="$${RUSTFLAGS:+$$RUSTFLAGS }-Dwarnings" cargo build --release -p emx
 	mkdir -p bin
 	cp target/release/emx bin/emx
+
+install: build
+	install -D -m 0755 bin/emx $(INSTALL_DIR)/emx
 
 test:
 	cargo test $(if $(TEST_ARGS),$(TEST_ARGS),--workspace)
@@ -87,7 +92,7 @@ clean:
 	cargo clean
 
 publish-dry-run:
-	cargo publish --dry-run --allow-dirty
+	cargo publish --workspace --dry-run --allow-dirty
 
 publish:
-	cargo publish
+	cargo publish --workspace

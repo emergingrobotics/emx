@@ -4,13 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+description = "Editor core (buffers, commands, persistence) for the emx editor"
 
 [dependencies]
 crc32fast.workspace = true
-emx-proto = { path = "../emx-proto" }
-emx-text = { path = "../emx-text" }
-emx-types = { path = "../emx-types" }
+emx-proto.workspace = true
+emx-text.workspace = true
+emx-types.workspace = true
 memchr.workspace = true
 parking_lot.workspace = true
 rustix = { workspace = true, features = ["fs", "process", "rand"] }
