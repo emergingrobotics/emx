@@ -481,6 +481,11 @@ impl Editor {
                 complete,
             } => self.index_progress(buffer, indexed_blocks, total_blocks, complete),
             Event::IndexFinished { buffer, result } => self.index_finished(buffer, result),
+            Event::SaveProgress {
+                buffer,
+                written_bytes,
+                total_bytes,
+            } => self.save_progress(buffer, written_bytes, total_bytes),
             Event::Timer(id) => self.handle_timer(id),
             Event::FileLoaded { buffer, result } => self.file_loaded(buffer, result),
             Event::SaveFinished { buffer, result } => self.save_finished(buffer, result),

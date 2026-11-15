@@ -12,7 +12,7 @@ use emx_types::Key;
 
 use super::{Editor, Session, TimerPurpose};
 use crate::autosave;
-use crate::buffer::{BufferId, CodingMnemonic, EditError, FileBinding};
+use crate::buffer::{BufferId, CodingMnemonic, EditError, FileBinding, SaveProgress};
 use crate::command::{CommandError, PrefixArg};
 use crate::completion::{Candidate, Completer, ListingError};
 use crate::event::ListingId;
@@ -1457,6 +1457,9 @@ impl Editor {
         let buffer = flow.buffer;
         self.check_savable(buffer)?;
         let target = &mut self.buffers[buffer];
+        // A fresh save starts with no progress, so a report from a previous
+        // save can never show on this one.
+        target.saving_progress = None;
         target
             .file
             .as_mut()
@@ -1485,6 +1488,22 @@ impl Editor {
         Ok(())
     }
 
+    /// A save worker's progress report, recorded as a per-buffer snapshot for
+    /// the modeline. Progress reports are external input: one for a buffer not
+    /// being saved (killed meanwhile, or a stale report after the save
+    /// finished) is ignored, so the snapshot never outlives the save.
+    pub(super) fn save_progress(&mut self, buffer: BufferId, written_bytes: u64, total_bytes: u64) {
+        if !self.pending_saves.contains_key(&buffer) {
+            return;
+        }
+        if let Some(target) = self.buffers.get_mut(buffer) {
+            target.saving_progress = Some(SaveProgress {
+                written_bytes,
+                total_bytes,
+            });
+        }
+    }
+
     /// A worker's save result. Results are external input: one for a save
     /// the editor is not waiting on is ignored.
     pub(super) fn save_finished(
@@ -1497,6 +1516,9 @@ impl Editor {
         };
         let client = request.client;
         let mut outcome = Err("the buffer was killed while it was saved".to_string());
+        if let Some(target) = self.buffers.get_mut(buffer) {
+            target.saving_progress = None;
+        }
         if let Some(binding) = self
             .buffers
             .get_mut(buffer)

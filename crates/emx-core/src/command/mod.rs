@@ -250,6 +250,10 @@ static COMMANDS: &[CommandSpec] = &[
         run: misc::execute_extended_command,
     },
     CommandSpec {
+        name: "auto-revert-tail-mode",
+        run: misc::auto_revert_tail_mode,
+    },
+    CommandSpec {
         name: "scroll-up-command",
         run: misc::scroll_up_command,
     },

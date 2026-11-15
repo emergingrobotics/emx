@@ -32,6 +32,10 @@ pub struct BlockCache {
     /// The file was rewritten in place: the bytes this cache stood for are
     /// gone, so every read fails rather than return the new bytes.
     retired: AtomicBool,
+    /// Test support (see `trap_blocking_reads`): once set, a blocking disk
+    /// read panics, so a code path that must read only cached blocks can be
+    /// proven not to read from disk.
+    blocking_reads_trapped: AtomicBool,
 }
 
 impl std::fmt::Debug for BlockCache {
@@ -74,7 +78,16 @@ impl BlockCache {
                 bytes: 0,
             }),
             retired: AtomicBool::new(false),
+            blocking_reads_trapped: AtomicBool::new(false),
         })
+    }
+
+    /// Test support: from now on, any blocking disk read (a cache miss served
+    /// through `get`) panics. Redisplay is a pure function of cached bytes and
+    /// must never read from disk; a test engages this and renders to prove no
+    /// render path blocks on I/O.
+    pub fn trap_blocking_reads(&self) {
+        self.blocking_reads_trapped.store(true, Ordering::Release);
     }
 
     pub fn len(&self) -> u64 {
@@ -187,6 +200,11 @@ impl BlockCache {
     /// Reads one block with `pread`, bypassing the cache. A read shorter than
     /// the expected length means the file was truncated underneath us.
     pub(crate) fn read_block_direct(&self, block: u64) -> Result<Vec<u8>, ReadError> {
+        assert!(
+            !self.blocking_reads_trapped.load(Ordering::Acquire),
+            "a blocking disk read of block {block} on a cache with reads trapped: \
+             redisplay must read only cached blocks"
+        );
         if self.is_retired() {
             return Err(ReadError::Retired);
         }

@@ -23,8 +23,9 @@ use crate::marker::MarkerId;
 use crate::reload::{
     AppendRead, AppendedBytes, Classification, ExternalState, Observation, Reloaded, classify,
 };
+use crate::render::PrefetchRequest;
 use crate::undo::UndoEntry;
-use crate::window::PrevBuffer;
+use crate::window::{Fetch, PrevBuffer, WindowId, not_cached_block};
 
 const DIFF_BUFFER: &str = "*diff-external*";
 const NOT_VISITING: &str = "Buffer does not seem to be associated with any file";
@@ -625,7 +626,49 @@ impl Editor {
         if needs_index {
             self.start_indexing(buffer);
         }
+        if self.buffers[buffer].tail {
+            self.follow_tail(buffer);
+        }
         self.external_change_event(buffer, ExternalKind::Appended);
+    }
+
+    /// Tail mode (`auto-revert-tail-mode`): after an append, every window on
+    /// `buffer` whose point sits at end-of-buffer scrolls so the end stays in
+    /// view, following the file like `tail -f`. Windows whose point is
+    /// elsewhere keep their place. It reads only cached blocks, so it never
+    /// blocks; when the tail is not cached it asks for a prefetch and keeps the
+    /// window's start, and the frame that follows the block becoming cached
+    /// catches up (`keep_point_visible` also keeps the followed point in view).
+    fn follow_tail(&mut self, buffer: BufferId) {
+        let end = self.buffers[buffer].text.len();
+        let clients: Vec<ClientId> = self.clients.keys().copied().collect();
+        for client in clients {
+            let windows: Vec<WindowId> = self.client(client).frame.windows.keys().collect();
+            for window in windows {
+                let window_ref = self.window(client, window);
+                let (window_buffer, point_marker) = (window_ref.buffer, window_ref.point);
+                if window_buffer != buffer {
+                    continue;
+                }
+                if self.buffers[buffer].marker_pos(point_marker) != end {
+                    continue;
+                }
+                let (_, height) = self.window_size(client, window);
+                if height == 0 {
+                    continue;
+                }
+                let text = self.buffers[buffer].text.clone();
+                let layout = self.window_layout(client, window, &text, Fetch::CachedOnly);
+                let rows_above = u64::from(height.saturating_sub(1));
+                match layout.start_with_point_at(end, rows_above) {
+                    Ok(start) => self.set_window_start(client, window, start),
+                    Err(error) => self.effects.push(Effect::Prefetch(PrefetchRequest {
+                        buffer,
+                        block: not_cached_block(error),
+                    })),
+                }
+            }
+        }
     }
 
     // ---- Reloads ---------------------------------------------------------

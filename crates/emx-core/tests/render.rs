@@ -658,6 +658,47 @@ fn notcached_block_requests_prefetch() {
 }
 
 #[test]
+fn render_never_reads_uncached() {
+    // The hard enforcement of the responsiveness invariant: redisplay reads
+    // only cached blocks. The block cache is instrumented so that any blocking
+    // disk read (a cache miss served through `get`) panics; a render over
+    // partly-cached content must therefore emit `PrefetchRequest`s for what it
+    // cannot read, never read it, and so never trip the trap.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("big.txt");
+    let mut content = Vec::new();
+    while content.len() < 2 * BLOCK_SIZE + 100 {
+        content.extend_from_slice(b"0123456789abcdef\n");
+    }
+    fs::write(&path, &content).expect("write fixture");
+    // The cache holds two blocks; indexing reads all three in order, so the
+    // least-recently-used block 0 is evicted and left uncached.
+    let cache = BlockCache::open(&path, 2 * BLOCK_SIZE).expect("open cache");
+    let index = LineIndex::new(cache.len());
+    index_file(&cache, &index, &AtomicBool::new(false), &mut |_| {}).expect("index fixture");
+    assert!(
+        cache.try_get_cached(0).is_none(),
+        "block 0 is evicted, so rendering the window start reaches uncached text"
+    );
+
+    // From here a blocking disk read is a defect.
+    cache.trap_blocking_reads();
+    let text = Text::from_original(Sources::file(cache.clone(), index));
+    let mut harness = Harness::new();
+    harness.buffer_mut().text = text;
+    let buffer = harness.buffer().id;
+
+    // Render completes without a disk read: it reports the block it needs and
+    // draws that text blank until a later frame.
+    let (grid, prefetch) = render(harness.editor(), harness.client());
+    assert_eq!(prefetch, vec![PrefetchRequest { buffer, block: 0 }]);
+    assert!(
+        grid.row(0).iter().all(|cell| cell.text == " "),
+        "uncached text renders blank instead of blocking"
+    );
+}
+
+#[test]
 fn render_100mb_single_line_reads_bounded_bytes() {
     const MEGABYTE: usize = 1024 * 1024;
     const MEGABYTES: usize = 100;

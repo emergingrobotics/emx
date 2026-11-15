@@ -25,7 +25,7 @@ mod window;
 
 pub use buffer::{
     Buffer, BufferId, Change, ChangeRecorder, CodingMnemonic, EditError, FileBinding,
-    IndexingProgress,
+    IndexingProgress, SaveProgress,
 };
 pub use command::{CommandContext, CommandError, CommandSpec, PrefixArg};
 pub use config::{Config, ConfigError, InvalidSetting, KeyboardEncoding};

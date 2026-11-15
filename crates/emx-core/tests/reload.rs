@@ -16,7 +16,7 @@ use emx_proto::{
     ClientKind, EditorEvent, ExternalKind, Request, Response, ServerMsg, WireError, WirePath,
     error_code,
 };
-use emx_text::{FileIdentity, Original};
+use emx_text::{BLOCK_SIZE, BlockCache, FileIdentity, Original};
 use proptest::prelude::*;
 
 const TAIL: u64 = emx_core::config::APPEND_TAIL_HASH_BYTES;
@@ -214,6 +214,121 @@ fn append_to_file_backed_buffer_extends_the_original() {
     );
     harness.keys("C-/");
     assert_eq!(harness.text().as_bytes(), content.as_slice());
+}
+
+/// The last non-blank text row of the frame (above the modeline and echo
+/// rows).
+fn last_text_line(harness: &Harness) -> String {
+    let screen = harness.screen();
+    let text_rows = &screen[..screen.len() - 2];
+    text_rows
+        .iter()
+        .rev()
+        .map(|row| row.trim_end())
+        .find(|row| !row.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The block cache behind a file-backed buffer.
+fn buffer_cache(harness: &Harness) -> std::sync::Arc<BlockCache> {
+    match &harness.buffer().text.sources().original {
+        Original::File(cache) => cache.clone(),
+        Original::Memory(_) => panic!("fixture is file-backed"),
+    }
+}
+
+/// Services every block the renderer asked for, exactly as the server's I/O
+/// pool does: read the requested block into the cache, then deliver
+/// `BlockReady` so the editor re-renders. Loops until no block is outstanding.
+fn service_prefetches(harness: &mut Harness, cache: &BlockCache, buffer: emx_core::BufferId) {
+    loop {
+        let requests = harness.take_prefetches();
+        if requests.is_empty() {
+            return;
+        }
+        for request in requests {
+            let result = cache
+                .get(request.block)
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            harness.handle(Event::BlockReady {
+                buffer,
+                block: request.block,
+                result,
+            });
+        }
+    }
+}
+
+#[test]
+fn tail_mode_follows_appends() {
+    // `auto-revert-tail-mode` watching a large, block-cache-backed log (like
+    // `tail -f`): repeated appends (every 50 ms in the brief; here each is the
+    // watcher's settled change) scroll the window so the newly written last
+    // line comes into view, while only the tail is read -- never the whole
+    // file. The brief's literal 200 MB / 50 ms loop is replaced by a
+    // multi-block file driven through the deterministic harness: it keeps the
+    // semantics (large file, repeated appends, tail follows, bounded reads)
+    // without the disk cost or wall-clock flakiness.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("app.log");
+    let mut content = Vec::new();
+    let mut line = 0u32;
+    while content.len() < 10 * BLOCK_SIZE {
+        content.extend_from_slice(format!("line {line:010}\n").as_bytes());
+        line += 1;
+    }
+    fs::write(&path, &content).expect("write");
+
+    let mut harness = harness_with(big_file_config(), directory.path());
+    visit(&mut harness, &path);
+    assert!(
+        matches!(harness.buffer().text.sources().original, Original::File(_)),
+        "fixture is read through the block cache"
+    );
+    let buffer = harness.buffer().id;
+    let cache = buffer_cache(&harness);
+
+    // Turn tail mode on, then watch the end of the file.
+    harness.keys("M-x");
+    harness.type_text("auto-revert-tail-mode");
+    harness.keys("RET");
+    harness.keys("M->");
+    assert!(
+        modeline(&harness).contains("Tail"),
+        "the modeline marks tail mode: {}",
+        modeline(&harness)
+    );
+
+    let sources = harness.buffer().text.sources().clone();
+    for serial in 0..8u64 {
+        let appended = format!("appended {serial:010}\n");
+        append(&path, appended.as_bytes(), 100 + serial);
+        external_change(&mut harness, &path);
+        service_prefetches(&mut harness, &cache, buffer);
+
+        sources.reset_read_bytes();
+        let last = last_text_line(&harness);
+        assert_eq!(
+            last,
+            appended.trim_end(),
+            "serial {serial}: tail follows the append; screen {:?}",
+            harness.screen()
+        );
+        // Showing the tail read only a bounded amount, nowhere near the file.
+        let read = sources.read_bytes();
+        assert!(
+            read <= 2 * BLOCK_SIZE as u64,
+            "serial {serial}: one tail frame read {read} bytes, over the bound"
+        );
+    }
+    assert!(
+        content.len() as u64 > 8 * BLOCK_SIZE as u64,
+        "the file is many blocks, so the bounded read is meaningful"
+    );
+    // Point followed to the new end; the buffer stayed in step with disk.
+    assert!(!harness.buffer().is_modified());
 }
 
 #[test]

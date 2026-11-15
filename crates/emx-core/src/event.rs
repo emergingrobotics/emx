@@ -147,6 +147,14 @@ pub enum Event {
         buffer: BufferId,
         result: Result<(), String>,
     },
+    /// A save of `buffer` (`Effect::Save`) has written `written_bytes` of
+    /// `total_bytes`. Emitted periodically from the save worker so the modeline
+    /// can show progress; the terminal `Event::SaveFinished` clears it.
+    SaveProgress {
+        buffer: BufferId,
+        written_bytes: u64,
+        total_bytes: u64,
+    },
     /// The result of an `Effect::ListDirectory`, as `io::list_directory`
     /// returned it.
     DirectoryListed {

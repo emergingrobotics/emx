@@ -304,6 +304,43 @@ fn save_symlink_writes_target_keeps_link() {
 }
 
 #[test]
+fn save_progress_shown() {
+    // A save of a File-backed buffer reports progress in the modeline as
+    // `Saving NN%` while the write runs, and clears it when the save finishes.
+    // Modelled on the background indexer's `IndexProgress`: the worker emits a
+    // progress event, the editor records a per-buffer snapshot, and render
+    // shows it, so render stays a pure function of the events seen.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("a.txt");
+    write_file(&path, b"0123456789\n");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+    harness.keys("C-e X Y Z");
+    let buffer = harness.buffer().id;
+
+    // Hold the save in flight; while it runs the worker reports progress.
+    harness.hold_saves();
+    harness.keys("C-x C-s");
+    harness.handle(Event::SaveProgress {
+        buffer,
+        written_bytes: 50,
+        total_bytes: 100,
+    });
+    assert!(
+        modeline(&harness).contains("Saving 50%"),
+        "the modeline shows save progress: {}",
+        modeline(&harness)
+    );
+
+    harness.release_saves();
+    assert!(
+        !modeline(&harness).contains("Saving"),
+        "the badge clears when the save finishes: {}",
+        modeline(&harness)
+    );
+}
+
+#[test]
 fn save_hardlinked_uses_in_place() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("a.txt");

@@ -38,6 +38,9 @@ pub const SEARCHES_IN_FLIGHT_MAX: usize = 16;
 const TOO_MANY_SEARCHES: &str = "Too many searches in progress";
 /// The indexer reports its progress every this many blocks.
 pub const INDEX_PROGRESS_BLOCKS: u64 = 256;
+/// A save reports its progress at most once per this many bytes written, so a
+/// large save shows advancing progress without flooding the editor with events.
+pub const SAVE_PROGRESS_BYTES: u64 = 4 * emx_text::BLOCK_SIZE as u64;
 
 /// Set in the environment, a save job panics on its I/O thread: the seam
 /// tests use to check that a worker panic ends the server (`panic =
@@ -201,7 +204,7 @@ fn work(
         };
         journal.wait_for(queued.after_journal);
         panic_seam(panic_on_save, &queued.job);
-        if let Some(event) = run(queued.job, config) {
+        if let Some(event) = run(queued.job, config, deliver) {
             deliver(event);
         }
         if let Some(key) = queued.key {
@@ -232,17 +235,13 @@ fn worker_panic_requested() -> bool {
     false
 }
 
-fn run(job: Job, config: &Config) -> Option<Event> {
+fn run(job: Job, config: &Config, deliver: &Deliver) -> Option<Event> {
     match job {
         Job::Load { buffer, path } => Some(Event::FileLoaded {
             buffer,
             result: io::load_file(&path, config).map_err(|error| error.to_string()),
         }),
-        Job::Save { buffer, plan } => Some(Event::SaveFinished {
-            buffer,
-            result: io::save_file(&plan, config.append_tail_hash_bytes)
-                .map_err(|error| SaveFailure::from(&error)),
-        }),
+        Job::Save { buffer, plan } => Some(save(buffer, plan, config, deliver)),
         Job::Observe {
             buffer,
             path,
@@ -311,6 +310,30 @@ fn run(job: Job, config: &Config) -> Option<Event> {
                 .map_err(|error| error.to_string()),
         }),
     }
+}
+
+/// Runs a save, delivering `Event::SaveProgress` as the write advances and
+/// returning the terminal `Event::SaveFinished`. Progress is throttled to one
+/// report per `SAVE_PROGRESS_BYTES`, with a final report at the end so the
+/// modeline reaches its last value before the save finishes.
+fn save(buffer: BufferId, plan: SavePlan, config: &Config, deliver: &Deliver) -> Event {
+    let total = plan.text().len();
+    let deliver = deliver.clone();
+    let mut last_reported = 0u64;
+    let report = move |written: u64| {
+        let advanced = written.saturating_sub(last_reported) >= SAVE_PROGRESS_BYTES;
+        if written > last_reported && (advanced || written >= total) {
+            last_reported = written;
+            deliver(Event::SaveProgress {
+                buffer,
+                written_bytes: written.min(total),
+                total_bytes: total,
+            });
+        }
+    };
+    let result = io::save_file_reporting(&plan, config.append_tail_hash_bytes, report)
+        .map_err(|error| SaveFailure::from(&error));
+    Event::SaveFinished { buffer, result }
 }
 
 /// One read per block in flight: redisplay asks for a block after every

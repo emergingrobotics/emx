@@ -252,6 +252,20 @@ pub(super) fn recenter_if_past_window_end(ctx: &mut CommandContext) -> Result<()
     Ok(())
 }
 
+/// Emacs `auto-revert-tail-mode`: toggles following appends to the visited
+/// file, keeping the end of the buffer in view like `tail -f`. In Emacs this
+/// command has no default key binding; it is reached through `M-x`.
+pub(super) fn auto_revert_tail_mode(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let enabled = {
+        let buffer = ctx.buffer_mut();
+        buffer.tail = !buffer.tail;
+        buffer.tail
+    };
+    let state = if enabled { "enabled" } else { "disabled" };
+    ctx.message(format!("Auto-Revert Tail mode {state}"));
+    Ok(())
+}
+
 /// `M-x`: reads a command name and runs the command with this prefix
 /// argument.
 pub(super) fn execute_extended_command(ctx: &mut CommandContext) -> Result<(), CommandError> {

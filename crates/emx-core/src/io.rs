@@ -300,6 +300,32 @@ pub fn file_sink(file: File) -> Box<dyn SaveSink> {
     Box::new(FileSink { file })
 }
 
+/// Wraps a sink and reports the cumulative bytes written after each write, so a
+/// long save can be followed in the modeline. Reporting at the sink keeps the
+/// save-plan code (rename and in-place) unchanged.
+struct ProgressSink {
+    inner: Box<dyn SaveSink>,
+    written: u64,
+    report: Box<dyn FnMut(u64)>,
+}
+
+impl SaveSink for ProgressSink {
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.written += buf.len() as u64;
+        (self.report)(self.written);
+        Ok(())
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.inner.sync()
+    }
+
+    fn seek(&mut self, offset: u64) -> io::Result<()> {
+        self.inner.seek(offset)
+    }
+}
+
 /// Reads `path` for a new buffer. Files up to `in_memory_max` are read
 /// whole, so the buffer never depends on the file staying intact; larger
 /// ones are read on demand through the block cache, and their line index is
@@ -650,6 +676,28 @@ pub fn save_file_with(
         identity,
         tail_hash,
     })
+}
+
+/// Like `save_file`, reporting the cumulative bytes written to `report` as the
+/// save progresses. A worker uses it to emit `Event::SaveProgress` for the
+/// modeline; the throttling (how often a report becomes an event) is the
+/// caller's.
+pub fn save_file_reporting(
+    plan: &SavePlan,
+    tail_bytes: u64,
+    report: impl FnMut(u64) + 'static,
+) -> Result<SavedFile, SaveError> {
+    // The save builds exactly one sink (rename writes one temp file, in-place
+    // reuses the one target), so the callback moves into that sink.
+    let mut report = Some(Box::new(report) as Box<dyn FnMut(u64)>);
+    let mut sinks = move |file: File| -> Box<dyn SaveSink> {
+        Box::new(ProgressSink {
+            inner: file_sink(file),
+            written: 0,
+            report: report.take().expect("a save builds its sink once"),
+        })
+    };
+    save_file_with(plan, tail_bytes, &mut sinks)
 }
 
 /// Carries out a plan, writing through real files.

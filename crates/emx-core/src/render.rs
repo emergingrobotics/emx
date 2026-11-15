@@ -51,6 +51,8 @@ const MODELINE_CHANGED: &str = "[ext] ";
 const MODELINE_POLLED: &str = "[poll] ";
 /// Added to the mode name while the visited file is being read.
 const MODELINE_LOADING: &str = " Loading";
+/// Added to the mode name while `auto-revert-tail-mode` is on.
+const MODELINE_TAIL: &str = " Tail";
 /// The vertical border between side-by-side windows on a terminal.
 const VERTICAL_BORDER_GLYPH: &str = "|";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
@@ -603,7 +605,8 @@ fn draw_modeline(writer: &mut RowWriter, modeline: &Modeline) {
     });
     writer.write(MODELINE_MODES_GAP.as_bytes(), face, face);
     let loading = if buffer.loading { MODELINE_LOADING } else { "" };
-    let modes = format!("({}{loading}) ", buffer.mode_name());
+    let tail = if buffer.tail { MODELINE_TAIL } else { "" };
+    let modes = format!("({}{loading}{tail}) ", buffer.mode_name());
     writer.write(modes.as_bytes(), face, face);
     if buffer.damaged {
         writer.write(MODELINE_DAMAGED.as_bytes(), face, face);
@@ -616,6 +619,10 @@ fn draw_modeline(writer: &mut RowWriter, modeline: &Modeline) {
     }
     if let Some(progress) = buffer.indexing {
         let badge = format!("[Indexing {}%] ", progress.percent());
+        writer.write(badge.as_bytes(), face, face);
+    }
+    if let Some(progress) = buffer.saving_progress {
+        let badge = format!("Saving {}% ", progress.percent());
         writer.write(badge.as_bytes(), face, face);
     }
     writer.fill(MODELINE_FILL.as_bytes(), face);

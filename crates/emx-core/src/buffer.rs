@@ -104,6 +104,28 @@ impl IndexingProgress {
     }
 }
 
+/// How far a save of the buffer has written, as recorded from the most recent
+/// `Event::SaveProgress`. Kept as a per-buffer snapshot (like
+/// `IndexingProgress`) so the modeline is drawn purely from the events seen,
+/// never from state a worker thread is concurrently changing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaveProgress {
+    pub written_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl SaveProgress {
+    /// The written fraction as a whole-number percentage, capped at 99: the
+    /// editor clears the snapshot on `Event::SaveFinished`, so a lingering
+    /// "100%" would never be the true state.
+    pub fn percent(self) -> u64 {
+        if self.total_bytes == 0 {
+            return 0;
+        }
+        (self.written_bytes.saturating_mul(PERCENT_SCALE) / self.total_bytes).min(PERCENT_CAP)
+    }
+}
+
 /// The buffer coding's modeline letter (Emacs `mode-line-mule-info`): a
 /// visited file whose bytes are all ASCII stays undecided (`-`) until a
 /// save writes something else; everything else is UTF-8 (`U`).
@@ -188,6 +210,11 @@ pub struct Buffer {
     /// Progress of the background line indexer, `None` once the file is
     /// wholly indexed or when no index is being built.
     pub indexing: Option<IndexingProgress>,
+    /// Progress of a save in flight, `None` when no save is running.
+    pub saving_progress: Option<SaveProgress>,
+    /// Emacs `auto-revert-tail-mode`: follow appends to the visited file,
+    /// keeping the end of the buffer in view like `tail -f`.
+    pub tail: bool,
     pub coding: CodingMnemonic,
     /// An in-place save failed part way through the file this buffer reads
     /// its unchanged text from: the text is no longer what was visited.
@@ -244,6 +271,8 @@ impl Buffer {
             undo: UndoList::new(limits),
             loading: false,
             indexing: None,
+            saving_progress: None,
+            tail: false,
             coding: CodingMnemonic::Utf8,
             damaged: false,
             recovered: false,
