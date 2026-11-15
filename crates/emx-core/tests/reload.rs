@@ -332,6 +332,67 @@ fn tail_mode_follows_appends() {
 }
 
 #[test]
+fn tail_mode_leaves_non_eob_windows_unscrolled() {
+    // The discriminating half of the tail-mode semantic: on an append, only
+    // windows whose point is at end-of-buffer follow the tail; a window whose
+    // point is parked earlier is left alone. Two windows show one tail-mode
+    // buffer -- the upper parked mid-buffer (point pinned to its top row, so a
+    // wrong scroll would be re-centred by `keep_point_visible` to a visibly
+    // different place rather than masked), the lower window at the end.
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("two.log");
+    let mut content = Vec::new();
+    for line in 0..100 {
+        content.extend_from_slice(format!("line {line:03}\n").as_bytes());
+    }
+    fs::write(&path, &content).expect("write");
+    let mut harness = harness_in(directory.path());
+    visit(&mut harness, &path);
+
+    harness.keys("M-x");
+    harness.type_text("auto-revert-tail-mode");
+    harness.keys("RET");
+
+    // Upper window (selected after the split) parks mid-buffer: goto line 51
+    // (`line 050`), pinned to the top row with `C-u 0 C-l`. Its point is not at
+    // end-of-buffer. The lower window watches the end.
+    harness.keys("C-x 2");
+    harness.keys("M-g g");
+    harness.type_text("51");
+    harness.keys("RET");
+    harness.keys("C-u 0 C-l");
+    harness.keys("C-x o");
+    harness.keys("M->");
+
+    let before = harness.screen();
+    assert_eq!(
+        before[0].trim_end(),
+        "line 050",
+        "the upper window shows its parked point at the top row"
+    );
+
+    append(&path, b"line 100\n", 1);
+    external_change(&mut harness, &path);
+    let after = harness.screen();
+
+    // The end-of-buffer window followed the tail: the new last line is shown.
+    assert!(
+        after.iter().any(|row| row.trim_end() == "line 100"),
+        "the end-of-buffer window follows the tail: {after:?}"
+    );
+    // The non-end window was left alone: its rows did not move. This fails if
+    // `follow_tail` ever scrolled windows whose point is not at end-of-buffer
+    // (dropping the guard scrolls the upper window to the tail; its parked
+    // point is then re-centred, so `line 050` no longer sits on the top row).
+    let upper_text_rows = 5;
+    assert_eq!(
+        &after[..upper_text_rows],
+        &before[..upper_text_rows],
+        "the non-end window stays put"
+    );
+}
+
+#[test]
 fn same_size_rewrite_is_replaced() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("a.txt");
