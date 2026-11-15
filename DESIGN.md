@@ -44,7 +44,7 @@ Client/server is the architecture from milestone 1, inspired by [herdr](https://
 - Filesystem watching via `notify` (inotify on Linux).
 - **Network and FUSE filesystems** (NFS, SMB, sshfs), where inotify misses changes: the filesystem type is detected with `statfs`. On those, only files with open buffers are polled (default every 2 s, configurable), and the tree panel refreshes on focus or on request, never by polling. The modeline shows that the buffer is polled. Settle detection tolerates coarse mtimes there by also comparing size and a tail hash.
 - **Unmodified buffer:** reload silently (after settle), preserving cursor position (anchored by line and surrounding context) and scroll.
-- **Modified buffer + disk change:** non-destructive conflict handling. Show an indicator in the modeline and offer `diff`, `reload (discard mine)`, or `keep mine`. Three-way merge against the last-saved base is deferred to a later milestone.
+- **Modified buffer + disk change:** non-destructive conflict handling. Show an indicator in the modeline and offer `diff`, `reload (discard mine)`, or `keep mine`. Three-way merge is out of scope (VISION.md Non-Goals).
 - **Append-only growth:** treat a change as an append only when the inode is unchanged, the size grew, and a hash of the last 64 KB before the old end of file is unchanged. Then extend the buffer without re-reading; auto-scroll if the cursor is at the end (follow mode). Anything else is a full reload.
 - **Handles** atomic-replace saves (write-temp-and-rename), truncation (including `copytruncate` log rotation), deletion, and rename. A deleted file keeps its buffer and is flagged.
 - **Our own saves** are recognized and never trigger a reload loop.
@@ -60,7 +60,7 @@ Client/server is the architecture from milestone 1, inspired by [herdr](https://
 - **Minibuffer completion:** vertical incremental completion in the style of `fido-vertical-mode` / vertico. Candidates are listed vertically and narrow as you type; `RET` accepts. Vanilla Emacs completion is not emulated. Used by `C-x C-f`, `C-x b`, and `M-x` (a command palette over the built-in command set). History per prompt.
 - **Universal argument** (`C-u`), keyboard macros (`C-x ( ) e`), `C-g` always aborts.
 - **Undo follows Emacs's model:** undo is itself undoable, and `C-g` (or any non-undo command) breaks the undo chain. `undo-redo` (Emacs 28) is also provided. Undo history is memory-bounded for huge files.
-- **Syntax-aware commands** that Emacs gets from major modes (`TAB` indentation, `M-;` comment, `C-M-f/b` sexp movement, `M-q` fill) come from built-in per-language rules and tree-sitter, since there is no Lisp. These sit in tier 2 of the command list.
+- **Syntax-aware commands** that Emacs gets from major modes (`TAB` indentation, `M-;` comment) come from built-in per-language rules and tree-sitter, since there is no Lisp. These sit in tier 2 of the command list. Sexp movement (`C-M-f/b`) and filling (`M-q`) are out of scope.
 - **Keybindings are data:** a default Emacs keymap, user-overridable via TOML. Defaults avoid stealing Emacs prefixes: the tree panel toggles with `F8` and `M-x toggle-tree`, not `C-x t` (Emacs's tab-bar prefix).
 
 ## 5. Large File Support
@@ -92,7 +92,7 @@ A side-panel file tree drawn in the terminal: a persistent, resizable column on 
 - "Changed externally" markers (section 1) shown alongside git status.
 - Opens files into the active window; preview-on-select optional.
 - Fuzzy file finder (`C-x C-f` completion and a project-wide quick-open) shares the same index.
-- **Mouse support is opt-in** (click, scroll, resize). Enabling mouse reporting takes over the terminal's native drag-to-select, which users rely on over SSH; Emacs `-nw` leaves `xterm-mouse-mode` off for the same reason. When enabled, Shift-drag bypass is documented.
+- Clicking a file opens it; clicking a directory expands or collapses it; dragging the panel's edge resizes it (section 7, Mouse).
 
 ## 7. Editing Fundamentals
 
@@ -103,7 +103,8 @@ A side-panel file tree drawn in the terminal: a persistent, resizable column on 
 - Auto-save and recovery files.
 - **Clipboard via OSC 52, kill ring to system clipboard only.** Most terminals block or don't support reading the clipboard through OSC 52, so syncing from the system clipboard into the kill ring is not promised. Inside tmux, the default `set-clipboard external` ignores OSC 52 from programs, so users need `set -g set-clipboard on`; this is documented.
 - Line endings, tabs/spaces, trailing whitespace, and final-newline handling configurable per file type.
-- Tree-sitter syntax highlighting, auto-indent, and bracket matching (bundled grammars for a defined language set). LSP client (diagnostics, go-to-definition) as a later, optional layer.
+- Tree-sitter syntax highlighting, auto-indent, and bracket matching (bundled grammars for a defined language set), within the highlighting budget and limits of section 5. No LSP client (VISION.md Non-Goals).
+- **Mouse:** click to place point and select a window, drag to set the region, double- and triple-click to select a word or line, wheel scrolling, clicking the modeline to select a window, dragging window dividers and the panel edge to resize, and clicks in the file panel. Decoded as SGR mouse reports (mode 1006) through the same pluggable input interface as keys, so it works in every supported terminal, including tmux and screen with their mouse options on. Mouse reporting is opt-in (`mouse = true`, or `M-x xterm-mouse-mode` for the session), because it takes over the terminal's native drag-to-select, which users rely on over SSH; Emacs `-nw` leaves `xterm-mouse-mode` off for the same reason. When enabled, the Shift-drag bypass is documented.
 
 ## 8. Performance Principles
 
@@ -170,12 +171,14 @@ The author's usual stack is Go. Rust is chosen here for `regex-automata` (revers
 
 ## 10. Testing
 
-- **Tiered command list.** Tier 1: the everyday commands in section 4, which must match Emacs exactly. Tier 2: syntax-aware commands (indentation, comments, sexp movement, fill), which must match closely for supported languages. Tier 3: everything else, best effort.
+- **Tiered command list.** Tier 1: the everyday commands in section 4, which must match Emacs exactly. Tier 2: syntax-aware commands (indentation, comments), which must match closely for supported languages. Tier 3: any other Emacs command `emx` implements, best effort. Commands listed as out of scope in VISION.md are not implemented at any tier.
 - **Differential testing against real Emacs.** For each command test, run the same keystroke sequence through `emacs --batch -Q` with `execute-kbd-macro` and through `emx`, then compare buffer contents, point, mark, and kill ring. The tier-1 pass rate is a CI-enforced number; this turns "Emacs-native feel" into a measurement.
 - **Property tests and fuzzing** of the piece tree (random edit sequences against a naive reference), the line indexer, and the reload/conflict logic (random interleavings of user edits and external writes, asserting Goal 1: no content lost).
 - **Terminal matrix, phased.** Keyboard input decoding sits behind a configurable interface so new encodings can be added without touching the command layer.
   - **First release (M1-M4):** terminals that speak the Kitty keyboard protocol (Kitty, WezTerm, Ghostty, foot), tested in CI. Other terminals are unsupported in this release: at startup `emx` queries for the protocol and, if the terminal does not answer, exits with an error naming the supported terminals.
-  - **Later releases:** legacy Linux terminals (GNOME Terminal, Konsole, Alacritty, xterm, Linux console), tmux and screen (where the Kitty protocol often does not pass through, so legacy decoding applies even inside a Kitty terminal), and macOS Terminal.app and iTerm2. Each joins the CI matrix when it lands.
+  - **Next release (M5):** legacy Linux terminals (GNOME Terminal, Alacritty, xterm, Linux console) and tmux and screen (where the Kitty protocol often does not pass through, so legacy decoding applies even inside a Kitty terminal). The startup check stops being fatal: a terminal that does not answer the Kitty query falls back to legacy decoding. Each terminal joins the CI matrix when it lands.
+  - **Later (M8):** macOS Terminal.app and iTerm2.
+  - **Not supported:** Konsole. It is not in the CI matrix and its quirks are not worked around.
 
 ## 11. Configuration
 
@@ -186,18 +189,20 @@ The author's usual stack is Go. Rust is chosen here for `regex-automata` (revers
 
 ## 12. Milestones
 
-The **first release** is M1 through M4: the first build others are asked to use daily. It supports Kitty-protocol terminals only. M5 onward, plus the remaining terminal phases, ship in later releases. Dogfooding starts after M2.
+The **first release** is M1 through M4: the first build others are asked to use daily. It supports Kitty-protocol terminals only. The **next release** is M5 through M7: Linux terminal coverage, the file panel with mouse support, and syntax highlighting. M8 onward ship after that. Dogfooding starts after M2.
+
+Revised 2026-11-15: terminal coverage moved ahead of the file panel; mouse support widened from the panel to the whole editor; sexp movement, fill, the help system, version control, running programs, LSP, and three-way merge moved out of scope (VISION.md Non-Goals).
 
 1. **Core and server.** Piece tree over the `pread` block cache, byte-oriented storage, client/server split with per-client windows and point, `--no-server` mode, daemon lifetime rules, edit journal with crash replay, terminal renderer with control-character escaping, Kitty keyboard protocol decoding behind a pluggable input interface, basic movement and editing, open/save with the save policy, kill ring, Emacs-model undo, protocol v1 (`open`, `--wait`, `events`), UID-keyed sockets, auto-save, and the differential-testing harness.
 2. **External edits and live reload.** Watcher with settle detection, append detection, conflict UX (diff / reload / keep mine), atomic-save and truncation handling, network-filesystem detection and polling of open buffers, undoable reloads with the save-after-undo warning, change markers, `diff-external`, multi-file summary notifications, follow-edit mode.
 3. **Emacs tier-1 parity.** Full tier-1 keymap, vertical minibuffer completion, incremental search, query-replace, marks, regions, registers, windows, macros, universal argument.
 4. **Large files.** Background line indexer, column checkpoints, streaming search with reverse DFA, long-line handling, tail/follow mode, benchmark suite with cold-cache and aarch64 runs.
-5. **File panel.** Lazy tree, gitignore, `gix` git status, change markers, file operations, quick-open, opt-in mouse.
-6. **Syntax-aware editing.** Tree-sitter highlighting and the tier-2 commands (indentation, comments, sexp movement, fill) for the bundled language set.
-7. **Terminal coverage.** Legacy key decoding; legacy Linux terminals, tmux and screen, and macOS Terminal.app and iTerm2 added to the CI matrix.
-8. **Polish.** OSC 52 clipboard, themes, ANSI-color log view, encoding detection, binary-file view, per-filetype line-ending/tab/whitespace handling, packaging (static musl builds with `mimalloc`, `.deb`).
+5. **Linux terminal coverage.** Legacy key decoding with non-fatal fallback from the Kitty protocol; GNOME Terminal, Alacritty, xterm, the Linux console, tmux, and screen added to the CI matrix.
+6. **File panel and mouse.** Lazy tree, gitignore, `gix` git status markers, change markers, file operations, quick-open; opt-in mouse support across windows, the minibuffer, and the panel (section 7).
+7. **Syntax highlighting.** Tree-sitter highlighting, bracket matching, and the tier-2 commands (`TAB` indentation, `M-;` comments) for the bundled language set.
+8. **Polish.** macOS Terminal.app and iTerm2, OSC 52 clipboard, themes, ANSI-color log view, encoding detection, binary-file view, per-filetype line-ending/tab/whitespace handling. (Packaging, static musl builds with `mimalloc` and `.deb`, shipped early with the first release.)
 9. **Agent patch API.** `emx apply-patch` with clean failure on mismatched hunks.
-10. **Later / optional.** LSP client, three-way merge for conflicts, rectangle editing enhancements, remote file support.
+10. **Later / optional.** Rectangle editing enhancements, remote file support.
 
 TOML config is not a polish item: it lands incrementally from M1 as each configurable value appears.
 
