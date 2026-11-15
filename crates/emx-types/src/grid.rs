@@ -39,6 +39,13 @@ pub enum Face {
     /// Emacs `show-paren-match` and `show-paren-mismatch`.
     ShowParenMatch,
     ShowParenMismatch,
+    /// Text colored by ANSI SGR codes (`ansi-color-mode`): the 16 colors
+    /// 0-15, or 16 for the terminal's default.
+    Ansi {
+        foreground: u8,
+        background: u8,
+        bold: bool,
+    },
 }
 
 impl Face {
@@ -106,6 +113,7 @@ impl Face {
             Face::Preprocessor => "preprocessor",
             Face::ShowParenMatch => "show_paren_match",
             Face::ShowParenMismatch => "show_paren_mismatch",
+            Face::Ansi { .. } => "ansi",
         }
     }
 

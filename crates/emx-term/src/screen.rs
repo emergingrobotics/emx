@@ -61,6 +61,8 @@ pub fn face_sgr(face: Face) -> &'static str {
         Face::Preprocessor => "0;95",
         Face::ShowParenMatch => "0;30;46",
         Face::ShowParenMismatch => "0;97;45",
+        // Built from the colors by `Theme::sgr`.
+        Face::Ansi { .. } => "0",
     }
 }
 
@@ -141,8 +143,33 @@ impl Theme {
         Ok(())
     }
 
-    pub fn sgr(&self, face: Face) -> &str {
-        &self.sgr[index(face)]
+    pub fn sgr(&self, face: Face) -> std::borrow::Cow<'_, str> {
+        match face {
+            Face::Ansi {
+                foreground,
+                background,
+                bold,
+            } => {
+                let mut parameters = String::from("0");
+                if bold {
+                    parameters.push_str(";1");
+                }
+                // The 16 colors as SGR 30-37 and 90-97, 40-47 and 100-107.
+                let code = |color: u8, base: u8, bright: u8| match color {
+                    0..=7 => Some(base + color),
+                    8..=15 => Some(bright + color - 8),
+                    _ => None,
+                };
+                if let Some(code) = code(foreground, 30, 90) {
+                    parameters.push_str(&format!(";{code}"));
+                }
+                if let Some(code) = code(background, 40, 100) {
+                    parameters.push_str(&format!(";{code}"));
+                }
+                std::borrow::Cow::Owned(parameters)
+            }
+            face => std::borrow::Cow::Borrowed(&self.sgr[index(face)]),
+        }
     }
 }
 

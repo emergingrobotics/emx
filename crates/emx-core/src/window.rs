@@ -1088,6 +1088,20 @@ impl LineWalker<'_, '_> {
         ControlFlow::Continue(at)
     }
 
+    /// A unit that takes no room: point can be on it, where the next
+    /// shown glyph is.
+    fn hidden(&mut self, pos: u64) -> ControlFlow<()> {
+        let col = match self.hscroll {
+            Some(hscroll) => self.truncated_place(hscroll, self.x, 0).0,
+            None => self.x,
+        };
+        (self.visit)(&LineEvent::Unit {
+            pos,
+            row: self.row,
+            col,
+        })
+    }
+
     fn unit(&mut self, pos: u64, bytes: &[u8], unit: DisplayUnit) -> ControlFlow<()> {
         let column = self.continued_columns + self.x as u64;
         let tab_width = self.tab_width;
@@ -1218,6 +1232,8 @@ pub(crate) struct Layout<'a> {
     /// `Some` for a window that truncates lines: how far it is scrolled
     /// to the left.
     hscroll: Option<u64>,
+    /// `ansi-color-mode`: SGR sequences take no room.
+    ansi: bool,
 }
 
 impl<'a> Layout<'a> {
@@ -1228,7 +1244,14 @@ impl<'a> Layout<'a> {
             cols,
             tab_width,
             hscroll: None,
+            ansi: false,
         }
+    }
+
+    /// The same layout with SGR sequences hidden when `ansi`.
+    pub(crate) fn with_ansi(mut self, ansi: bool) -> Layout<'a> {
+        self.ansi = ansi;
+        self
     }
 
     /// Lines are truncated at the window's edges (Emacs `truncate-lines`),
@@ -1244,6 +1267,7 @@ impl<'a> Layout<'a> {
             cols,
             tab_width,
             hscroll: Some(hscroll),
+            ansi: false,
         }
     }
 
@@ -1301,9 +1325,19 @@ impl<'a> Layout<'a> {
                     .rposition(|(offset, _)| *offset < settled)
                     .unwrap_or(0)
             };
+            let hidden = if self.ansi {
+                crate::ansi::sgr_sequences(segment)
+            } else {
+                Vec::new()
+            };
             for (offset, unit) in &units[..usable] {
                 let unit_pos = pos + *offset as u64;
-                if walker.unit(unit_pos, &segment[*offset..], *unit).is_break() {
+                let flow = if hidden.iter().any(|range| range.contains(offset)) {
+                    walker.hidden(unit_pos)
+                } else {
+                    walker.unit(unit_pos, &segment[*offset..], *unit)
+                };
+                if flow.is_break() {
                     return Ok(());
                 }
             }

@@ -55,6 +55,8 @@ const MODELINE_POLLED: &str = "[poll] ";
 const MODELINE_LOADING: &str = " Loading";
 /// Added to the mode name while `auto-revert-tail-mode` is on.
 const MODELINE_TAIL: &str = " Tail";
+/// Added to the mode name while `ansi-color-mode` is on.
+const MODELINE_ANSI: &str = " ANSI";
 /// The vertical border between side-by-side windows on a terminal.
 const VERTICAL_BORDER_GLYPH: &str = "|";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
@@ -171,7 +173,13 @@ fn draw_window(
             )
         })
         .flatten();
+    let ansi = if buffer.ansi {
+        ansi_colors(&buffer.text, start.line_start)
+    } else {
+        Vec::new()
+    };
     let marks = Marks {
+        ansi,
         parens,
         faces: &buffer.faces,
         region: active_region(buffer, point),
@@ -262,6 +270,8 @@ fn draw_window(
 
 /// The parts of a window's text drawn in another face.
 struct Marks<'a> {
+    /// `ansi-color-mode`'s colors, sorted.
+    ansi: Vec<(Range<u64>, Face)>,
     /// `show-paren-mode`'s parens, drawn over the region (its overlay
     /// priority is higher).
     parens: Option<ParenMatch>,
@@ -338,6 +348,29 @@ fn search_marks(
     SearchMarks { current, lazy }
 }
 
+/// How far past a window's start `ansi-color-mode` colors text: well past
+/// what any terminal window shows.
+const ANSI_SCAN_BYTES: u64 = 256 * 1024;
+
+/// The colors SGR sequences give the text from `from` on, as far as it is
+/// cached; colors start plain at `from`.
+fn ansi_colors(text: &emx_text::Text, from: u64) -> Vec<(Range<u64>, Face)> {
+    let end = text.len().min(from.saturating_add(ANSI_SCAN_BYTES));
+    let mut bytes = Vec::new();
+    if text.read_cached(from..end, &mut bytes).is_err() {
+        return Vec::new();
+    }
+    crate::ansi::ansi_faces(&bytes, from)
+}
+
+fn ansi_face(spans: &[(Range<u64>, Face)], pos: u64) -> Option<Face> {
+    let index = spans.partition_point(|(range, _)| range.end <= pos);
+    spans
+        .get(index)
+        .filter(|(range, _)| range.start <= pos)
+        .map(|(_, face)| *face)
+}
+
 /// The region Transient Mark mode highlights, between point and an
 /// active mark.
 fn active_region(buffer: &Buffer, point: u64) -> Option<Range<u64>> {
@@ -391,6 +424,8 @@ fn draw_event(
                 Face::Region
             } else if *escape {
                 Face::EscapeGlyph
+            } else if let Some(face) = ansi_face(&marks.ansi, *unit) {
+                face
             } else {
                 marks.faces.face_at(*unit).unwrap_or(Face::Default)
             };
@@ -661,7 +696,8 @@ fn draw_modeline(writer: &mut RowWriter, modeline: &Modeline) {
     writer.write(MODELINE_MODES_GAP.as_bytes(), face, face);
     let loading = if buffer.loading { MODELINE_LOADING } else { "" };
     let tail = if buffer.tail { MODELINE_TAIL } else { "" };
-    let modes = format!("({}{loading}{tail}) ", buffer.mode_name());
+    let ansi = if buffer.ansi { MODELINE_ANSI } else { "" };
+    let modes = format!("({}{loading}{tail}{ansi}) ", buffer.mode_name());
     writer.write(modes.as_bytes(), face, face);
     if buffer.damaged {
         writer.write(MODELINE_DAMAGED.as_bytes(), face, face);

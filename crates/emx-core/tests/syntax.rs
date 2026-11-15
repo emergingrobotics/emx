@@ -199,3 +199,37 @@ fn file_types_set_tab_width_and_save_time_cleanups() {
     let harness = open_with(directory.path(), "b.txt", "\tx  ", config);
     assert_eq!(harness.screen()[0].trim_end(), "        x");
 }
+
+#[test]
+fn ansi_color_mode_hides_sgr_codes_and_colors_the_text() {
+    let mut harness = Harness::with_text("|ok \u{1b}[31merror\u{1b}[0m done\nnext");
+    assert!(harness.screen()[0].starts_with("ok ^[[31merror"));
+    harness.keys("M-x");
+    harness.type_text("ansi-color-mode");
+    harness.keys("RET");
+    assert!(harness.echo().contains("Ansi-Color mode enabled"));
+    assert_eq!(harness.screen()[0].trim_end(), "ok error done");
+    let row = harness.grid().row(0).to_vec();
+    assert_eq!(row[0].face, Face::Default);
+    assert_eq!(
+        row[3].face,
+        Face::Ansi {
+            foreground: 1,
+            background: 16,
+            bold: false
+        }
+    );
+    assert_eq!(row[9].face, Face::Default, "reset");
+    assert!(
+        harness.screen()[22].contains("ANSI"),
+        "{:?}",
+        harness.screen()[22]
+    );
+    // The cursor skips over the hidden codes' columns: C-n keeps the column.
+    harness.keys("C-e C-p C-n");
+    assert_eq!(
+        harness.text(),
+        "ok \u{1b}[31merror\u{1b}[0m done\nnext",
+        "unchanged"
+    );
+}

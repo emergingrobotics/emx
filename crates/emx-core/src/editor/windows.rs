@@ -733,11 +733,13 @@ impl Editor {
     ) -> Layout<'t> {
         let (cols, _) = self.window_size(client, window);
         let reader = Reader::new(text, fetch);
-        let tab_width = self.buffer_tab_width(self.window(client, window).buffer);
-        match self.window_hscroll(client, window) {
+        let buffer = self.window(client, window).buffer;
+        let tab_width = self.buffer_tab_width(buffer);
+        let layout = match self.window_hscroll(client, window) {
             Some(hscroll) => Layout::truncating(reader, cols, tab_width, hscroll),
             None => Layout::new(reader, cols, tab_width),
-        }
+        };
+        layout.with_ansi(self.buffers[buffer].ansi)
     }
 
     /// Emacs auto-hscroll (`hscroll_window_tree`, `hscroll-step` 0): a

@@ -259,6 +259,10 @@ static COMMANDS: &[CommandSpec] = &[
         run: misc::xterm_mouse_mode,
     },
     CommandSpec {
+        name: "ansi-color-mode",
+        run: misc::ansi_color_mode,
+    },
+    CommandSpec {
         name: "comment-dwim",
         run: syntax::comment_dwim,
     },

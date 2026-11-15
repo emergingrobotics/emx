@@ -275,6 +275,20 @@ pub(super) fn auto_revert_tail_mode(ctx: &mut CommandContext) -> Result<(), Comm
     Ok(())
 }
 
+/// `ansi-color-mode`, for the buffer: SGR color sequences are hidden and
+/// color the text after them; the text itself is unchanged.
+pub(super) fn ansi_color_mode(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let enabled = {
+        let buffer = ctx.buffer_mut();
+        buffer.ansi = !buffer.ansi;
+        buffer.ansi
+    };
+    ctx.request_full_redraw();
+    let state = if enabled { "enabled" } else { "disabled" };
+    ctx.message(format!("Ansi-Color mode {state} in current buffer"));
+    Ok(())
+}
+
 /// Emacs `xterm-mouse-mode`, global: every terminal client of the
 /// session reports the mouse, or stops.
 pub(super) fn xterm_mouse_mode(ctx: &mut CommandContext) -> Result<(), CommandError> {

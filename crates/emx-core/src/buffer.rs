@@ -242,6 +242,8 @@ pub struct Buffer {
     pub indexing: Option<IndexingProgress>,
     /// Progress of a save in flight, `None` when no save is running.
     pub saving_progress: Option<SaveProgress>,
+    /// `ansi-color-mode`: SGR sequences are hidden and color the text.
+    pub ansi: bool,
     /// Emacs `auto-revert-tail-mode`: follow appends to the visited file,
     /// keeping the end of the buffer in view like `tail -f`.
     pub tail: bool,
@@ -314,6 +316,7 @@ impl Buffer {
             indexing: None,
             saving_progress: None,
             tail: false,
+            ansi: false,
             coding: CodingMnemonic::Utf8,
             damaged: false,
             recovered: false,

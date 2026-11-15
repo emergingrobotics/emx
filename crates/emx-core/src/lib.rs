@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod ansi;
 pub mod autosave;
 mod buffer;
 pub mod command;
