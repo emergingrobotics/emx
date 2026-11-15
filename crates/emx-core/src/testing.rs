@@ -743,6 +743,27 @@ impl Harness {
         );
     }
 
+    /// For long-line windowing tests: the byte the renderer resolves the
+    /// window start to (its bounded checkpoint approximation), and the byte the
+    /// window start truly maps to when the line is laid out from its start.
+    /// They coincide for width-1 text and diverge for dense wide-character
+    /// lines (the deliberate, bounded render approximation).
+    pub fn window_start_approx_and_exact(&self) -> (u64, u64) {
+        use crate::window::Fetch;
+        let window = self.editor.selected_window_id(self.client);
+        let buffer = self.buffer();
+        let start = self.editor.window_start(self.client, window);
+        let layout = self
+            .editor
+            .window_layout(self.client, window, &buffer.text, Fetch::Io);
+        let exact = layout.row_start(start).expect("row start reads memory");
+        let approx = layout
+            .resolve_start(start, &buffer.checkpoints, &buffer.text)
+            .expect("resolve start reads memory")
+            .line_start;
+        (approx, exact)
+    }
+
     /// The client's frame as it is rendered now.
     pub fn grid(&self) -> Grid {
         render(&self.editor, self.client).0

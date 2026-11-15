@@ -1226,6 +1226,26 @@ impl<'a> Layout<'a> {
         if text_width == 0 {
             return Ok(start);
         }
+        // The exact byte where screen row `start.row` begins depends on the
+        // whole wrap history of the line: a width-2 grapheme that cannot fit
+        // the last text column wraps early, wasting up to one column per row,
+        // and that waste accumulates. A width-INDEPENDENT column checkpoint
+        // cannot encode where those wraps fall, so there is no bounded way to
+        // recover the exact row start from the column alone; computing it
+        // exactly would mean laying the line out from its start (unbounded).
+        //
+        // DELIBERATE DEVIATION (accepted under the project's "always
+        // responsive > Emacs fidelity" goal ranking; see VISION Goal 2): the
+        // start is approximated as the grapheme boundary at display column
+        // `start.row * text_width`, read within the bounded checkpoint budget.
+        // For width-1 text this is exact. For mixed text it is off by the
+        // number of wide-grapheme-at-edge wraps in the scrolled-off prefix
+        // (zero for ordinary ASCII; a few columns for occasional CJK). Only a
+        // pathologically dense wide-character line drifts further: about one
+        // extra row per `text_width` scrolled rows. The frame is always a
+        // valid, correctly wrapped region of the line (never a panic or
+        // garbage), and the next event's `keep_point_visible` recenters on
+        // point, so the drift is transient. The read bound is never exceeded.
         let column = start.row.saturating_mul(text_width as u64);
         match checkpoints.seek_column_cached(text, start.line_start, column)? {
             Some(offset) => Ok(ScreenLine {
@@ -1268,6 +1288,19 @@ impl<'a> Layout<'a> {
     /// the text on the row, or the start of the next row when the row wraps
     /// before reaching the goal. Mirrors `move-to-column` within one screen
     /// row.
+    ///
+    /// DELIBERATE DEVIATION (accepted under the project's "always responsive >
+    /// Emacs fidelity" goal ranking): when `goal` reaches or passes a wrapped
+    /// row's width, point lands at the row's end, which is the first position
+    /// of the row below. That position's screen row is the row below, so a
+    /// following visual motion measured from it can revisit the same boundary
+    /// ("stick") instead of tracking Emacs's pixel-precise goal column across
+    /// the wrap. Emacs keeps the goal as a window x-coordinate carried by its
+    /// display engine; reproducing that here would need per-row layout state
+    /// this bounded, cached-read model does not keep. The landing is always a
+    /// valid buffer position on the line; only the exact column across a full
+    /// wrapped row differs from Emacs. `goal == text_width` is pinned by
+    /// `visual_line_goal_at_wrap_boundary` in tests/render.rs.
     pub(crate) fn position_on_row(&self, line: ScreenLine, goal: u64) -> Result<u64, ReadError> {
         let mut result = None;
         self.walk_line(line.line_start, &mut |event| {

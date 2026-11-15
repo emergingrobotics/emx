@@ -690,6 +690,83 @@ fn render_100mb_single_line_reads_bounded_bytes() {
 }
 
 #[test]
+fn visual_line_goal_at_wrap_boundary() {
+    // Pins the deliberate deviation at goal == text_width (see
+    // Layout::position_on_row): a nine-column line fills a nine-text-column
+    // window exactly, so its end sits at the text width.
+    let mut harness = sized(10, 8, "|012345678\nabcdefghijkl\nxyz");
+    harness.keys("C-e");
+    assert_eq!(
+        harness.point(),
+        9,
+        "end of a full row (goal column == text width)"
+    );
+    harness.keys("C-n");
+    // Goal 9 reaches past the wrapped second line's first row, so point lands
+    // at that row's end, which is the start of the row below.
+    assert_eq!(harness.point(), 19);
+    harness.keys("C-p");
+    // Deliberate "stick": measured from that boundary, moving up revisits it
+    // rather than tracking Emacs's pixel goal column.
+    assert_eq!(harness.point(), 19);
+    harness.keys("C-n");
+    assert_eq!(
+        harness.point(),
+        26,
+        "the next screen row, clamped to the short last line"
+    );
+}
+
+#[test]
+fn render_mid_wide_line_degrades_gracefully() {
+    // Width-1 long line: the bounded mid-line seek is exact.
+    let ascii = Text::from_original(Sources::memory(Arc::from(vec![b'x'; 60_000])));
+    let mut harness = Harness::new();
+    harness.buffer_mut().text = ascii;
+    harness.set_window_start_row(50);
+    let _ = render(harness.editor(), harness.client());
+    let (approx, exact) = harness.window_start_approx_and_exact();
+    assert_eq!(approx, exact, "width-1 content resolves the start exactly");
+
+    // Dense wide-character line: the seek is a bounded approximation. It is a
+    // valid grapheme boundary, at or past the exact row start, and the frame
+    // is well-formed (no panic, no garbage). The drift is pinned here.
+    let wide = Text::from_original(Sources::memory(Arc::from("中".repeat(20_000).into_bytes())));
+    let mut harness = Harness::new();
+    harness.buffer_mut().text = wide;
+    harness.set_window_start_row(50);
+    let _ = render(harness.editor(), harness.client());
+    let (approx, exact) = harness.window_start_approx_and_exact();
+    assert_eq!(
+        exact, 5850,
+        "true start of screen row 50 (39 wide chars per row)"
+    );
+    assert_eq!(
+        approx, 5925,
+        "bounded approximation: display column 50 * 79"
+    );
+    assert_eq!(approx % 3, 0, "the approximation is a grapheme boundary");
+    assert!(approx >= exact, "the view is shifted forward, never before");
+    // Drift here is 75 bytes = 25 wide chars ~= 0.6 of a screen row.
+    assert_eq!(approx - exact, 75);
+
+    // The frame is valid: the top row is wide chars then a continuation glyph,
+    // never raw or malformed, and point (left at the buffer start, off screen)
+    // shows no cursor.
+    let top = top_line(&harness);
+    assert!(
+        top.starts_with("中中中"),
+        "top row renders wide chars: {top:?}"
+    );
+    let grid = harness.grid();
+    assert!(
+        grid.cells.iter().all(|cell| cell.width <= 2),
+        "no malformed cells"
+    );
+    assert_eq!(harness.cursor(), None, "point is off screen");
+}
+
+#[test]
 fn visual_line_motion_in_wrapped_line() {
     // A 30-character line wraps across four rows of a 10-column window
     // (nine text columns per row), then a short line.
