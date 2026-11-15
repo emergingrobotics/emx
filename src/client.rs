@@ -21,13 +21,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use emx_core::KeyboardEncoding;
+use emx_core::{KeyboardEncoding, ThemeChoice};
 use emx_proto::{ClientKind, ClientMsg, LineReader, Request, ServerMsg, WirePath, write_msg};
 use emx_term::{
-    Decoder, InputEvent, KEYBOARD_ENV, Protocol, Screen, StdinSource, Terminal, keyboard_override,
-    mouse_sequence, probe_protocol,
+    Decoder, InputEvent, KEYBOARD_ENV, Protocol, Screen, StdinSource, Terminal, Theme, ThemeBase,
+    keyboard_override, mouse_sequence, probe_protocol,
 };
-use emx_types::{Grid, MouseButton, MouseEvent, MouseKind};
+use emx_types::{Face, Grid, MouseButton, MouseEvent, MouseKind};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
@@ -124,7 +124,7 @@ pub fn parse_file_arguments(arguments: &[OsString]) -> Vec<FileArgument> {
 /// Runs the terminal client of the session server.
 pub fn run(options: ClientOptions) -> anyhow::Result<ExitCode> {
     let files = parse_file_arguments(&options.files);
-    let keyboard = crate::server::load_config()?.keyboard_encoding;
+    let settings = ClientSettings::from_config(&crate::server::load_config()?)?;
     let socket = socket_path()?;
     // Connect before taking over the terminal, so a server that cannot
     // start is reported on a usable terminal.
@@ -138,7 +138,7 @@ pub fn run(options: ClientOptions) -> anyhow::Result<ExitCode> {
         events,
         &files,
         options.wait,
-        keyboard,
+        settings,
     )?;
     Ok(end.report())
 }
@@ -375,7 +375,7 @@ pub fn run_tui(
     events: Receiver<UiEvent>,
     files: &[FileArgument],
     wait: bool,
-    keyboard: KeyboardEncoding,
+    settings: ClientSettings,
 ) -> anyhow::Result<End> {
     // Registered before the terminal is taken over: from here on SIGTERM
     // and SIGWINCH queue until the client handles them, instead of killing
@@ -392,7 +392,7 @@ pub fn run_tui(
         Startup {
             files,
             wait,
-            keyboard,
+            settings,
         },
     );
     drop(terminal);
@@ -400,11 +400,36 @@ pub fn run_tui(
 }
 
 /// What the client starts with: the files to open, whether to wait for
-/// them, and the configured keyboard encoding.
+/// them, and the client's settings.
 struct Startup<'a> {
     files: &'a [FileArgument],
     wait: bool,
-    keyboard: KeyboardEncoding,
+    settings: ClientSettings,
+}
+
+/// What the terminal client takes from the config: how to read keys and
+/// the colors to draw with.
+pub struct ClientSettings {
+    pub keyboard: KeyboardEncoding,
+    pub theme: Theme,
+}
+
+impl ClientSettings {
+    pub fn from_config(config: &emx_core::Config) -> anyhow::Result<ClientSettings> {
+        let mut theme = Theme::new(match config.theme {
+            ThemeChoice::Dark => ThemeBase::Dark,
+            ThemeChoice::Light => ThemeBase::Light,
+        });
+        for (name, parameters) in &config.faces {
+            let face = Face::from_name(name)
+                .with_context(|| format!("the config names no face {name}"))?;
+            theme.set(face, parameters)?;
+        }
+        Ok(ClientSettings {
+            keyboard: config.keyboard_encoding,
+            theme,
+        })
+    }
 }
 
 fn session(
@@ -418,8 +443,9 @@ fn session(
     let Startup {
         files,
         wait,
-        keyboard,
+        settings,
     } = startup;
+    let ClientSettings { keyboard, theme } = settings;
     let mut input = StdinSource::new();
     let configured = match keyboard {
         KeyboardEncoding::Auto => None,
@@ -448,7 +474,7 @@ fn session(
     let mut client = Client {
         link,
         decoder,
-        display: Display::new(cols, rows),
+        display: Display::new(cols, rows, theme),
         mouse: false,
         clicks: ClickCounter::default(),
         cwd,
@@ -782,8 +808,7 @@ impl Client {
             if let Some(reconnected) = self.link.reconnect() {
                 return match reconnected {
                     Ok(()) => {
-                        let (cols, rows) = self.display.size();
-                        self.display = Display::new(cols, rows);
+                        self.display = self.display.fresh();
                         self.greet()
                     }
                     Err(error) => Some(End::failure(format!("{CONNECTION_LOST}: {error:#}"))),
@@ -886,14 +911,19 @@ struct Display {
 
 impl Display {
     /// The server's first frame for a client is always whole.
-    fn new(cols: u16, rows: u16) -> Display {
+    fn new(cols: u16, rows: u16, theme: Theme) -> Display {
         Display {
             cols,
             rows,
             grid: None,
-            screen: Screen::new(),
+            screen: Screen::with_theme(theme),
             whole_frame_due: true,
         }
+    }
+
+    /// A display of the same size and colors that has drawn nothing.
+    fn fresh(&self) -> Display {
+        Display::new(self.cols, self.rows, self.screen.theme().clone())
     }
 
     fn size(&self) -> (u16, u16) {
@@ -1061,7 +1091,7 @@ mod tests {
 
     #[test]
     fn whole_frames_then_diffs_are_drawn() {
-        let mut display = Display::new(4, 2);
+        let mut display = Display::new(4, 2, Theme::default());
         assert!(matches!(
             display.apply(&whole(4, 2, "ab")),
             FrameOutcome::Drawn(_)
@@ -1074,7 +1104,7 @@ mod tests {
 
     #[test]
     fn a_frame_for_another_size_is_refused_and_a_redraw_asked_once() {
-        let mut display = Display::new(4, 2);
+        let mut display = Display::new(4, 2, Theme::default());
         display.apply(&whole(4, 2, "ab"));
         assert_eq!(
             display.apply(&whole(5, 2, "ab")),
@@ -1102,7 +1132,7 @@ mod tests {
 
     #[test]
     fn malformed_frames_are_refused_never_drawn() {
-        let mut display = Display::new(4, 2);
+        let mut display = Display::new(4, 2, Theme::default());
         display.apply(&whole(4, 2, "ab"));
         let outside = ServerMsg::Frame {
             full: false,
@@ -1170,7 +1200,7 @@ mod tests {
 
     #[test]
     fn a_resize_waits_for_a_whole_frame_of_the_new_size() {
-        let mut display = Display::new(4, 2);
+        let mut display = Display::new(4, 2, Theme::default());
         display.apply(&whole(4, 2, "ab"));
         assert!(display.resize(6, 3));
         assert!(!display.resize(6, 3), "unchanged");

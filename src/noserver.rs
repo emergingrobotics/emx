@@ -45,7 +45,7 @@ const CLAIM_ATTEMPTS: usize = 16;
 
 pub fn run(files: &[OsString]) -> anyhow::Result<ExitCode> {
     let files = client::parse_file_arguments(files);
-    let keyboard = server::load_config()?.keyboard_encoding;
+    let settings = client::ClientSettings::from_config(&server::load_config()?)?;
     let terminal_stderr = divert_stderr()?;
     let (sender, events) = mpsc::channel();
     let mut started = None;
@@ -59,7 +59,7 @@ pub fn run(files: &[OsString]) -> anyhow::Result<ExitCode> {
         events,
         &files,
         false,
-        keyboard,
+        settings,
     );
     let finished = match started {
         Some(editor) => editor.finish(),

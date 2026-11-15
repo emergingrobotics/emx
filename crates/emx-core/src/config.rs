@@ -95,6 +95,15 @@ pub enum KeyboardEncoding {
     Legacy,
 }
 
+/// The built-in colors the terminal draws with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    #[default]
+    Dark,
+    Light,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -139,6 +148,9 @@ pub struct Config {
     pub show_paren_max_distance: u64,
     pub osc52_clipboard: bool,
     pub osc52_max_bytes: u64,
+    pub theme: ThemeChoice,
+    /// Face name to SGR parameters (`keyword = "1;34"`), over the theme's.
+    pub faces: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -182,6 +194,8 @@ impl Default for Config {
             show_paren_max_distance: SHOW_PAREN_MAX_DISTANCE,
             osc52_clipboard: OSC52_CLIPBOARD,
             osc52_max_bytes: OSC52_MAX_BYTES,
+            theme: ThemeChoice::Dark,
+            faces: BTreeMap::new(),
         }
     }
 }
@@ -291,6 +305,26 @@ impl Config {
                 key: "tab_width",
                 reason: format!("must be between 1 and {TAB_WIDTH_MAX}"),
             });
+        }
+        for (name, parameters) in &self.faces {
+            if emx_types::Face::from_name(name).is_none() {
+                return Err(InvalidSetting {
+                    key: "faces",
+                    reason: format!("has no face named {name}"),
+                });
+            }
+            let valid = !parameters.is_empty()
+                && parameters
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b';');
+            if !valid {
+                return Err(InvalidSetting {
+                    key: "faces",
+                    reason: format!(
+                        "{name}: {parameters:?} is not SGR parameters (digits and ';')"
+                    ),
+                });
+            }
         }
         if !(PANEL_WIDTH_MIN..=PANEL_WIDTH_MAX).contains(&self.panel_width) {
             return Err(InvalidSetting {
@@ -420,7 +454,8 @@ mod tests {
              keyboard_encoding = \"legacy\"\nmouse = true\nmouse_wheel_lines = 23\n\
              panel_width = 24\nquick_open_max_files = 25\nhighlight_max_file = 26\n\
              highlight_max_line = 27\nshow_paren_mode = false\nshow_paren_max_distance = 28\n\
-             osc52_clipboard = false\nosc52_max_bytes = 29\n",
+             osc52_clipboard = false\nosc52_max_bytes = 29\ntheme = \"light\"\n\
+             [faces]\nkeyword = \"1;34\"\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -462,6 +497,8 @@ mod tests {
             show_paren_max_distance: 28,
             osc52_clipboard: false,
             osc52_max_bytes: 29,
+            theme: ThemeChoice::Light,
+            faces: BTreeMap::from([("keyword".to_string(), "1;34".to_string())]),
         };
         assert_eq!(config, expected);
     }
@@ -569,6 +606,8 @@ mod tests {
             "mouse_wheel_lines"
         );
         assert_eq!(invalid_key("panel_width = 10\n"), "panel_width");
+        assert_eq!(invalid_key("[faces]\nkeywrd = \"1\"\n"), "faces");
+        assert_eq!(invalid_key("[faces]\nkeyword = \"1m\"\n"), "faces");
         assert_eq!(
             invalid_key("quick_open_max_files = 0\n"),
             "quick_open_max_files"

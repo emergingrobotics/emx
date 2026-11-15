@@ -33,7 +33,7 @@ pub use buffer::{
     IndexingProgress, SaveProgress,
 };
 pub use command::{CommandContext, CommandError, CommandSpec, PrefixArg};
-pub use config::{Config, ConfigError, InvalidSetting, KeyboardEncoding};
+pub use config::{Config, ConfigError, InvalidSetting, KeyboardEncoding, ThemeChoice};
 pub use editor::{Editor, Session};
 pub use event::{AutoSaveJob, ClientId, Effect, Event, ListingId, ReloadJob, SearchId, TimerId};
 pub use journal::JournalOutbox;

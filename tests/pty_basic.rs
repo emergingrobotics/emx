@@ -896,3 +896,23 @@ fn rust_files_are_highlighted_through_the_server() {
         thread::sleep(POLL);
     }
 }
+
+/// The config's theme and face colors reach the terminal.
+#[test]
+fn themes_and_face_colors_come_from_the_config() {
+    let env = TestEnv::with_config("theme = \"light\"\n[faces]\nkeyword = \"1;34\"\n");
+    let _reaper = SessionReaper::new(&env);
+    env.file("main.rs", "fn main() {}\n");
+    let pty = Pty::spawn(&env, &["--no-server", "main.rs"]);
+    pty.wait_modeline(|modeline| modeline.contains("(Rust)"));
+    let keyword = b"\x1b[0;1;34mfn";
+    let deadline = std::time::Instant::now() + WAIT;
+    while find(&pty.raw_output(), keyword).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            pty.raw_output_text()
+        );
+        thread::sleep(POLL);
+    }
+}

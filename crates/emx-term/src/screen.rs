@@ -64,14 +64,115 @@ pub fn face_sgr(face: Face) -> &'static str {
     }
 }
 
+/// For a terminal with a light background: the faces whose dark-theme
+/// colors would be hard to read on one, closer to Emacs's light defaults.
+fn light_sgr(face: Face) -> &'static str {
+    match face {
+        Face::Region => "0;30;43",
+        Face::String => "0;32",
+        Face::Keyword => "0;35",
+        Face::Type => "0;36",
+        Face::Function => "0;34",
+        Face::Variable => "0;33",
+        Face::Constant => "0;36",
+        Face::Builtin => "0;34",
+        Face::Preprocessor => "0;35",
+        Face::Warning => "0;1;31",
+        other => face_sgr(other),
+    }
+}
+
+/// Which built-in colors a theme starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeBase {
+    #[default]
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("face {face}: {value:?} is not SGR parameters (digits and ';')")]
+pub struct BadFaceSgr {
+    pub face: &'static str,
+    pub value: String,
+}
+
+/// The SGR parameters each face is drawn with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Theme {
+    sgr: Vec<String>,
+}
+
+impl Default for Theme {
+    fn default() -> Theme {
+        Theme::new(ThemeBase::Dark)
+    }
+}
+
+impl Theme {
+    pub fn new(base: ThemeBase) -> Theme {
+        let builtin = match base {
+            ThemeBase::Dark => face_sgr,
+            ThemeBase::Light => light_sgr,
+        };
+        Theme {
+            sgr: Face::ALL
+                .iter()
+                .map(|face| builtin(*face).to_string())
+                .collect(),
+        }
+    }
+
+    /// Draws `face` with `parameters` (as `1;34`), after a reset so it
+    /// inherits nothing. Only digits and `;` are taken: anything else could
+    /// smuggle other escape sequences to the terminal.
+    pub fn set(&mut self, face: Face, parameters: &str) -> Result<(), BadFaceSgr> {
+        let valid = !parameters.is_empty()
+            && parameters
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b';');
+        if !valid {
+            return Err(BadFaceSgr {
+                face: face.name(),
+                value: parameters.to_string(),
+            });
+        }
+        self.sgr[index(face)] = format!("0;{parameters}");
+        Ok(())
+    }
+
+    pub fn sgr(&self, face: Face) -> &str {
+        &self.sgr[index(face)]
+    }
+}
+
+fn index(face: Face) -> usize {
+    Face::ALL
+        .iter()
+        .position(|candidate| *candidate == face)
+        .expect("Face::ALL lists every face")
+}
+
 #[derive(Debug, Default)]
 pub struct Screen {
     current: Option<Grid>,
+    theme: Theme,
 }
 
 impl Screen {
     pub fn new() -> Screen {
         Screen::default()
+    }
+
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    pub fn with_theme(theme: Theme) -> Screen {
+        Screen {
+            current: None,
+            theme,
+        }
     }
 
     /// Forgets what the terminal shows, so the next draw repaints everything;
@@ -90,7 +191,7 @@ impl Screen {
             .filter(|current| current.cols == next.cols && current.rows == next.rows);
         out.extend_from_slice(HIDE_CURSOR);
         if previous.is_none() {
-            push_sgr(out, Face::Default);
+            push_sgr(out, &self.theme, Face::Default);
             out.extend_from_slice(CLEAR_SCREEN);
         }
         let mut last_face = None;
@@ -100,7 +201,7 @@ impl Screen {
                 Some(previous) => changed_columns(previous.row(row), cells),
                 None => vec![true; cells.len()],
             };
-            draw_row(row, cells, &changed, &mut last_face, out);
+            draw_row(row, cells, &changed, &mut last_face, &self.theme, out);
         }
         if let Some((col, row)) = next.cursor {
             push_goto(out, col, row);
@@ -186,6 +287,7 @@ fn draw_row(
     cells: &[Cell],
     changed: &[bool],
     last_face: &mut Option<Face>,
+    theme: &Theme,
     out: &mut Vec<u8>,
 ) {
     let mut positioned = false;
@@ -202,7 +304,7 @@ fn draw_row(
             push_goto(out, col, row);
         }
         if *last_face != Some(cell.face) {
-            push_sgr(out, cell.face);
+            push_sgr(out, theme, cell.face);
             *last_face = Some(cell.face);
         }
         positioned = push_cell_text(out, cell);
@@ -230,6 +332,6 @@ fn push_goto(out: &mut Vec<u8>, col: u16, row: u16) {
     );
 }
 
-fn push_sgr(out: &mut Vec<u8>, face: Face) {
-    out.extend_from_slice(format!("\x1b[{}m", face_sgr(face)).as_bytes());
+fn push_sgr(out: &mut Vec<u8>, theme: &Theme, face: Face) {
+    out.extend_from_slice(format!("\x1b[{}m", theme.sgr(face)).as_bytes());
 }

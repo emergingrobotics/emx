@@ -327,3 +327,31 @@ fn screen_invalidate_forces_full_redraw() {
     screen.invalidate();
     assert!(draw(&mut screen, &grid).contains(CLEAR));
 }
+
+#[test]
+fn themes_and_face_overrides() {
+    use emx_term::{Theme, ThemeBase};
+    let dark = Theme::new(ThemeBase::Dark);
+    let light = Theme::new(ThemeBase::Light);
+    assert_eq!(dark.sgr(Face::Keyword), face_sgr(Face::Keyword));
+    assert_ne!(light.sgr(Face::Keyword), dark.sgr(Face::Keyword));
+    assert_eq!(light.sgr(Face::ModeLine), dark.sgr(Face::ModeLine));
+    let mut custom = Theme::new(ThemeBase::Dark);
+    custom.set(Face::Keyword, "1;34").unwrap();
+    assert_eq!(custom.sgr(Face::Keyword), "0;1;34");
+    assert!(custom.set(Face::Keyword, "1m\x1b[2J").is_err());
+    assert!(custom.set(Face::Keyword, "").is_err());
+    let mut grid = Grid::new(2, 1);
+    grid.set(
+        0,
+        0,
+        Cell {
+            text: "k".into(),
+            width: 1,
+            face: Face::Keyword,
+        },
+    );
+    let mut output = Vec::new();
+    Screen::with_theme(custom).draw(&grid, &mut output).unwrap();
+    assert!(String::from_utf8_lossy(&output).contains("\x1b[0;1;34mk"));
+}
