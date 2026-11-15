@@ -91,8 +91,17 @@ fn decode_legacy_control_bytes_as_ctrl_keys() {
 #[test]
 fn decode_plain_utf8_text() {
     assert_keys(
-        "aZ é€😀 %".as_bytes(),
-        &["a", "Z", "SPC", "é", "€", "😀", "SPC", "%"],
+        "aZ \u{e9}\u{20ac}\u{1f600} %".as_bytes(),
+        &[
+            "a",
+            "Z",
+            "SPC",
+            "\u{e9}",
+            "\u{20ac}",
+            "\u{1f600}",
+            "SPC",
+            "%",
+        ],
     );
     assert_eq!(
         decode(b"A"),
@@ -194,7 +203,7 @@ fn decode_terminal_replies() {
 fn decode_split_sequence_across_feeds() {
     let input: Vec<u8> = [
         b"\x1b[120;5u".as_slice(),
-        "é€😀".as_bytes(),
+        "\u{e9}\u{20ac}\u{1f600}".as_bytes(),
         b"\x1b[1;5A\x1bOP\x1b[24;5~\r",
         b"\x1b[200~a\r\nb\x1b[201~",
         b"\x1b[?1u\x1b[?62;22c",

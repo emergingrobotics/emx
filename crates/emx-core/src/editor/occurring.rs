@@ -55,6 +55,11 @@ pub(crate) struct OccurRequest {
 
 /// `next-single-property-change` over the matches in `*Occur*`: the first
 /// position after `from` whose "in a match" state differs from `from`'s.
+/// For an `*Occur*` buffer whose source is still alive: the source target of
+/// each of its lines (`None` for a context or header line) and the byte spans
+/// of the matches within its body.
+type OccurTargetsAndSpans = (Vec<Option<u64>>, Vec<Range<u64>>);
+
 fn next_change(spans: &[Range<u64>], from: u64, length: u64) -> Option<u64> {
     let inside = |position: u64| spans.iter().any(|span| span.contains(&position));
     let state = inside(from);
@@ -443,13 +448,12 @@ impl Editor {
     /// The text of `*Occur*` (`occur-engine`), the target of each of its
     /// lines in the source, the spans of the matches in it, and the number
     /// of matches.
-    #[allow(clippy::type_complexity)]
     fn occur_text(
         &self,
         request: &OccurRequest,
         lines: &[OccurLine],
         name: &str,
-    ) -> (Vec<u8>, Option<(Vec<Option<u64>>, Vec<Range<u64>>)>, u64) {
+    ) -> (Vec<u8>, Option<OccurTargetsAndSpans>, u64) {
         let context = lines
             .iter()
             .any(|line| !line.before.is_empty() || !line.after.is_empty());

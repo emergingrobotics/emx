@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use emx_core::io::load_file;
 use emx_core::testing::Harness;
 use emx_core::{BufferId, Config, Event, PrefetchRequest};
-use emx_text::{BLOCK_SIZE, BlockCache, Original, index_file};
+use emx_text::{BLOCK_SIZE, BlockCache, LineIndex, Original, index_file};
 
 /// One byte over the small-file threshold forces the block-cache path. The
 /// fixtures here are a few hundred KiB, so a tiny limit keeps them off the
@@ -144,6 +144,57 @@ fn large_file_opens_without_reading_whole() {
     assert!(
         loaded_at < complete_at,
         "the file opens before the index completes"
+    );
+}
+
+/// An append that lands while a large file is still being indexed must leave
+/// line numbers correct: the superseded indexer's count for the grown tail is
+/// refused, and the new indexer recounts it, so no stale count survives.
+#[test]
+fn append_during_indexing_recounts_without_a_stale_tail_count() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("appending.log");
+
+    // Two full blocks plus a partial third, so an append grows the tail block.
+    let before_lines = 2 * LINES_PER_BLOCK + 10;
+    fs::write(&path, fixed_width_lines(before_lines)).expect("write fixture");
+    let before_len = fs::metadata(&path).expect("stat").len();
+
+    let index = LineIndex::new(before_len);
+    // A background indexer starts on the pre-append file.
+    let stale_generation = index.generation();
+    let tail_block = before_len / BLOCK_SIZE as u64;
+    // The pre-append tail block holds the trailing partial lines.
+    let stale_tail_count = before_lines - tail_block * LINES_PER_BLOCK;
+
+    // The append grows the file; the tail block gains bytes and the index grows.
+    let appended_lines = LINES_PER_BLOCK + 5;
+    let mut grown = fixed_width_lines(before_lines);
+    grown.extend(fixed_width_lines(appended_lines));
+    fs::write(&path, &grown).expect("write appended fixture");
+    let after_len = fs::metadata(&path).expect("stat").len();
+    index.extend(after_len);
+
+    // The superseded indexer's late write for the now-grown tail arrives after
+    // the append. It must be ignored so the new indexer recounts the tail.
+    index.set_block_if_current(tail_block, stale_tail_count as u32, stale_generation);
+    assert_eq!(
+        index.get_block(tail_block),
+        None,
+        "the stale tail count must not survive the append"
+    );
+
+    // The new indexer recounts from scratch over the grown file.
+    let cache =
+        BlockCache::open(&path, Config::default().block_cache_bytes as usize).expect("open");
+    index_file(&cache, &index, &AtomicBool::new(false), &mut |_| {}).expect("reindex");
+    assert!(index.is_complete(), "the new indexer counts every block");
+    assert_eq!(
+        index
+            .count_range(&cache, 0..after_len)
+            .expect("count the whole file"),
+        Some(before_lines + appended_lines),
+        "line numbers are correct after the append"
     );
 }
 

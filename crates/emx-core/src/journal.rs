@@ -82,8 +82,13 @@ pub const LEFT_PARTLY_REWRITTEN: &str = "an in-place save left the file partly r
 pub struct JournalId(pub u128);
 
 impl JournalId {
-    /// Panics only if the kernel's random source fails, which Linux's
-    /// `getrandom` does not do for a 16-byte request once booted.
+    /// A failure here is a panic, by deliberate choice, not propagated as an
+    /// error: for a 16-byte request with no flags on a booted Linux, the
+    /// blocking `getrandom` cannot fail at runtime. `EINTR` is retried; the
+    /// only other errnos (`EFAULT`, `EINVAL`) signal a programming fault, not a
+    /// recoverable condition. So this is a true internal invariant, and
+    /// threading an error through the edit-journaling paths that call it (none
+    /// of which can recover from "no entropy") would add a dead error channel.
     pub fn random() -> JournalId {
         let mut bytes = [0u8; 16];
         let mut filled = 0;

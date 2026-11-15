@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use emx_text::BLOCK_SIZE;
 use emx_types::KbdError;
 use serde::Deserialize;
 
@@ -148,6 +149,8 @@ pub enum ConfigError {
         key: &'static str,
         reason: String,
     },
+    #[error("cannot determine the working directory: {source}")]
+    WorkingDirectory { source: io::Error },
     #[error("invalid key sequence {keys:?} in [keys]: {source}")]
     InvalidKey { keys: String, source: KbdError },
     #[error("unknown command {command:?} bound to {keys:?} in [keys]")]
@@ -221,6 +224,15 @@ impl Config {
                     reason: "must be greater than 0".to_string(),
                 });
             }
+        }
+        // A cache smaller than one block cannot hold even the block it just
+        // read, so every large-file open would fail. Reject it at startup
+        // rather than let it pass here and break the first large open.
+        if self.block_cache_bytes < BLOCK_SIZE as u64 {
+            return Err(InvalidSetting {
+                key: "block_cache_bytes",
+                reason: format!("must be at least one block ({BLOCK_SIZE})"),
+            });
         }
         if !(1..=TAB_WIDTH_MAX).contains(&self.tab_width) {
             return Err(InvalidSetting {
@@ -320,7 +332,7 @@ mod tests {
     #[test]
     fn every_group_is_overridable() {
         let config = load_str(
-            "in_memory_max = 1\nblock_cache_bytes = 2\nsearch_match_cap = 3\n\
+            "in_memory_max = 1\nblock_cache_bytes = 65536\nsearch_match_cap = 3\n\
              append_tail_hash_bytes = 4\nsettle_window_ms = 5\npoll_interval_ms = 6\n\
              journal_fsync_ms = 7\njournal_snapshot_max = 8\nlarge_save_warn = 9\n\
              daemon_grace_ms = 10\nundo_limit = 11\nundo_strong_limit = 12\n\
@@ -334,7 +346,7 @@ mod tests {
         let expected = Config {
             keys: BTreeMap::new(),
             in_memory_max: 1,
-            block_cache_bytes: 2,
+            block_cache_bytes: 65536,
             search_match_cap: 3,
             append_tail_hash_bytes: 4,
             settle_window_ms: 5,
@@ -416,6 +428,21 @@ mod tests {
         }
         let error = load_str("poll_interval_ms = 0\n").expect_err("rejected");
         assert!(error.to_string().contains("poll_interval_ms"), "{error}");
+    }
+
+    #[test]
+    fn block_cache_bytes_below_one_block_is_rejected() {
+        // A positive value under one block passes the nonzero check but would
+        // break every large-file open, so validate() must reject it by name.
+        let key = invalid_key(&format!("block_cache_bytes = {}\n", BLOCK_SIZE - 1));
+        assert_eq!(key, "block_cache_bytes");
+        let error = load_str(&format!("block_cache_bytes = {}\n", BLOCK_SIZE - 1))
+            .expect_err("sub-block cache rejected");
+        assert!(error.to_string().contains("block_cache_bytes"), "{error}");
+        assert!(
+            load_str(&format!("block_cache_bytes = {BLOCK_SIZE}\n")).is_ok(),
+            "exactly one block is valid"
+        );
     }
 
     #[test]

@@ -352,6 +352,11 @@ impl Editor {
         keymap.apply_overrides(&config.keys)?;
         let kill_ring_max =
             usize::try_from(config.kill_ring_max).expect("kill_ring_max fits in usize");
+        // The working directory seeds file prompts. A failure to read it (the
+        // directory was removed, or is unreadable) is an environment fault
+        // surfaced at startup, not silently masked by rooting prompts at "/".
+        let default_directory =
+            std::env::current_dir().map_err(|source| ConfigError::WorkingDirectory { source })?;
         let mut editor = Editor {
             keymap,
             buffers: SlotMap::with_key(),
@@ -366,9 +371,7 @@ impl Editor {
             session,
             next_frame_number: FIRST_SERVER_FRAME,
             histories: Histories::default(),
-            // A working directory that no longer exists leaves only the
-            // root to offer as a starting point in file prompts.
-            default_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            default_directory,
             recency: Vec::new(),
             pending_loads: HashMap::new(),
             pending_saves: HashMap::new(),

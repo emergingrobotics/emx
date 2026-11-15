@@ -32,7 +32,16 @@ pub(crate) enum BlockReader<'source> {
     /// Fails with `NotCached` instead of reading the file.
     CacheOnly(&'source BlockCache),
     Memory(&'source Arc<[u8]>),
+    /// Test support: serves a block's bytes through a closure, so a test can
+    /// observe the lock state at the moment of a read.
+    #[cfg(test)]
+    Probe(&'source ProbeRead<'source>),
 }
+
+/// A `BlockReader::Probe` closure: it returns a block's bytes and the offset of
+/// the block within them, exactly as the real readers do.
+#[cfg(test)]
+type ProbeRead<'a> = dyn Fn(u64, u64) -> Result<(Arc<[u8]>, usize), ReadError> + 'a;
 
 impl BlockReader<'_> {
     /// The block's bytes and the offset of the block inside them.
@@ -46,6 +55,8 @@ impl BlockReader<'_> {
                 0,
             ),
             BlockReader::Memory(bytes) => ((*bytes).clone(), block_slot(block) * BLOCK_SIZE),
+            #[cfg(test)]
+            BlockReader::Probe(probe) => probe(block, file_len)?,
         };
         assert!(
             offset as u64 + block_length(block, file_len) <= data.len() as u64,
@@ -130,6 +141,11 @@ struct IndexState {
     /// One per unknown block, so "is any block in this range unknown" is O(log n).
     unknown_blocks: Fenwick,
     indexed_prefix: u64,
+    /// Bumped by every `extend`. An indexer captures the generation it started
+    /// on; a block count it computed before an append is refused afterwards, so
+    /// a superseded indexer cannot write a stale count over a block the append
+    /// invalidated.
+    generation: u64,
 }
 
 fn known_value(count: u32) -> u64 {
@@ -152,9 +168,24 @@ impl IndexState {
             unknown_blocks: Fenwick::from_values(counts.iter().map(|&count| unknown_value(count))),
             counts,
             indexed_prefix: 0,
+            generation: 0,
         };
         state.advance_prefix();
         state
+    }
+
+    /// Writes one block's newline count and advances the indexed prefix.
+    fn write_block(&mut self, block: u64, newlines: u32) {
+        assert!(
+            newlines as usize <= BLOCK_SIZE,
+            "a block holds at most BLOCK_SIZE newlines"
+        );
+        assert!(
+            block < self.counts.len() as u64,
+            "block {block} is inside the indexed file"
+        );
+        self.set_count(block, newlines);
+        self.advance_prefix();
     }
 
     fn count(&self, block: u64) -> Option<u32> {
@@ -202,35 +233,57 @@ impl IndexState {
         }
     }
 
-    fn span_count(&self, reader: BlockReader<'_>, span: &BlockSpan) -> Result<u64, ReadError> {
-        let count = self.count(span.block).expect("span block is indexed");
-        if span.covers_block {
-            return Ok(u64::from(count));
-        }
-        let (data, offset) = reader.read(span.block, self.file_len)?;
-        Ok(count_newlines(span_bytes(&data, offset, span)))
-    }
-
-    /// Looks for newline ordinal `remaining` inside `span`; on a miss returns
-    /// how many newlines the span holds.
-    fn span_nth(
-        &self,
-        reader: BlockReader<'_>,
-        span: &BlockSpan,
-        remaining: u64,
-    ) -> Result<Result<u64, u64>, ReadError> {
+    /// Plans a block's contribution to a range under the lock, so the read it
+    /// may need can happen after the lock is released.
+    fn span_plan(&self, block: u64, range: &Range<u64>) -> SpanPlan {
+        let span = self.span(block, range);
         let count = u64::from(self.count(span.block).expect("span block is indexed"));
-        if span.covers_block && remaining >= count {
-            return Ok(Err(count));
-        }
-        let (data, offset) = reader.read(span.block, self.file_len)?;
-        let bytes = span_bytes(&data, offset, span);
-        let skip = usize::try_from(remaining).expect("ordinal fits in memory");
-        Ok(match memchr::memchr_iter(b'\n', bytes).nth(skip) {
-            Some(position) => Ok(span.start + position as u64),
-            None => Err(count_newlines(bytes)),
-        })
+        SpanPlan { span, count }
     }
+}
+
+/// A block's share of a range, with its stored newline count, planned under the
+/// `state` lock. The read a partial span needs is done through `reader` after
+/// the lock is released, so no blocking file read ever happens while the index
+/// `state` lock is held (the render path must never stall behind such a read).
+struct SpanPlan {
+    span: BlockSpan,
+    count: u64,
+}
+
+/// Newlines in `plan`'s span. A span covering a whole block uses the stored
+/// count and needs no read; a partial span reads the block through `reader`.
+fn resolve_span_count(
+    plan: &SpanPlan,
+    reader: BlockReader<'_>,
+    file_len: u64,
+) -> Result<u64, ReadError> {
+    if plan.span.covers_block {
+        return Ok(plan.count);
+    }
+    let (data, offset) = reader.read(plan.span.block, file_len)?;
+    Ok(count_newlines(span_bytes(&data, offset, &plan.span)))
+}
+
+/// Looks for newline ordinal `remaining` inside `plan`'s span; on a miss
+/// returns how many newlines the span holds. Reads the block only when the
+/// stored count cannot answer, and does so with the lock released.
+fn resolve_span_nth(
+    plan: &SpanPlan,
+    reader: BlockReader<'_>,
+    file_len: u64,
+    remaining: u64,
+) -> Result<Result<u64, u64>, ReadError> {
+    if plan.span.covers_block && remaining >= plan.count {
+        return Ok(Err(plan.count));
+    }
+    let (data, offset) = reader.read(plan.span.block, file_len)?;
+    let bytes = span_bytes(&data, offset, &plan.span);
+    let skip = usize::try_from(remaining).expect("ordinal fits in memory");
+    Ok(match memchr::memchr_iter(b'\n', bytes).nth(skip) {
+        Some(position) => Ok(plan.span.start + position as u64),
+        None => Err(count_newlines(bytes)),
+    })
 }
 
 /// Newline count per block of the original file, filled in lazily by a
@@ -299,17 +352,25 @@ impl LineIndex {
 
     /// Panics when `block` is past the end or `newlines` exceeds a block's size.
     pub fn set_block(&self, block: u64, newlines: u32) {
-        assert!(
-            newlines as usize <= BLOCK_SIZE,
-            "a block holds at most BLOCK_SIZE newlines"
-        );
+        self.state.write().write_block(block, newlines);
+    }
+
+    /// The current index generation, bumped by every `extend`. An indexer
+    /// captures this when it starts so its writes can be refused once an append
+    /// has superseded them.
+    pub fn generation(&self) -> u64 {
+        self.state.read().generation
+    }
+
+    /// Like `set_block`, but ignores the write when `generation` no longer
+    /// matches the index: a cancelled or superseded indexer must not write a
+    /// stale count over a block that a later append invalidated.
+    pub fn set_block_if_current(&self, block: u64, newlines: u32, generation: u64) {
         let mut state = self.state.write();
-        assert!(
-            block < state.counts.len() as u64,
-            "block {block} is inside the indexed file"
-        );
-        state.set_count(block, newlines);
-        state.advance_prefix();
+        if state.generation != generation {
+            return;
+        }
+        state.write_block(block, newlines);
     }
 
     pub fn get_block(&self, block: u64) -> Option<u32> {
@@ -339,12 +400,14 @@ impl LineIndex {
             "extend never shrinks the index ({new_len} < {})",
             state.file_len
         );
+        let generation = state.generation + 1;
         let mut counts = std::mem::take(&mut state.counts);
         if !state.file_len.is_multiple_of(BLOCK_BYTES) {
             counts[block_slot(state.file_len / BLOCK_BYTES)] = UNKNOWN;
         }
         counts.resize(block_slot(blocks_for(new_len)), UNKNOWN);
         *state = IndexState::with_counts(new_len, counts);
+        state.generation = generation;
     }
 
     /// Newlines in the whole file, or `None` until every block is indexed.
@@ -372,24 +435,38 @@ impl LineIndex {
         reader: BlockReader<'_>,
         range: Range<u64>,
     ) -> Result<Option<u64>, ReadError> {
-        let state = self.state.read();
-        assert_range_inside(&range, state.file_len);
-        if range.is_empty() {
-            return Ok(Some(0));
-        }
-        let first = range.start / BLOCK_BYTES;
-        let last = (range.end - 1) / BLOCK_BYTES;
-        let middle = block_slot(first + 1)..block_slot(last.max(first + 1));
-        if state.count(first).is_none()
-            || state.count(last).is_none()
-            || state.unknown_blocks.range_sum(middle.clone()) > 0
-        {
-            return Ok(None);
-        }
-        let mut total = state.span_count(reader, &state.span(first, &range))?;
-        if last > first {
-            total += state.newline_sums.range_sum(middle);
-            total += state.span_count(reader, &state.span(last, &range))?;
+        // The spans are planned under the lock; the partial-block reads they
+        // need happen below, after the lock is released.
+        let (first_plan, middle_newlines, last_plan, file_len) = {
+            let state = self.state.read();
+            assert_range_inside(&range, state.file_len);
+            if range.is_empty() {
+                return Ok(Some(0));
+            }
+            let first = range.start / BLOCK_BYTES;
+            let last = (range.end - 1) / BLOCK_BYTES;
+            let middle = block_slot(first + 1)..block_slot(last.max(first + 1));
+            if state.count(first).is_none()
+                || state.count(last).is_none()
+                || state.unknown_blocks.range_sum(middle.clone()) > 0
+            {
+                return Ok(None);
+            }
+            let first_plan = state.span_plan(first, &range);
+            let (middle_newlines, last_plan) = if last > first {
+                (
+                    state.newline_sums.range_sum(middle),
+                    Some(state.span_plan(last, &range)),
+                )
+            } else {
+                (0, None)
+            };
+            (first_plan, middle_newlines, last_plan, state.file_len)
+        };
+        let mut total = resolve_span_count(&first_plan, reader, file_len)?;
+        if let Some(last_plan) = last_plan {
+            total += middle_newlines;
+            total += resolve_span_count(&last_plan, reader, file_len)?;
         }
         Ok(Some(total))
     }
@@ -412,20 +489,28 @@ impl LineIndex {
         range: Range<u64>,
         n: u64,
     ) -> Result<NthNewline, ReadError> {
-        let state = self.state.read();
-        assert_range_inside(&range, state.file_len);
-        if range.is_empty() {
-            return Ok(NthNewline::NotInRange { count: 0 });
-        }
-        let first = range.start / BLOCK_BYTES;
-        let last = (range.end - 1) / BLOCK_BYTES;
+        // Phase 1: plan the first edge block under the lock. Only the editor
+        // thread calls this, and it is also the only thread that calls
+        // `extend`, so the file length is stable across the phases below; the
+        // indexer thread only fills unknown blocks and never changes a known
+        // count. Releasing the lock between phases is therefore consistent, and
+        // no read ever happens while the lock is held.
+        let (first_plan, first, last, file_len) = {
+            let state = self.state.read();
+            assert_range_inside(&range, state.file_len);
+            if range.is_empty() {
+                return Ok(NthNewline::NotInRange { count: 0 });
+            }
+            let first = range.start / BLOCK_BYTES;
+            let last = (range.end - 1) / BLOCK_BYTES;
+            if state.count(first).is_none() {
+                return Ok(NthNewline::Unknown);
+            }
+            (state.span_plan(first, &range), first, last, state.file_len)
+        };
         let mut remaining = n;
         let mut seen = 0;
-
-        if state.count(first).is_none() {
-            return Ok(NthNewline::Unknown);
-        }
-        match state.span_nth(reader, &state.span(first, &range), remaining)? {
+        match resolve_span_nth(&first_plan, reader, file_len, remaining)? {
             Ok(offset) => return Ok(NthNewline::Found(offset)),
             Err(count) => {
                 remaining -= count;
@@ -436,34 +521,65 @@ impl LineIndex {
             return Ok(NthNewline::NotInRange { count: seen });
         }
 
-        let middle_start = block_slot(first + 1);
-        let middle_end = block_slot(last);
-        let known_end = state.first_unknown(middle_start..middle_end);
-        let known = state.newline_sums.range_sum(middle_start..known_end);
-        if remaining < known {
-            let target = state.newline_sums.prefix(middle_start) + remaining;
-            let block = state.newline_sums.first_exceeding(target);
-            let skipped = state.newline_sums.range_sum(middle_start..block);
-            let span = state.span(block as u64, &range);
-            return match state.span_nth(reader, &span, remaining - skipped)? {
+        // Phase 2: the middle Fenwick search and the last edge block, planned
+        // under the lock. The read each plan may need happens after the lock is
+        // released.
+        enum MiddlePlan {
+            Unknown,
+            Read {
+                plan: SpanPlan,
+                remaining: u64,
+            },
+            ReadLast {
+                plan: SpanPlan,
+                remaining: u64,
+                seen: u64,
+            },
+        }
+        let middle_plan = {
+            let state = self.state.read();
+            let middle_start = block_slot(first + 1);
+            let middle_end = block_slot(last);
+            let known_end = state.first_unknown(middle_start..middle_end);
+            let known = state.newline_sums.range_sum(middle_start..known_end);
+            if remaining < known {
+                let target = state.newline_sums.prefix(middle_start) + remaining;
+                let block = state.newline_sums.first_exceeding(target);
+                let skipped = state.newline_sums.range_sum(middle_start..block);
+                MiddlePlan::Read {
+                    plan: state.span_plan(block as u64, &range),
+                    remaining: remaining - skipped,
+                }
+            } else if known_end < middle_end || state.count(last).is_none() {
+                MiddlePlan::Unknown
+            } else {
+                MiddlePlan::ReadLast {
+                    plan: state.span_plan(last, &range),
+                    remaining: remaining - known,
+                    seen: seen + known,
+                }
+            }
+        };
+        match middle_plan {
+            MiddlePlan::Unknown => Ok(NthNewline::Unknown),
+            MiddlePlan::Read { plan, remaining } => {
+                match resolve_span_nth(&plan, reader, file_len, remaining)? {
+                    Ok(offset) => Ok(NthNewline::Found(offset)),
+                    Err(_) => {
+                        unreachable!("prefix sums place newline {n} in block {}", plan.span.block)
+                    }
+                }
+            }
+            MiddlePlan::ReadLast {
+                plan,
+                remaining,
+                seen,
+            } => match resolve_span_nth(&plan, reader, file_len, remaining)? {
                 Ok(offset) => Ok(NthNewline::Found(offset)),
-                Err(_) => unreachable!("prefix sums place newline {n} in block {block}"),
-            };
-        }
-        remaining -= known;
-        seen += known;
-        if known_end < middle_end {
-            return Ok(NthNewline::Unknown);
-        }
-
-        if state.count(last).is_none() {
-            return Ok(NthNewline::Unknown);
-        }
-        match state.span_nth(reader, &state.span(last, &range), remaining)? {
-            Ok(offset) => Ok(NthNewline::Found(offset)),
-            Err(count) => Ok(NthNewline::NotInRange {
-                count: seen + count,
-            }),
+                Err(count) => Ok(NthNewline::NotInRange {
+                    count: seen + count,
+                }),
+            },
         }
     }
 }
@@ -488,6 +604,10 @@ pub fn index_file(
         )));
     }
     rustix::fs::fadvise(cache.file(), 0, None, Advice::Sequential).map_err(io::Error::from)?;
+    // An append replaces the index with a newer generation and starts a fresh
+    // indexer; counts this scan computes for the old generation are refused, so
+    // a stale count never survives the append.
+    let generation = index.generation();
     let block_count = index.block_count();
     for block in 0..block_count {
         if cancel.load(Ordering::Relaxed) {
@@ -495,7 +615,7 @@ pub fn index_file(
         }
         if index.get_block(block).is_none() {
             let data = cache.read_block_direct(block)?;
-            index.set_block(block, count_newlines(&data) as u32);
+            index.set_block_if_current(block, count_newlines(&data) as u32, generation);
         }
         progress(block + 1);
     }
@@ -505,6 +625,83 @@ pub fn index_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader whose read, while in flight, records whether the index's
+    /// `state` lock is free for writing. If a query held the read lock across
+    /// the read, this same-thread `try_write` would fail.
+    fn probing_reader<'a>(
+        index: &'a LineIndex,
+        free_during_read: &'a AtomicBool,
+    ) -> impl Fn(u64, u64) -> Result<(Arc<[u8]>, usize), ReadError> + 'a {
+        move |block, file_len| {
+            if index.state.try_write().is_some() {
+                free_during_read.store(true, Ordering::Relaxed);
+            }
+            let bytes = vec![0u8; block_length(block, file_len) as usize];
+            Ok((Arc::from(bytes), 0))
+        }
+    }
+
+    #[test]
+    fn count_range_does_not_hold_the_state_lock_across_a_read() {
+        // A partial last block forces `count_range_in` to read it.
+        let file_len = BLOCK_BYTES + 100;
+        let index = LineIndex::new(file_len);
+        index.set_block(0, 0);
+        index.set_block(1, 0);
+        let free_during_read = AtomicBool::new(false);
+        let probe = probing_reader(&index, &free_during_read);
+        // A range starting mid-block forces a partial-block read.
+        index
+            .count_range_in(BlockReader::Probe(&probe), 1..file_len)
+            .expect("count with probe reader");
+        assert!(
+            free_during_read.load(Ordering::Relaxed),
+            "count_range_in must release the state lock before reading a block"
+        );
+    }
+
+    #[test]
+    fn nth_newline_does_not_hold_the_state_lock_across_a_read() {
+        // A partial last block the nth-newline search must read.
+        let file_len = BLOCK_BYTES + 100;
+        let index = LineIndex::new(file_len);
+        index.set_block(0, 0);
+        index.set_block(1, 0);
+        let free_during_read = AtomicBool::new(false);
+        let probe = probing_reader(&index, &free_during_read);
+        // A range starting mid-block forces a partial first-block read.
+        index
+            .nth_newline_in(BlockReader::Probe(&probe), 1..file_len, 0)
+            .expect("nth with probe reader");
+        assert!(
+            free_during_read.load(Ordering::Relaxed),
+            "nth_newline_in must release the state lock before reading a block"
+        );
+    }
+
+    #[test]
+    fn superseded_indexer_cannot_write_a_stale_count_after_append() {
+        // A partial last block, so an append grows it and must invalidate its
+        // count. A superseded indexer still holding the pre-append generation
+        // must not write the old count over the invalidated block.
+        let file_len = BLOCK_BYTES + 10;
+        let index = LineIndex::new(file_len);
+        let stale_generation = index.generation();
+        index.extend(BLOCK_BYTES + 20);
+        index.set_block_if_current(1, 7, stale_generation);
+        assert_eq!(
+            index.get_block(1),
+            None,
+            "a stale count must not survive the append; the new indexer recounts"
+        );
+        index.set_block_if_current(1, 3, index.generation());
+        assert_eq!(
+            index.get_block(1),
+            Some(3),
+            "the current indexer still writes"
+        );
+    }
 
     #[test]
     fn fenwick_prefix_and_search_match_linear() {
