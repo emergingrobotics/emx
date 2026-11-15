@@ -69,7 +69,10 @@ emx reload               # reread unmodified buffers from disk
 emx save-all
 emx events               # stream buffer, file and cursor events as JSON lines
 emx diff-external FILE   # show how FILE changed on disk against its buffer
+git diff FILE | emx apply-patch FILE   # apply a unified diff to FILE's open buffer
 ```
+
+`emx apply-patch` puts the hunks into the open buffer, on top of any unsaved edits, as one change that `C-/` undoes. If any hunk does not apply, nothing changes and it exits with an error. It never saves.
 
 Run `emx --help` or `emx help COMMAND` for details. Key bindings can be overridden in `~/.config/emx/config.toml`.
 

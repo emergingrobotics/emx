@@ -153,6 +153,12 @@ pub enum Request {
     DiffExternal {
         path: WirePath,
     },
+    /// Applies a unified diff of one file to the buffer visiting `path`,
+    /// on top of unsaved edits, as one undoable change; never saves.
+    ApplyPatch {
+        path: WirePath,
+        patch_b64: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +197,9 @@ pub mod error_code {
     pub const NO_EXTERNAL_CHANGE: &str = "no_external_change";
     /// `diff-external` could not read or diff the texts.
     pub const DIFF_FAILED: &str = "diff_failed";
+    /// `apply-patch`: the patch is malformed, a hunk does not apply, or
+    /// the buffer cannot take it; nothing changed.
+    pub const PATCH_FAILED: &str = "patch_failed";
     /// The connection broke the protocol; the server closes it.
     pub const PROTOCOL: &str = "protocol";
 }

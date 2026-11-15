@@ -454,6 +454,7 @@ dependencies = [
 name = "emx-core"
 version = "0.0.2"
 dependencies = [
+ "base64",
  "crc32fast",
  "emx-proto",
  "emx-text",

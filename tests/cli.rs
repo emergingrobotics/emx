@@ -453,3 +453,57 @@ fn cli_without_server_errors() {
         "the command-line tools never start a server"
     );
 }
+
+/// `emx apply-patch FILE` with the patch on stdin.
+fn apply_patch(env: &TestEnv, file: &str, patch: &str) -> Output {
+    use std::io::Write;
+    let mut child = env
+        .emx()
+        .args(["apply-patch", file])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn emx");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(patch.as_bytes())
+        .expect("write the patch");
+    child.wait_with_output().expect("emx apply-patch")
+}
+
+#[test]
+fn apply_patch_edits_the_buffer_over_unsaved_edits_and_never_saves() {
+    let env = TestEnv::new();
+    let path = env.file("code.txt", "one\ntwo\nthree\n");
+    let _server = env.start_server();
+    let mut terminal = env.connect(ClientKind::Tui);
+    terminal.open(&path);
+    terminal.wait_text("three");
+    terminal.type_text("X");
+    terminal.wait_text("Xone");
+    let patch = "--- a/code.txt\n+++ b/code.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n";
+    let failed = apply_patch(&env, "code.txt", patch);
+    assert_fails_with(&failed, "emx: hunk 1 does not apply\n");
+    let patch = "@@ -2,1 +2,1 @@\n-two\n+TWO\n";
+    let applied = apply_patch(&env, "code.txt", patch);
+    assert_success(&applied);
+    terminal.wait_text("TWO");
+    terminal.wait_text("Xone");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "one\ntwo\nthree\n",
+        "never saved"
+    );
+    terminal.keys("C-/");
+    terminal.wait_text("two");
+    assert_fails_with(
+        &apply_patch(&env, "absent.txt", patch),
+        &format!(
+            "emx: no buffer visits {}\n",
+            env.work.join("absent.txt").display()
+        ),
+    );
+}

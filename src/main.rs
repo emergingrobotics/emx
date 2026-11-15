@@ -78,6 +78,10 @@ enum Command {
     Events,
     /// Show how FILE changed on disk against its buffer.
     DiffExternal { file: OsString },
+    /// Apply a unified diff read from stdin to FILE's open buffer, on top
+    /// of unsaved edits, as one undoable change; fails without changing
+    /// anything if a hunk does not apply. Never saves.
+    ApplyPatch { file: OsString },
 }
 
 fn main() -> ExitCode {
@@ -98,6 +102,7 @@ fn main() -> ExitCode {
         Some(Command::SaveAll) => cli::run(Tool::SaveAll),
         Some(Command::Events) => cli::run(Tool::Events),
         Some(Command::DiffExternal { file }) => cli::run(Tool::DiffExternal { file }),
+        Some(Command::ApplyPatch { file }) => cli::run(Tool::ApplyPatch { file }),
         None if cli.no_server => noserver::run(&cli.files),
         None => client::run(ClientOptions {
             files: cli.files,

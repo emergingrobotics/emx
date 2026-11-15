@@ -18,6 +18,7 @@ mod killring;
 mod marker;
 mod minibuffer;
 mod paren;
+pub mod patch;
 pub mod reload;
 mod render;
 pub mod search_job;

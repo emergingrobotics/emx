@@ -409,6 +409,10 @@ fn absolute_request(request: Request, cwd: &Path) -> Request {
         Request::DiffExternal { path } => Request::DiffExternal {
             path: absolute(path),
         },
+        Request::ApplyPatch { path, patch_b64 } => Request::ApplyPatch {
+            path: absolute(path),
+            patch_b64,
+        },
         other @ (Request::ListBuffers | Request::SaveAll | Request::SubscribeEvents) => other,
     }
 }
