@@ -226,3 +226,185 @@ fn pad_to_column(ctx: &mut CommandContext, column: u64) -> Result<(), CommandErr
     }
     Ok(())
 }
+
+/// Inserts `bytes` at `at` without moving point past them: markers there,
+/// point included, stay before the text, as under Emacs `save-excursion`.
+fn insert_at(ctx: &mut CommandContext, at: u64, bytes: &[u8]) -> Result<(), CommandError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let (buffer, recorder) = ctx.buffer_and_recorder();
+    buffer
+        .insert(at, bytes, recorder)
+        .map_err(|error| super::read_only_error(buffer, error))
+}
+
+/// Emacs `indent-to` from column `from` at `at`: tabs (when
+/// `indent-tabs-mode`) then spaces up to `column`.
+fn indentation_bytes(from: u64, column: u64, tab_width: u64, tabs: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut at = from;
+    if tabs && tab_width > 0 {
+        let count = column / tab_width - from / tab_width;
+        if count > 0 {
+            bytes.extend(std::iter::repeat_n(b'\t', count as usize));
+            at = (column / tab_width) * tab_width;
+        }
+    }
+    bytes.extend(std::iter::repeat_n(
+        b' ',
+        column.saturating_sub(at) as usize,
+    ));
+    bytes
+}
+
+/// The rectangle between mark and point: its columns and line starts.
+fn rectangle(ctx: &CommandContext) -> Result<(u64, u64, u64, Vec<u64>), CommandError> {
+    let (mark, point) = ctx.mark_and_point()?;
+    let (start, end) = (mark.min(point), mark.max(point));
+    let text = &ctx.buffer().text;
+    let (start_col, end_col) = rectangle_columns(text, start, end, ctx.tab_width())?;
+    Ok((
+        start,
+        start_col,
+        end_col,
+        rectangle_line_starts(text, start, end)?,
+    ))
+}
+
+/// The start of a line `index` lines below the first, after edits to the
+/// lines above moved it.
+fn nth_line(text: &Text, first: u64, index: usize) -> Result<u64, ReadError> {
+    let mut line = first;
+    for _ in 0..index {
+        match text.find_newline_forward(line)? {
+            Some(newline) => line = newline + 1,
+            None => break,
+        }
+    }
+    Ok(line)
+}
+
+/// `C-x r d`: Emacs `delete-rectangle`, which keeps no copy.
+pub(super) fn delete_rectangle(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    ctx.check_editable()?;
+    let (_, start_col, end_col, lines) = rectangle(ctx)?;
+    let text = ctx.buffer().text.clone();
+    let tab_width = ctx.tab_width();
+    let mut deletions = Vec::new();
+    for line in lines {
+        if let (Some(range), _) = delete_extract_line(&text, line, start_col, end_col, tab_width)? {
+            deletions.push(range);
+        }
+    }
+    for range in deletions.into_iter().rev() {
+        let at = range.start;
+        ctx.delete_with_point(range, at)?;
+    }
+    ctx.request_deactivate_mark();
+    Ok(())
+}
+
+/// `C-x r M-w`: Emacs `copy-rectangle-as-kill`.
+pub(super) fn copy_rectangle_as_kill(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let (_, start_col, end_col, lines) = rectangle(ctx)?;
+    let text = ctx.buffer().text.clone();
+    let tab_width = ctx.tab_width();
+    let mut extracted = Vec::new();
+    for line in lines {
+        extracted.push(delete_extract_line(&text, line, start_col, end_col, tab_width)?.1);
+    }
+    ctx.editor().set_killed_rectangle(extracted);
+    ctx.request_deactivate_mark();
+    Ok(())
+}
+
+/// `C-x r c`: Emacs `clear-rectangle`: the rectangle becomes blank; a line
+/// ending inside it is cut there instead.
+pub(super) fn clear_rectangle(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    ctx.check_editable()?;
+    let (_, start_col, end_col, lines) = rectangle(ctx)?;
+    let tab_width = ctx.tab_width();
+    let tabs = ctx.editor().config().indent_tabs_mode;
+    let first = lines.first().copied().unwrap_or(0);
+    for index in 0..lines.len() {
+        let text = ctx.buffer().text.clone();
+        let line = nth_line(&text, first, index)?;
+        let begin = move_to_column(&text, line, start_col, tab_width)?;
+        if current_column(&text, begin, tab_width)? != start_col {
+            continue;
+        }
+        let line_end = super::line_end(&text, line)?;
+        if current_column(&text, line_end, tab_width)? <= end_col {
+            if begin < line_end {
+                ctx.delete_with_point(begin..line_end, begin)?;
+            }
+            continue;
+        }
+        let finish = move_to_column(&text, line, end_col, tab_width)?;
+        let reached = current_column(&text, finish, tab_width)?;
+        ctx.delete_with_point(begin..finish, begin)?;
+        insert_at(
+            ctx,
+            begin,
+            &indentation_bytes(start_col, reached, tab_width, tabs),
+        )?;
+    }
+    ctx.request_deactivate_mark();
+    Ok(())
+}
+
+/// `C-x r o`: Emacs `open-rectangle`: blank space fills the rectangle,
+/// pushing the text right; point goes to its upper-left corner.
+pub(super) fn open_rectangle(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    ctx.check_editable()?;
+    let (start, start_col, end_col, lines) = rectangle(ctx)?;
+    let tab_width = ctx.tab_width();
+    let tabs = ctx.editor().config().indent_tabs_mode;
+    let first = lines.first().copied().unwrap_or(0);
+    let corner = ctx
+        .buffer_mut()
+        .create_marker(start, crate::marker::InsertionType::StayBefore);
+    for index in 0..lines.len() {
+        let text = ctx.buffer().text.clone();
+        let line = nth_line(&text, first, index)?;
+        let begin = move_to_column(&text, line, start_col, tab_width)?;
+        if current_column(&text, begin, tab_width)? != start_col
+            || begin == super::line_end(&text, line)?
+        {
+            continue;
+        }
+        insert_at(
+            ctx,
+            begin,
+            &indentation_bytes(start_col, end_col, tab_width, tabs),
+        )?;
+    }
+    let corner_position = ctx.buffer().marker_pos(corner);
+    ctx.buffer_mut().delete_marker(corner);
+    ctx.set_point(corner_position);
+    ctx.request_deactivate_mark();
+    Ok(())
+}
+
+/// `C-x r N`: Emacs `rectangle-number-lines` from 1: each line of the
+/// rectangle gets its number, right-aligned to the widest, and a space at
+/// the rectangle's left column.
+pub(super) fn rectangle_number_lines(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    ctx.check_editable()?;
+    let (_, start_col, _, lines) = rectangle(ctx)?;
+    let tab_width = ctx.tab_width();
+    let width = lines.len().to_string().len();
+    let first = lines.first().copied().unwrap_or(0);
+    for index in 0..lines.len() {
+        let text = ctx.buffer().text.clone();
+        let line = nth_line(&text, first, index)?;
+        let begin = move_to_column(&text, line, start_col, tab_width)?;
+        let reached = current_column(&text, begin, tab_width)?;
+        let mut bytes = vec![b' '; start_col.saturating_sub(reached) as usize];
+        bytes.extend(format!("{:>width$} ", index + 1).into_bytes());
+        insert_at(ctx, begin, &bytes)?;
+    }
+    ctx.request_deactivate_mark();
+    Ok(())
+}

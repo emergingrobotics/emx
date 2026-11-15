@@ -547,6 +547,26 @@ static COMMANDS: &[CommandSpec] = &[
         run: rect::string_rectangle,
     },
     CommandSpec {
+        name: "delete-rectangle",
+        run: rect::delete_rectangle,
+    },
+    CommandSpec {
+        name: "copy-rectangle-as-kill",
+        run: rect::copy_rectangle_as_kill,
+    },
+    CommandSpec {
+        name: "clear-rectangle",
+        run: rect::clear_rectangle,
+    },
+    CommandSpec {
+        name: "open-rectangle",
+        run: rect::open_rectangle,
+    },
+    CommandSpec {
+        name: "rectangle-number-lines",
+        run: rect::rectangle_number_lines,
+    },
+    CommandSpec {
         name: "kmacro-start-macro",
         run: r#macro::kmacro_start_macro,
     },

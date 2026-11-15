@@ -1,0 +1,13 @@
+{"name": "delete-rectangle", "text": "^abcd\nefgh\nij|kl", "keys": "C-x r d", "tier": 1}
+{"name": "delete-rectangle-short-line", "text": "a^bcd\nx\nijk|l", "keys": "C-x r d", "tier": 1}
+{"name": "delete-rectangle-keeps-killed-rectangle", "text": "^ab|cd\nxy", "keys": "C-x r k C-x r d M-> C-x r y", "tier": 1}
+{"name": "copy-rectangle-as-kill", "text": "^abcd\nefgh|\nzz", "keys": "C-x r M-w M-> C-x r y", "tier": 1}
+{"name": "copy-rectangle-as-kill-short-line", "text": "a^bcd\ne\nijk|l\n", "keys": "C-x r M-w M-> C-x r y", "tier": 1}
+{"name": "clear-rectangle", "text": "a^bcd\nefgh\nijk|l", "keys": "C-x r c", "tier": 1}
+{"name": "clear-rectangle-short-line", "text": "a^bcd\ne\nijk|l", "keys": "C-x r c", "tier": 1}
+{"name": "clear-rectangle-to-line-end", "text": "a^bcd\nefgh\nijkl|", "keys": "C-x r c", "tier": 1}
+{"name": "open-rectangle", "text": "a^bcd\nefgh\nijk|l", "keys": "C-x r o", "tier": 1}
+{"name": "open-rectangle-short-line", "text": "a^bcd\ne\nijk|l", "keys": "C-x r o", "tier": 1}
+{"name": "number-lines", "text": "^abc\ndef\nghi|", "keys": "C-x r N", "tier": 1}
+{"name": "number-lines-column", "text": "a^bc\ndef\ngh|i", "keys": "C-x r N", "tier": 1}
+{"name": "number-lines-ten", "text": "^a\nb\nc\nd\ne\nf\ng\nh\ni\nj|", "keys": "C-x r N", "tier": 1}

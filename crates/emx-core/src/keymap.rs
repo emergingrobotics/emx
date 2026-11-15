@@ -27,7 +27,7 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 97] = [
+const DEFAULT_BINDINGS: [(&str, &str); 102] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
@@ -119,6 +119,11 @@ const DEFAULT_BINDINGS: [(&str, &str); 97] = [
     ("C-x r k", "kill-rectangle"),
     ("C-x r y", "yank-rectangle"),
     ("C-x r t", "string-rectangle"),
+    ("C-x r d", "delete-rectangle"),
+    ("C-x r M-w", "copy-rectangle-as-kill"),
+    ("C-x r c", "clear-rectangle"),
+    ("C-x r o", "open-rectangle"),
+    ("C-x r N", "rectangle-number-lines"),
     ("C-x (", "kmacro-start-macro"),
     ("C-x )", "kmacro-end-macro"),
     ("C-x e", "kmacro-end-and-call-macro"),
