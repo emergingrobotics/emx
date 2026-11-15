@@ -342,6 +342,54 @@ static COMMANDS: &[CommandSpec] = &[
         run: window::other_window,
     },
     CommandSpec {
+        name: "toggle-tree",
+        run: window::toggle_tree,
+    },
+    CommandSpec {
+        name: "tree-next-line",
+        run: window::tree_next_line,
+    },
+    CommandSpec {
+        name: "tree-previous-line",
+        run: window::tree_previous_line,
+    },
+    CommandSpec {
+        name: "tree-open",
+        run: window::tree_open,
+    },
+    CommandSpec {
+        name: "tree-toggle",
+        run: window::tree_toggle,
+    },
+    CommandSpec {
+        name: "tree-up",
+        run: window::tree_up,
+    },
+    CommandSpec {
+        name: "tree-refresh",
+        run: window::tree_refresh,
+    },
+    CommandSpec {
+        name: "tree-toggle-ignored",
+        run: window::tree_toggle_ignored,
+    },
+    CommandSpec {
+        name: "tree-create-directory",
+        run: window::tree_create_directory,
+    },
+    CommandSpec {
+        name: "tree-rename",
+        run: window::tree_rename,
+    },
+    CommandSpec {
+        name: "tree-delete",
+        run: window::tree_delete,
+    },
+    CommandSpec {
+        name: "project-find-file",
+        run: window::project_find_file,
+    },
+    CommandSpec {
         name: "switch-to-buffer",
         run: window::switch_to_buffer,
     },

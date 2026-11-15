@@ -401,9 +401,22 @@ fn distribute(total: u16, normals: &[f64]) -> Vec<u16> {
     sizes
 }
 
+/// The file panel: a side window in the frame's leftmost columns, outside
+/// the window tree, as an Emacs side window is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Panel {
+    pub window: WindowId,
+    /// The width asked for, its border included; a narrow terminal gives
+    /// the panel less, or hides it.
+    pub wanted_cols: u16,
+}
+
+/// A panel narrower than this, its border included, is not shown.
+pub(crate) const PANEL_MIN_COLS: u16 = 3;
+
 /// One client's windows: a tree of live windows filling the frame above
-/// the echo area. Windows and point are per client; buffers are shared
-/// between clients.
+/// the echo area, and the file panel to its left when open. Windows and
+/// point are per client; buffers are shared between clients.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub selected: WindowId,
@@ -411,6 +424,9 @@ pub struct Frame {
     /// Emacs `window-prev-buffers` of each window, most recent first.
     pub prev_buffers: SecondaryMap<WindowId, Vec<PrevBuffer>>,
     root: Node,
+    /// The frame's columns: the panel's and the window tree's.
+    width: u16,
+    panel: Option<Panel>,
 }
 
 impl Frame {
@@ -425,6 +441,8 @@ impl Frame {
             windows,
             prev_buffers,
             root: Node::live(selected, cols, window_area_rows(rows)),
+            width: cols,
+            panel: None,
         }
     }
 
@@ -432,25 +450,121 @@ impl Frame {
         &self.windows[self.selected]
     }
 
-    /// The frame's width: the root window's.
+    /// The window tree's width: the root window's.
     pub(crate) fn cols(&self) -> u16 {
         self.root.cols
     }
 
-    /// The terminal changed size: the windows keep their shares of it.
-    pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
-        self.root.resize(cols, window_area_rows(rows));
+    /// The whole frame's width, the panel included.
+    pub(crate) fn width(&self) -> u16 {
+        self.width
     }
 
-    /// Every live window with its place, in Emacs's cyclic order (the
-    /// window tree left to right, top to bottom).
+    /// The terminal changed size: the windows keep their shares of it.
+    pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
+        self.width = cols;
+        let panel = self.panel_cols();
+        self.root.resize(cols - panel, window_area_rows(rows));
+    }
+
+    /// Every live window of the tree with its place, in Emacs's cyclic
+    /// order (left to right, top to bottom); the panel is not one.
     pub(crate) fn boxes(&self) -> Vec<(WindowId, WindowBox)> {
         let mut boxes = Vec::new();
-        self.root.collect_boxes(0, 0, &mut boxes);
+        self.root.collect_boxes(self.panel_cols(), 0, &mut boxes);
         boxes
     }
 
+    /// The columns the panel takes now: what it asked for, as far as the
+    /// windows can spare it while keeping `window-min-width`; none when
+    /// that is too little to show it.
+    fn panel_cols(&self) -> u16 {
+        let Some(panel) = self.panel else {
+            return 0;
+        };
+        let cols = panel
+            .wanted_cols
+            .min(self.width.saturating_sub(WINDOW_MIN_WIDTH));
+        if cols < PANEL_MIN_COLS { 0 } else { cols }
+    }
+
+    pub(crate) fn panel(&self) -> Option<Panel> {
+        self.panel
+    }
+
+    pub(crate) fn is_panel(&self, window: WindowId) -> bool {
+        self.panel.is_some_and(|panel| panel.window == window)
+    }
+
+    /// The panel window and its place, when it is open and has room.
+    pub(crate) fn panel_box(&self) -> Option<(WindowId, WindowBox)> {
+        let panel = self.panel?;
+        let cols = self.panel_cols();
+        (cols > 0).then_some((
+            panel.window,
+            WindowBox {
+                left: 0,
+                top: 0,
+                cols,
+                rows: self.root.rows,
+            },
+        ))
+    }
+
+    /// Opens the panel showing `window`, `cols` wide; the window tree gives
+    /// up the columns.
+    pub(crate) fn open_panel(&mut self, window: Window, cols: u16) -> WindowId {
+        assert!(self.panel.is_none(), "a frame has one panel");
+        let id = self.windows.insert(window);
+        self.prev_buffers.insert(id, Vec::new());
+        self.panel = Some(Panel {
+            window: id,
+            wanted_cols: cols,
+        });
+        self.relayout();
+        id
+    }
+
+    /// Closes the panel; the window tree takes its columns back. Returns
+    /// its window and history, whose markers the caller deletes. The
+    /// caller selects another window first if the panel's was selected.
+    pub(crate) fn close_panel(&mut self) -> Option<(Window, Vec<PrevBuffer>)> {
+        let panel = self.panel.take()?;
+        assert!(
+            self.selected != panel.window,
+            "another window is selected before the panel closes"
+        );
+        self.relayout();
+        Some(self.remove_window(panel.window))
+    }
+
+    /// Asks for a panel `cols` wide; returns the columns it has now.
+    pub(crate) fn set_panel_cols(&mut self, cols: u16) -> u16 {
+        if let Some(panel) = &mut self.panel {
+            panel.wanted_cols = cols;
+        }
+        self.relayout();
+        self.panel_cols()
+    }
+
+    fn relayout(&mut self) {
+        let rows = self.root.rows;
+        let panel = self.panel_cols();
+        self.root.resize(self.width - panel, rows);
+    }
+
     pub(crate) fn window_box(&self, window: WindowId) -> WindowBox {
+        if self.is_panel(window) {
+            return self.panel_box().map_or(
+                WindowBox {
+                    left: 0,
+                    top: 0,
+                    cols: 0,
+                    rows: self.root.rows,
+                },
+                |(_, place)| place,
+            );
+        }
         self.boxes()
             .into_iter()
             .find(|(id, _)| *id == window)
@@ -463,15 +577,22 @@ impl Frame {
         self.boxes().into_iter().map(|(id, _)| id).collect()
     }
 
-    /// Live windows in cyclic order starting with the selected one, as
-    /// Emacs's `window-list-1` lists them.
+    /// Live windows of the tree in cyclic order starting with the
+    /// selected one, as Emacs's `window-list-1` lists them; from the first
+    /// when the panel is selected.
     pub(crate) fn order_from_selected(&self) -> Vec<WindowId> {
         let mut order = self.order();
-        let selected = order
-            .iter()
-            .position(|id| *id == self.selected)
-            .expect("the selected window is live");
-        order.rotate_left(selected);
+        if let Some(selected) = order.iter().position(|id| *id == self.selected) {
+            order.rotate_left(selected);
+        }
+        order
+    }
+
+    /// Every window `other-window` cycles through: the panel, then the
+    /// tree's windows, as Emacs lists a left side window first.
+    pub(crate) fn cycle_order(&self) -> Vec<WindowId> {
+        let mut order: Vec<WindowId> = self.panel_box().map(|(id, _)| id).into_iter().collect();
+        order.extend(self.order());
         order
     }
 

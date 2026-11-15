@@ -146,6 +146,22 @@ pub(crate) enum Purpose {
         start: u64,
         end: u64,
     },
+    /// The file panel's `+`: the directory to create, relative to `base`.
+    TreeCreateDirectory {
+        base: PathBuf,
+    },
+    /// The file panel's `R`: the new name of `from`.
+    TreeRename {
+        from: PathBuf,
+    },
+    /// The file panel's `d`: delete `path`?
+    TreeDelete {
+        path: PathBuf,
+    },
+    /// `project-find-file`: a file under `root`.
+    ProjectFile {
+        root: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,7 +317,7 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-fn file_name(path: &Path) -> String {
+pub(super) fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
@@ -345,7 +361,7 @@ impl Editor {
 
     /// A buffer's `default-directory`: its file's directory, or the
     /// editor's for buffers without a file.
-    fn directory_of(&self, buffer: BufferId) -> PathBuf {
+    pub(super) fn directory_of(&self, buffer: BufferId) -> PathBuf {
         match &self.buffers[buffer].file {
             Some(file) => io::parent_directory(&file.path).to_path_buf(),
             None => self.default_directory.clone(),
@@ -760,6 +776,22 @@ impl Editor {
                 self.string_rectangle_answered(client, start, end, string);
                 Ok(())
             }
+            (Purpose::TreeCreateDirectory { base }, Answer::Line(input)) => {
+                self.tree_create_answered(client, &base, &input);
+                Ok(())
+            }
+            (Purpose::TreeRename { from }, Answer::Line(input)) => {
+                self.tree_rename_answered(client, from, &input);
+                Ok(())
+            }
+            (Purpose::TreeDelete { path }, Answer::Yes(yes)) => {
+                self.tree_delete_answered(client, path, yes);
+                Ok(())
+            }
+            (Purpose::ProjectFile { root }, Answer::Line(input)) => {
+                self.project_file_answered(client, &root, &input);
+                Ok(())
+            }
             (purpose, answer) => {
                 unreachable!("{purpose:?} is asked in a mode that answers {answer:?}")
             }
@@ -985,6 +1017,17 @@ impl Editor {
     /// Removes the buffer; windows showing it show another buffer, and
     /// clients waiting for it are released.
     pub(super) fn kill_buffer(&mut self, buffer: BufferId) {
+        // A file panel's buffer goes with its panel.
+        if let Some(client) = self
+            .trees
+            .iter()
+            .find(|(_, tree)| **tree == buffer)
+            .map(|(client, _)| *client)
+        {
+            self.close_panel(client);
+            return;
+        }
+        self.forget_tree(buffer);
         self.isearch_forget_buffer(buffer);
         self.replace_forget_buffer(buffer);
         self.occur_forget_buffer(buffer);

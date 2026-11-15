@@ -13,6 +13,7 @@ use emx_core::completion::{Candidate, ListingError};
 use emx_core::diff::{self, DiffJob};
 use emx_core::io::{self, SaveFailure, SavePlan};
 use emx_core::search_job::{SearchJob, run_search_job};
+use emx_core::tree::{TreeJob, refused_tree_job, run_tree_job};
 use emx_core::{
     AutoSaveJob, BufferId, ClientId, Config, Event, ListingId, PrefetchRequest, ReloadJob,
 };
@@ -36,6 +37,11 @@ pub const LISTINGS_IN_FLIGHT_MAX: usize = 64;
 /// time and cancels the one it replaces, so normal use stays far below.
 pub const SEARCHES_IN_FLIGHT_MAX: usize = 16;
 const TOO_MANY_SEARCHES: &str = "Too many searches in progress";
+/// The most file panel jobs (listings, git status, file operations,
+/// project listings) running at once; capped for the same reason as
+/// searches: one on a hung mount never returns.
+pub const TREE_JOBS_IN_FLIGHT_MAX: usize = 32;
+const TOO_MANY_TREE_JOBS: &str = "Too many file panel jobs in progress";
 /// The indexer reports its progress every this many blocks.
 pub const INDEX_PROGRESS_BLOCKS: u64 = 256;
 /// A save reports its progress at most once per this many bytes written, so a
@@ -589,6 +595,47 @@ impl Searchers {
             id,
             result: Err(TOO_MANY_SEARCHES.to_string()),
         });
+    }
+}
+
+/// Runs the file panel's jobs (`Effect::Tree`), each on a thread of its
+/// own, so a git status of a large repository or a listing on a hung mount
+/// holds only its own thread (the threads are never joined).
+pub struct TreeTasks {
+    in_flight: Arc<AtomicUsize>,
+    deliver: Deliver,
+    cap: usize,
+}
+
+impl TreeTasks {
+    pub fn new(deliver: Deliver) -> TreeTasks {
+        TreeTasks {
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            deliver,
+            cap: TREE_JOBS_IN_FLIGHT_MAX,
+        }
+    }
+
+    pub fn submit(&self, client: ClientId, job: TreeJob) {
+        if self.in_flight.fetch_add(1, Ordering::AcqRel) >= self.cap {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            (self.deliver)(refused_tree_job(client, &job, TOO_MANY_TREE_JOBS));
+            return;
+        }
+        let in_flight = self.in_flight.clone();
+        let deliver = self.deliver.clone();
+        let refused = refused_tree_job(client, &job, TOO_MANY_TREE_JOBS);
+        let spawned = thread::Builder::new()
+            .name("emx-tree".to_string())
+            .spawn(move || {
+                let event = run_tree_job(client, &job);
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+                deliver(event);
+            });
+        if spawned.is_err() {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            (self.deliver)(refused);
+        }
     }
 }
 

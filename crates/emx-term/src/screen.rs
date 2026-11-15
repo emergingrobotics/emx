@@ -43,6 +43,11 @@ pub fn face_sgr(face: Face) -> &'static str {
         // `icomplete-selected-match` is `highlight`: darkseagreen2 behind
         // the text on a light terminal, nearest ANSI green.
         Face::CompletionSelected => "0;30;42",
+        Face::PanelDirectory => "0;1;34",
+        Face::GitModified => "0;33",
+        Face::GitAdded => "0;32",
+        Face::GitUntracked => "0;31",
+        Face::GitIgnored => "0;2",
     }
 }
 

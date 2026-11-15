@@ -61,6 +61,14 @@ pub const MOUSE: bool = false;
 pub const MOUSE_WHEEL_LINES: u64 = 5;
 /// The most lines one wheel step may scroll.
 pub const MOUSE_WHEEL_LINES_MAX: u64 = 1000;
+/// The file panel's width, its border included.
+pub const PANEL_WIDTH: u64 = 30;
+/// The panel's width must be from 11 (ten text columns and the border)
+/// up to the widest terminal the server accepts.
+pub const PANEL_WIDTH_MIN: u64 = 11;
+pub const PANEL_WIDTH_MAX: u64 = 1000;
+/// The most files `project-find-file` lists.
+pub const QUICK_OPEN_MAX_FILES: u64 = 100_000;
 pub const MAX_WIRE_MESSAGE: u64 = 16 * MIB;
 pub const FRAME_QUEUE_DEPTH: u64 = 8;
 
@@ -109,6 +117,8 @@ pub struct Config {
     pub completion_rows: u64,
     pub mouse: bool,
     pub mouse_wheel_lines: u64,
+    pub panel_width: u64,
+    pub quick_open_max_files: u64,
 }
 
 impl Default for Config {
@@ -144,6 +154,8 @@ impl Default for Config {
             completion_rows: COMPLETION_ROWS,
             mouse: MOUSE,
             mouse_wheel_lines: MOUSE_WHEEL_LINES,
+            panel_width: PANEL_WIDTH,
+            quick_open_max_files: QUICK_OPEN_MAX_FILES,
         }
     }
 }
@@ -252,6 +264,18 @@ impl Config {
             return Err(InvalidSetting {
                 key: "tab_width",
                 reason: format!("must be between 1 and {TAB_WIDTH_MAX}"),
+            });
+        }
+        if !(PANEL_WIDTH_MIN..=PANEL_WIDTH_MAX).contains(&self.panel_width) {
+            return Err(InvalidSetting {
+                key: "panel_width",
+                reason: format!("must be between {PANEL_WIDTH_MIN} and {PANEL_WIDTH_MAX}"),
+            });
+        }
+        if self.quick_open_max_files == 0 {
+            return Err(InvalidSetting {
+                key: "quick_open_max_files",
+                reason: "must be greater than 0".to_string(),
             });
         }
         if !(1..=MOUSE_WHEEL_LINES_MAX).contains(&self.mouse_wheel_lines) {
@@ -367,7 +391,8 @@ mod tests {
              amalgamation_limit = 17\ncolumn_checkpoint_interval = 18\n\
              long_line_threshold = 19\necho_keystrokes_ms = 0\nmark_ring_max = 20\n\
              indent_tabs_mode = false\ncursor_event_interval_ms = 21\ncompletion_rows = 22\n\
-             keyboard_encoding = \"legacy\"\nmouse = true\nmouse_wheel_lines = 23\n",
+             keyboard_encoding = \"legacy\"\nmouse = true\nmouse_wheel_lines = 23\n\
+             panel_width = 24\nquick_open_max_files = 25\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -401,6 +426,8 @@ mod tests {
             completion_rows: 22,
             mouse: true,
             mouse_wheel_lines: 23,
+            panel_width: 24,
+            quick_open_max_files: 25,
         };
         assert_eq!(config, expected);
     }
@@ -506,6 +533,11 @@ mod tests {
         assert_eq!(
             invalid_key("mouse_wheel_lines = 1001\n"),
             "mouse_wheel_lines"
+        );
+        assert_eq!(invalid_key("panel_width = 10\n"), "panel_width");
+        assert_eq!(
+            invalid_key("quick_open_max_files = 0\n"),
+            "quick_open_max_files"
         );
         assert_eq!(load_str("tab_width = 16\n").expect("valid").tab_width, 16);
         assert_eq!(load_str("tab_width = 1\n").expect("valid").tab_width, 1);

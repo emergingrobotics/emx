@@ -58,6 +58,8 @@ const MODELINE_TAIL: &str = " Tail";
 const VERTICAL_BORDER_GLYPH: &str = "|";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
 const MODELINE_FILL: &str = "-";
+/// The panel's modeline before its root is known.
+const PANEL_MODELINE: &str = "Tree";
 const UNKNOWN_LINE: &str = "?";
 const NEWLINE: u8 = b'\n';
 /// `%p` computes differently above this size to avoid overflow.
@@ -81,7 +83,11 @@ pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>)
     let mut prefetch = Vec::new();
     let frame = editor.frame(client);
     let mut cursor = None;
-    for (window_id, _) in frame.boxes() {
+    let panel = frame.panel_box().map(|(window, _)| window);
+    let windows = panel
+        .into_iter()
+        .chain(frame.boxes().into_iter().map(|(window, _)| window));
+    for window_id in windows {
         let area = editor.window_area(client, window_id);
         let selected = window_id == frame.selected;
         let window_cursor = draw_window(
@@ -218,7 +224,10 @@ fn draw_window(
             },
         };
         let mut writer = RowWriter::within(grid, row, area, tab_width(editor));
-        draw_modeline(&mut writer, &modeline);
+        match &buffer.tree {
+            Some(tree) => draw_panel_modeline(&mut writer, tree, modeline.face),
+            None => draw_modeline(&mut writer, &modeline),
+        }
     }
     if let Some(col) = area.border {
         for row in area.box_top..area.box_top.saturating_add(area.box_rows) {
@@ -564,6 +573,23 @@ impl RowWriter<'_> {
             self.write(b" ", face, face);
         }
     }
+}
+
+/// The file panel's modeline: the name of the project it shows.
+fn draw_panel_modeline(writer: &mut RowWriter, tree: &crate::editor::TreeData, face: Face) {
+    let name = tree
+        .root
+        .as_ref()
+        .and_then(|root| root.file_name())
+        .map_or_else(
+            || PANEL_MODELINE.as_bytes().to_vec(),
+            |name| name.as_encoded_bytes().to_vec(),
+        );
+    writer.write(MODELINE_FRONT.as_bytes(), face, face);
+    writer.write(b" ", face, face);
+    writer.write(&name, face, Face::EscapeGlyph);
+    writer.write(b" ", face, face);
+    writer.fill(MODELINE_FILL.as_bytes(), face);
 }
 
 /// Emacs 29's default `mode-line-format` for a Fundamental-mode buffer as

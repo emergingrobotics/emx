@@ -29,8 +29,7 @@ pub(super) fn delete_window(ctx: &mut CommandContext) -> Result<(), CommandError
 
 pub(super) fn delete_other_windows(ctx: &mut CommandContext) -> Result<(), CommandError> {
     let client = ctx.client;
-    ctx.editor().delete_other_windows_command(client);
-    Ok(())
+    ctx.editor().delete_other_windows_command(client)
 }
 
 pub(super) fn other_window(ctx: &mut CommandContext) -> Result<(), CommandError> {
@@ -57,4 +56,68 @@ pub(super) fn list_buffers(ctx: &mut CommandContext) -> Result<(), CommandError>
 pub(super) fn buffer_menu_this_window(ctx: &mut CommandContext) -> Result<(), CommandError> {
     let client = ctx.client;
     ctx.editor().buffer_menu_this_window_command(client)
+}
+
+/// `toggle-tree` (`F8`): opens or closes the file panel.
+pub(super) fn toggle_tree(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().toggle_tree_command(client)
+}
+
+pub(super) fn tree_next_line(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let (client, count) = (ctx.client, ctx.prefix_arg.numeric_value());
+    ctx.editor().tree_move_command(client, count)
+}
+
+pub(super) fn tree_previous_line(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let (client, count) = (ctx.client, ctx.prefix_arg.numeric_value());
+    ctx.editor()
+        .tree_move_command(client, count.saturating_neg())
+}
+
+pub(super) fn tree_open(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().tree_open_command(client)
+}
+
+pub(super) fn tree_toggle(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().tree_toggle_command(client)
+}
+
+pub(super) fn tree_up(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().tree_up_command(client)
+}
+
+pub(super) fn tree_refresh(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().tree_refresh_command(client)
+}
+
+pub(super) fn tree_toggle_ignored(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().tree_toggle_ignored_command(client)
+}
+
+pub(super) fn tree_create_directory(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().tree_create_directory_command(client)
+}
+
+pub(super) fn tree_rename(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().tree_rename_command(client)
+}
+
+pub(super) fn tree_delete(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().tree_delete_command(client)
+}
+
+/// `project-find-file` (`C-x p f`).
+pub(super) fn project_find_file(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().project_find_file_command(client);
+    Ok(())
 }

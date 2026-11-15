@@ -847,3 +847,31 @@ fn mouse_clicks_move_point() {
         assert!(off > find(&tail, on).expect("turned on"));
     }
 }
+
+/// The file panel through the real server: F8 lists the project, `RET`
+/// opens a file, and a file created outside the editor appears on its
+/// own (the tree watcher).
+#[test]
+fn file_panel_lists_opens_and_updates_live() {
+    let env = TestEnv::new();
+    let _reaper = SessionReaper::new(&env);
+    std::fs::create_dir(env.work.join(".git")).expect("a project");
+    env.file("alpha.txt", "alpha contents\n");
+    env.file("beta.txt", "beta\n");
+    let mut pty = Pty::spawn(&env, &["alpha.txt"]);
+    pty.wait_modeline(|modeline| modeline.contains("alpha.txt") && !modeline.contains("Loading"));
+    pty.keys("<f8>");
+    pty.wait_screen("the panel", |rows| {
+        rows.iter().any(|row| row.starts_with("    alpha.txt"))
+            && rows.iter().any(|row| row.starts_with("    beta.txt"))
+    });
+    std::fs::write(env.work.join("gamma.txt"), "").expect("a new file");
+    pty.wait_screen("the new file", |rows| {
+        rows.iter().any(|row| row.starts_with("    gamma.txt"))
+    });
+    // beta.txt is the second entry.
+    pty.keys("n n RET");
+    pty.wait_modeline(|modeline| modeline.contains("beta.txt"));
+    pty.keys("C-x C-c");
+    assert!(pty.wait_exit().success());
+}

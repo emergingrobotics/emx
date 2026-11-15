@@ -194,6 +194,8 @@ const FUNDAMENTAL_MODE: &str = "Fundamental";
 const BUFFER_MENU_MODE: &str = "Buffer Menu";
 /// Emacs `mode-name` of `messages-buffer-mode`.
 const MESSAGES_MODE: &str = "Messages";
+/// The mode name of the file panel's buffer.
+const TREE_MODE: &str = "Tree";
 
 #[derive(Debug)]
 pub struct Buffer {
@@ -238,6 +240,8 @@ pub struct Buffer {
     pub(crate) occur: Option<OccurData>,
     /// The mode name of a special buffer (`*Occur*`, `*Help*`).
     pub(crate) special_mode: Option<&'static str>,
+    /// Set while the buffer is a client's file panel.
+    pub(crate) tree: Option<Box<crate::editor::TreeData>>,
     /// Emacs `recent-auto-save-p`: auto-saved since last read or saved, so
     /// the auto-save file is this session's and a save may delete it.
     pub(crate) auto_saved_since_save: bool,
@@ -286,6 +290,7 @@ impl Buffer {
             messages: false,
             occur: None,
             special_mode: None,
+            tree: None,
             auto_saved_since_save: false,
             checkpoints,
             faces: FaceSpans::new(),
@@ -300,6 +305,8 @@ impl Buffer {
     pub(crate) fn mode_name(&self) -> &'static str {
         if self.menu.is_some() {
             BUFFER_MENU_MODE
+        } else if self.tree.is_some() {
+            TREE_MODE
         } else if let Some(mode) = self.special_mode {
             mode
         } else if self.messages {

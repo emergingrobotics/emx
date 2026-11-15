@@ -394,10 +394,14 @@ fn input_directory(directory_part: &[u8], default_directory: &Path) -> PathBuf {
 /// how they are shown.
 #[derive(Debug, Clone)]
 pub(crate) enum Kind {
-    File { default_directory: PathBuf },
+    File {
+        default_directory: PathBuf,
+    },
     Buffer,
     Command,
     KillRing,
+    /// `project-find-file`: paths relative to the project root.
+    ProjectFile,
 }
 
 /// One prompt's completion state: the candidates, the matches for the
@@ -513,7 +517,7 @@ impl Completer {
                 }
                 name.to_vec()
             }
-            Kind::Buffer | Kind::Command | Kind::KillRing => input.to_vec(),
+            Kind::Buffer | Kind::Command | Kind::KillRing | Kind::ProjectFile => input.to_vec(),
         };
         let narrowing = self
             .filtered_for
@@ -613,7 +617,9 @@ impl Completer {
                 completed.extend_from_slice(candidate.text());
                 completed
             }
-            Kind::Buffer | Kind::Command | Kind::KillRing => candidate.text().to_vec(),
+            Kind::Buffer | Kind::Command | Kind::KillRing | Kind::ProjectFile => {
+                candidate.text().to_vec()
+            }
         }
     }
 
@@ -697,7 +703,9 @@ impl Completer {
     pub(crate) fn display(&self, candidate: &Candidate, columns: usize) -> Vec<u8> {
         match self.kind {
             Kind::KillRing => kill_display(candidate.text(), columns),
-            Kind::File { .. } | Kind::Buffer | Kind::Command => candidate.text().to_vec(),
+            Kind::File { .. } | Kind::Buffer | Kind::Command | Kind::ProjectFile => {
+                candidate.text().to_vec()
+            }
         }
     }
 }

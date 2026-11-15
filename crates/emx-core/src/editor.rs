@@ -6,6 +6,7 @@ mod kmacro;
 mod messages;
 mod mouse;
 mod occurring;
+mod panel;
 mod rectangles;
 mod registers;
 mod reload;
@@ -40,6 +41,7 @@ use crate::render::{PrefetchRequest, render};
 use crate::undo::{UndoLimits, outer_limit_warning};
 pub(crate) use files::Purpose;
 use files::{AutoSaveRequest, ExitWait, SaveFlow, SaveRequest};
+pub(crate) use panel::TreeData;
 use registers::{RegisterRead, RegisterValue};
 use reload::ReloadRequest;
 use replacing::QueryReplace;
@@ -173,6 +175,8 @@ struct Client {
     pending_goto: Option<PendingGoto>,
     /// The mouse drag the last press started, until its release.
     mouse_drag: Option<mouse::MouseDrag>,
+    /// A `project-find-file` waiting for the project's files.
+    quick_open: Option<panel::QuickOpen>,
 }
 
 /// A `goto-line` whose target line is not yet indexed: the jump completes
@@ -217,6 +221,8 @@ enum TimerPurpose {
     Settle(BufferId),
     /// The automatic reloads of one settle round are summarized.
     ReloadSummary,
+    /// A client's file panel lists changed directories again.
+    TreeRefresh(ClientId),
 }
 
 /// How a command finished, for the command loop's bookkeeping.
@@ -314,6 +320,8 @@ pub struct Editor {
     /// `isearch-mode-map` and `occur-mode-map`.
     isearch_keymap: Keymap,
     occur_keymap: Keymap,
+    /// The file panel's map.
+    tree_keymap: Keymap,
     /// Names the next `Effect::StartSearch`.
     next_search: u64,
     /// Emacs `search-ring` and `regexp-search-ring`, newest first.
@@ -342,6 +350,11 @@ pub struct Editor {
     killed_rectangle: Option<Vec<Vec<u8>>>,
     /// Emacs `xterm-mouse-mode`: terminal clients report the mouse.
     mouse: bool,
+    /// Each client's file panel buffer.
+    trees: BTreeMap<ClientId, BufferId>,
+    /// The width the next panel opens with, its border included: the
+    /// config's, until a panel is resized.
+    panel_width: u16,
 }
 
 impl Editor {
@@ -409,6 +422,7 @@ impl Editor {
             buffer_menu_keymap: Keymap::buffer_menu(),
             isearch_keymap: Keymap::isearch(),
             occur_keymap: Keymap::occur(),
+            tree_keymap: Keymap::tree(),
             next_search: 0,
             search_ring: VecDeque::new(),
             regexp_search_ring: VecDeque::new(),
@@ -424,6 +438,8 @@ impl Editor {
             last_kbd_macro: None,
             killed_rectangle: None,
             mouse: config.mouse,
+            trees: BTreeMap::new(),
+            panel_width: u16::try_from(config.panel_width).expect("panel_width is validated small"),
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -472,6 +488,12 @@ impl Editor {
                 self.note_terminal_activity(client);
                 self.handle_mouse(client, event);
             }
+            Event::Tree { client, outcome } => {
+                if self.clients.contains_key(&client) {
+                    self.tree_result(client, outcome);
+                }
+            }
+            Event::TreeChanged { dir } => self.tree_changed(&dir),
             Event::Paste { client, data, last } => {
                 self.note_terminal_activity(client);
                 self.paste_chunk(client, data, last);
@@ -501,7 +523,10 @@ impl Editor {
             } => self.save_progress(buffer, written_bytes, total_bytes),
             Event::Timer(id) => self.handle_timer(id),
             Event::FileLoaded { buffer, result } => self.file_loaded(buffer, result),
-            Event::SaveFinished { buffer, result } => self.save_finished(buffer, result),
+            Event::SaveFinished { buffer, result } => {
+                self.save_finished(buffer, result);
+                self.files_changed_for_trees();
+            }
             Event::AutoSaved { buffer, result } => self.auto_saved(buffer, result),
             Event::AutoSaveRead { buffer, result } => self.auto_save_read(buffer, result),
             Event::Recovered(buffers) => self.recovered(buffers),
@@ -512,7 +537,10 @@ impl Editor {
                 self.polled_paths.remove(&path);
             }
             Event::Observed { buffer, result } => self.observed(buffer, result),
-            Event::Reloaded { buffer, result } => self.reloaded(buffer, result),
+            Event::Reloaded { buffer, result } => {
+                self.reloaded(buffer, result);
+                self.files_changed_for_trees();
+            }
             Event::AppendRead { buffer, result } => self.append_read(buffer, result),
             Event::DiffReady {
                 requester, result, ..
@@ -734,6 +762,7 @@ impl Editor {
                 dabbrev: None,
                 pending_goto: None,
                 mouse_drag: None,
+                quick_open: None,
             },
         );
         if kind == ClientKind::Tui && self.mouse {
@@ -750,6 +779,19 @@ impl Editor {
 
     fn detach(&mut self, client: ClientId) {
         self.cancel_search(client);
+        if let Some(panel) = self.frame(client).panel()
+            && self.frame(client).selected == panel.window
+        {
+            let main = self.main_window(client);
+            self.client_mut(client).frame.selected = main;
+        }
+        if let Some(buffer) = self.trees.remove(&client) {
+            self.forget_tree(buffer);
+            if let Some((window, history)) = self.client_mut(client).frame.close_panel() {
+                self.discard_window(window, history);
+            }
+            self.kill_buffer(buffer);
+        }
         let mut removed = self
             .clients
             .remove(&client)
@@ -824,6 +866,7 @@ impl Editor {
             TimerPurpose::CursorEvent(client) => self.cursor_timer_expired(client, id),
             TimerPurpose::Settle(buffer) => self.settle_timer(buffer, id),
             TimerPurpose::ReloadSummary => self.reload_summary_timer(id),
+            TimerPurpose::TreeRefresh(client) => self.tree_refresh_timer(client),
         }
     }
 
@@ -1246,7 +1289,7 @@ impl Editor {
         let buffer = &self.buffers[frame.windows[window].buffer];
         frame
             .window_box(window)
-            .area(frame.cols(), buffer.menu.is_some())
+            .area(frame.width(), buffer.menu.is_some())
     }
 
     pub(crate) fn window_start(&self, client_id: ClientId, window: WindowId) -> ScreenLine {

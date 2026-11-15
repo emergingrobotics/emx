@@ -18,6 +18,14 @@ pub enum Face {
     ChangedMarker,
     /// The selected completion candidate (Emacs `icomplete-selected-match`).
     CompletionSelected,
+    /// A directory in the file panel.
+    PanelDirectory,
+    /// Git status in the file panel: modified, added, untracked, and an
+    /// ignored entry shown on request.
+    GitModified,
+    GitAdded,
+    GitUntracked,
+    GitIgnored,
 }
 
 /// A width of 0 marks the trailing half of a wide character.

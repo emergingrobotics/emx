@@ -12,11 +12,15 @@
 //!   indexer thread per large file counts lines (`workers`);
 //! - a watcher thread reports changes to visited files, and a poller
 //!   thread looks for them on network filesystems (`watcher`);
+//! - a tree watcher thread reports changes to the directories file panels
+//!   show (`tree_watcher`), and the panels' jobs run on threads of their
+//!   own (`workers::TreeTasks`);
 //! - a signal thread turns SIGTERM and SIGINT into a clean exit.
 
 pub mod client_conn;
 pub mod journal_writer;
 pub mod local;
+pub mod tree_watcher;
 pub mod watcher;
 pub mod workers;
 
@@ -44,8 +48,11 @@ use signal_hook::iterator::Signals;
 use crate::paths::{self, JournalMode};
 use client_conn::{Delivery, Outbox};
 use journal_writer::{JournalBackend, JournalFailure, JournalThread};
+use tree_watcher::TreeWatcher;
 use watcher::Watcher;
-use workers::{Deliver, Indexers, Job, Listers, Pool, PrefetchTracker, Searchers, prefetch_cache};
+use workers::{
+    Deliver, Indexers, Job, Listers, Pool, PrefetchTracker, Searchers, TreeTasks, prefetch_cache,
+};
 
 /// A server that finds the lock held retries for this long, so one
 /// started while the previous one is exiting still comes up.
@@ -301,6 +308,8 @@ pub struct Server {
     listers: Listers,
     searchers: Searchers,
     watcher: Watcher,
+    tree_tasks: TreeTasks,
+    tree_watcher: TreeWatcher,
     deliver: Deliver,
     /// Events the server itself raised while carrying out effects.
     raised: VecDeque<Event>,
@@ -361,6 +370,8 @@ impl Server {
         );
         let watcher =
             Watcher::spawn(&config, deliver.clone()).context("starting the file watcher")?;
+        let tree_watcher =
+            TreeWatcher::spawn(deliver.clone()).context("starting the tree watcher")?;
         let editor = Editor::with_session(config, session)?;
         Ok(Server {
             editor,
@@ -375,6 +386,8 @@ impl Server {
             listers: Listers::new(deliver.clone()),
             searchers: Searchers::new(deliver.clone()),
             watcher,
+            tree_tasks: TreeTasks::new(deliver.clone()),
+            tree_watcher,
             deliver,
             raised: VecDeque::new(),
             shutdown: false,
@@ -630,6 +643,9 @@ impl Server {
                 Effect::StartSearch(job) => self.searchers.submit(job),
                 Effect::Watch { path } => self.watcher.watch(path),
                 Effect::Unwatch { path } => self.watcher.unwatch(path),
+                Effect::Tree { client, job } => self.tree_tasks.submit(client, job),
+                Effect::WatchTree { dir } => self.tree_watcher.watch(dir),
+                Effect::UnwatchTree { dir } => self.tree_watcher.unwatch(dir),
                 Effect::Shutdown => self.shutdown = true,
             }
         }

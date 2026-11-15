@@ -7,6 +7,8 @@ repository.workspace = true
 description = "Editor core (buffers, commands, persistence) for the emx editor"
 
 [dependencies]
+gix = { version = "0.90", default-features = false, features = ["status", "sha1"] }
+ignore = "0.4"
 crc32fast.workspace = true
 emx-proto.workspace = true
 emx-text.workspace = true

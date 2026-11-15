@@ -44,6 +44,8 @@ pub(crate) enum MouseDrag {
     Modeline { window: WindowId, row: u16 },
     /// A vertical border being dragged moves the window's right edge.
     Border { window: WindowId, col: u16 },
+    /// The file panel's border being dragged resizes the panel.
+    PanelBorder,
 }
 
 /// What is drawn at a cell of the frame.
@@ -57,6 +59,12 @@ enum Spot {
     },
     Modeline(WindowId),
     Border(WindowId),
+    /// A row of the file panel's text.
+    Panel {
+        window: WindowId,
+        row: u16,
+    },
+    PanelBorder(WindowId),
     Elsewhere,
 }
 
@@ -106,6 +114,23 @@ impl Editor {
 
     fn spot(&self, client_id: ClientId, col: u16, row: u16) -> Spot {
         let frame = self.frame(client_id);
+        if let Some((window, _)) = frame.panel_box() {
+            let area = self.window_area(client_id, window);
+            let within_rows =
+                row >= area.box_top && row < area.box_top.saturating_add(area.box_rows);
+            if within_rows && area.border == Some(col) {
+                return Spot::PanelBorder(window);
+            }
+            if within_rows && col < area.left.saturating_add(area.cols) {
+                if row >= area.top && row < area.top.saturating_add(area.text_rows) {
+                    return Spot::Panel {
+                        window,
+                        row: row - area.top,
+                    };
+                }
+                return Spot::Elsewhere;
+            }
+        }
         for (window, _) in frame.boxes() {
             let area = self.window_area(client_id, window);
             if row < area.box_top || row >= area.box_top.saturating_add(area.box_rows) {
@@ -237,6 +262,15 @@ impl Editor {
                     col: event.col,
                 }
             }
+            Spot::Panel { row, .. } => {
+                self.mouse_interrupts(client_id);
+                self.panel_click(client_id, row);
+                return;
+            }
+            Spot::PanelBorder(_) => {
+                self.mouse_interrupts(client_id);
+                MouseDrag::PanelBorder
+            }
             Spot::Elsewhere => return,
         };
         self.client_mut(client_id).mouse_drag = Some(drag);
@@ -293,6 +327,10 @@ impl Editor {
                     row: moved_by(row, moved),
                 });
             }
+            MouseDrag::PanelBorder => {
+                // The border is the panel's last column.
+                self.resize_panel(client_id, event.col.saturating_add(1));
+            }
             MouseDrag::Border { window, col } => {
                 if !live(self, window) {
                     self.client_mut(client_id).mouse_drag = None;
@@ -340,7 +378,11 @@ impl Editor {
     /// at either end of the buffer.
     fn mouse_wheel(&mut self, client_id: ClientId, event: MouseEvent) {
         let window = match self.spot(client_id, event.col, event.row) {
-            Spot::Text { window, .. } | Spot::Modeline(window) | Spot::Border(window) => window,
+            Spot::Text { window, .. }
+            | Spot::Modeline(window)
+            | Spot::Border(window)
+            | Spot::Panel { window, .. }
+            | Spot::PanelBorder(window) => window,
             Spot::Elsewhere => return,
         };
         let direction = match event.button {

@@ -21,6 +21,7 @@ pub mod reload;
 mod render;
 pub mod search_job;
 pub mod testing;
+pub mod tree;
 mod undo;
 mod window;
 

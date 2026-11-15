@@ -13,6 +13,7 @@ use crate::journal::{JournalOp, RecoveredBuffer};
 use crate::reload::{AppendRead, Observation, Reloaded};
 use crate::render::PrefetchRequest;
 use crate::search_job::{SearchJob, SearchOutcome};
+use crate::tree::{TreeJob, TreeOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClientId(pub u64);
@@ -43,6 +44,16 @@ pub enum Event {
     ClientDetached(ClientId),
     Key(ClientId, Key),
     Mouse(ClientId, MouseEvent),
+    /// The result of an `Effect::Tree`, as `tree::run_tree_job` made it.
+    Tree {
+        client: ClientId,
+        outcome: TreeOutcome,
+    },
+    /// Something in a directory watched for the file panel was created,
+    /// deleted or renamed.
+    TreeChanged {
+        dir: PathBuf,
+    },
     /// A chunk of a bracketed paste. The chunks are collected until the
     /// `last` one, then inserted as one change, never looked up as keys.
     Paste {
@@ -177,6 +188,20 @@ pub enum Event {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Send(ClientId, ServerMsg),
+    /// Run the file panel's `job` off the editor thread and deliver
+    /// `Event::Tree`.
+    Tree {
+        client: ClientId,
+        job: TreeJob,
+    },
+    /// Report changes to the entries of `dir` with `Event::TreeChanged`,
+    /// for the file panel; not done on network filesystems.
+    WatchTree {
+        dir: PathBuf,
+    },
+    UnwatchTree {
+        dir: PathBuf,
+    },
     /// Deliver `Event::Timer(id)` once `after` has elapsed.
     SetTimer {
         id: TimerId,
