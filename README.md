@@ -105,6 +105,8 @@ Mouse support is off by default, because turning it on takes over the terminal's
 
 emx works in Kitty-protocol terminals (kitty, WezTerm, Ghostty, foot, recent Alacritty) and in legacy terminals: xterm, GNOME Terminal and other VTE terminals, Alacritty, the Linux console, tmux and GNU screen. It asks the terminal at startup which it is. To skip the question, set `EMX_KEYBOARD=kitty` or `EMX_KEYBOARD=legacy`.
 
+On macOS, emx builds (`make macos`, or `cargo install` on a Mac) and uses the same keyboard handling in Terminal.app and iTerm2; set Option to act as Meta in the terminal's settings, or `M-` keys will not work. macOS is less tested than Linux.
+
 In a legacy terminal, Alt sends an ESC prefix (emx turns this on in xterm), and a lone Escape takes effect after 50 ms. Some Ctrl combinations, such as `C-%`, only reach emx in xterm and in tmux with `extended-keys` on.
 
 ## Build and test

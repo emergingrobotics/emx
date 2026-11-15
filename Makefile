@@ -3,12 +3,13 @@
 TEST_ARGS ?=
 FUZZ_SECONDS ?= 60
 MUSL_TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+MACOS_TARGETS := x86_64-apple-darwin aarch64-apple-darwin
 BENCH_SIZES := 10MB 100MB-line 1GB
 BENCH_FULL_SIZES := $(BENCH_SIZES) 10GB
 INSTALL_DIR ?= $(HOME)/.local/bin
 SYS_INSTALL_DIR ?= /usr/local/bin
 
-.PHONY: help build install install-sys test run-tests difftest check fmt fuzz bench bench-full static deb clean publish-dry-run publish
+.PHONY: help build install install-sys test run-tests difftest check fmt fuzz bench bench-full static deb macos clean publish-dry-run publish
 
 help:
 	@echo "Targets:"
@@ -25,6 +26,7 @@ help:
 	@echo "  bench-full       Benchmarks on 10 MB, 1 GB and 10 GB corpora"
 	@echo "  static           Static musl builds for x86_64 and aarch64"
 	@echo "  deb              .deb packages (amd64, arm64) from the static builds"
+	@echo "  macos            macOS builds (x86_64, arm64); needs SDKROOT set to a macOS SDK"
 	@echo "  clean            Remove build artifacts"
 	@echo "  publish-dry-run  Validate packaging of all crates for crates.io"
 	@echo "  publish          Publish all crates to crates.io in dependency order"
@@ -105,6 +107,18 @@ deb: static
 		cargo deb --no-build --no-strip --target $$target || exit 1; \
 	done
 	ls -l target/debian/*.deb
+
+# Cross-builds for macOS with zig. Linking needs Apple's frameworks, so
+# SDKROOT must point at a macOS SDK (on a Mac, `xcrun --show-sdk-path`).
+macos:
+	@test -n "$(SDKROOT)" || { echo "SDKROOT must name a macOS SDK"; exit 1; }
+	rustup target add $(MACOS_TARGETS)
+	cargo install cargo-zigbuild
+	python3 -m pip install --user --break-system-packages ziglang
+	for target in $(MACOS_TARGETS); do \
+		echo cargo zigbuild --release -p emx --target $$target; \
+		cargo zigbuild --release -p emx --target $$target || exit 1; \
+	done
 
 clean:
 	cargo clean
