@@ -357,6 +357,10 @@ pub struct Editor {
     /// The width the next panel opens with, its border included: the
     /// config's, until a panel is resized.
     panel_width: u16,
+    /// The kill ring generation last sent to a terminal's clipboard.
+    clipboard_generation: u64,
+    /// The terminal client whose input the current event is.
+    input_client: Option<ClientId>,
 }
 
 impl Editor {
@@ -442,6 +446,8 @@ impl Editor {
             mouse: config.mouse,
             trees: BTreeMap::new(),
             panel_width: u16::try_from(config.panel_width).expect("panel_width is validated small"),
+            clipboard_generation: 0,
+            input_client: None,
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -474,6 +480,11 @@ impl Editor {
 
     pub fn handle(&mut self, event: Event) {
         self.journal_outbox.begin_event();
+        self.input_client = match &event {
+            Event::Key(client, _) | Event::Mouse(client, _) => Some(*client),
+            Event::Paste { client, .. } => Some(*client),
+            _ => None,
+        };
         match event {
             Event::ClientAttached {
                 client,
@@ -558,6 +569,7 @@ impl Editor {
             }
             Event::SearchResult { client, id, result } => self.search_result(client, id, result),
         }
+        self.send_clipboard();
         self.sync_watches();
         self.redisplay();
         self.report_cursors();
@@ -830,6 +842,36 @@ impl Editor {
         self.client_detached(client, removed.kind);
         self.grace_timer = None;
         self.maybe_arm_grace();
+    }
+
+    /// A new kill goes to the system clipboard of the terminal whose input
+    /// made it (DESIGN section 7: kill ring to clipboard only).
+    fn send_clipboard(&mut self) {
+        let generation = self.kill_ring.generation();
+        if generation == self.clipboard_generation {
+            return;
+        }
+        self.clipboard_generation = generation;
+        if !self.config.osc52_clipboard {
+            return;
+        }
+        let Some(client) = self.input_client else {
+            return;
+        };
+        let Some(text) = self.kill_ring.newest() else {
+            return;
+        };
+        if text.len() as u64 > self.config.osc52_max_bytes
+            || self
+                .clients
+                .get(&client)
+                .is_none_or(|state| state.kind != ClientKind::Tui)
+        {
+            return;
+        }
+        let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text);
+        self.effects
+            .push(Effect::Send(client, ServerMsg::Clipboard { data_b64 }));
     }
 
     fn set_timer(&mut self, purpose: TimerPurpose, after_ms: u64) -> TimerId {

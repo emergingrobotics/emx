@@ -73,6 +73,11 @@ pub const QUICK_OPEN_MAX_FILES: u64 = 100_000;
 /// this length (DESIGN section 5).
 pub const HIGHLIGHT_MAX_FILE: u64 = 50 * 1000 * 1000;
 pub const HIGHLIGHT_MAX_LINE: u64 = 10 * 1000;
+/// Kills go to the system clipboard through the terminal (OSC 52).
+pub const OSC52_CLIPBOARD: bool = true;
+/// Longer kills are not sent: terminals refuse large OSC 52 payloads
+/// (xterm's limit is about 100 KB of base64).
+pub const OSC52_MAX_BYTES: u64 = 74_994;
 /// Emacs `show-paren-mode`, on by default since Emacs 28.
 pub const SHOW_PAREN_MODE: bool = true;
 /// How far a paren's match is looked for (Emacs
@@ -132,6 +137,8 @@ pub struct Config {
     pub highlight_max_line: u64,
     pub show_paren_mode: bool,
     pub show_paren_max_distance: u64,
+    pub osc52_clipboard: bool,
+    pub osc52_max_bytes: u64,
 }
 
 impl Default for Config {
@@ -173,6 +180,8 @@ impl Default for Config {
             highlight_max_line: HIGHLIGHT_MAX_LINE,
             show_paren_mode: SHOW_PAREN_MODE,
             show_paren_max_distance: SHOW_PAREN_MAX_DISTANCE,
+            osc52_clipboard: OSC52_CLIPBOARD,
+            osc52_max_bytes: OSC52_MAX_BYTES,
         }
     }
 }
@@ -410,7 +419,8 @@ mod tests {
              indent_tabs_mode = false\ncursor_event_interval_ms = 21\ncompletion_rows = 22\n\
              keyboard_encoding = \"legacy\"\nmouse = true\nmouse_wheel_lines = 23\n\
              panel_width = 24\nquick_open_max_files = 25\nhighlight_max_file = 26\n\
-             highlight_max_line = 27\nshow_paren_mode = false\nshow_paren_max_distance = 28\n",
+             highlight_max_line = 27\nshow_paren_mode = false\nshow_paren_max_distance = 28\n\
+             osc52_clipboard = false\nosc52_max_bytes = 29\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -450,6 +460,8 @@ mod tests {
             highlight_max_line: 27,
             show_paren_mode: false,
             show_paren_max_distance: 28,
+            osc52_clipboard: false,
+            osc52_max_bytes: 29,
         };
         assert_eq!(config, expected);
     }

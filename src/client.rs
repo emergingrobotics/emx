@@ -740,6 +740,10 @@ impl Client {
                 terminal.write(BELL)?;
                 None
             }
+            ServerMsg::Clipboard { data_b64 } => {
+                terminal.write(&osc52(&data_b64))?;
+                None
+            }
             ServerMsg::Modes { mouse } => {
                 if mouse != self.mouse {
                     self.mouse = mouse;
@@ -808,6 +812,11 @@ impl Client {
             Some(End::quiet_failure())
         }
     }
+}
+
+/// Sets the terminal's clipboard (selection `c`) to the base64 text.
+fn osc52(data_b64: &str) -> Vec<u8> {
+    format!("\x1b]52;c;{data_b64}\x07").into_bytes()
 }
 
 /// Counts clicks: presses of one button on one cell, each within

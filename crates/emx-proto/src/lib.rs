@@ -272,6 +272,10 @@ pub enum ServerMsg {
     Modes {
         mouse: bool,
     },
+    /// Text for the system clipboard: the client sets it with OSC 52.
+    Clipboard {
+        data_b64: String,
+    },
     Response {
         id: u64,
         result: Result<Response, WireError>,

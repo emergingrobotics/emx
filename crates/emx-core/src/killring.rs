@@ -13,6 +13,9 @@ pub struct KillRing {
     entries: VecDeque<Vec<u8>>,
     yank_pointer: usize,
     max: usize,
+    /// Counts changes to the newest kill, so whoever mirrors it (the
+    /// terminal clipboard) knows when it changed.
+    generation: u64,
 }
 
 impl KillRing {
@@ -23,6 +26,7 @@ impl KillRing {
             entries: VecDeque::new(),
             yank_pointer: 0,
             max,
+            generation: 0,
         }
     }
 
@@ -45,6 +49,16 @@ impl KillRing {
         self.entries.push_front(text);
         self.entries.truncate(self.max);
         self.yank_pointer = 0;
+        self.generation += 1;
+    }
+
+    /// Changes whenever the newest kill does.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn newest(&self) -> Option<&[u8]> {
+        self.entries.front().map(Vec::as_slice)
     }
 
     /// Emacs `kill-append`: extend the newest kill (prepend when `before`),
@@ -62,6 +76,7 @@ impl KillRing {
             newest.extend_from_slice(text);
         }
         self.yank_pointer = 0;
+        self.generation += 1;
     }
 
     /// Where `kill-ring-yank-pointer` is: 0 for the newest kill.
