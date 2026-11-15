@@ -3,7 +3,7 @@
 TEST_ARGS ?=
 FUZZ_SECONDS ?= 60
 MUSL_TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
-BENCH_SIZES := 10MB 1GB
+BENCH_SIZES := 10MB 100MB-line 1GB
 BENCH_FULL_SIZES := $(BENCH_SIZES) 10GB
 
 .PHONY: help build test run-tests difftest check fmt fuzz bench bench-full static clean publish-dry-run publish
@@ -54,25 +54,33 @@ fuzz:
 		cargo +nightly fuzz run $$target -- -max_total_time=$(FUZZ_SECONDS) || exit 1; \
 	done
 
-bench:
+# The benchmarks drive the real release binary; build it first and point
+# emx-bench at it. Corpora are generated on local disk by emx-bench itself,
+# never under this repository (it is on a network filesystem).
+bench: build
 	for size in $(BENCH_SIZES); do \
 		echo cargo run --release -p emx-bench -- --size $$size; \
-		cargo run --release -p emx-bench -- --size $$size || exit 1; \
+		EMX_BIN=$(CURDIR)/bin/emx cargo run --release -p emx-bench -- --size $$size || exit 1; \
 	done
 
-bench-full:
+bench-full: build
 	for size in $(BENCH_FULL_SIZES); do \
 		echo cargo run --release -p emx-bench -- --size $$size; \
-		cargo run --release -p emx-bench -- --size $$size || exit 1; \
+		EMX_BIN=$(CURDIR)/bin/emx cargo run --release -p emx-bench -- --size $$size || exit 1; \
 	done
 
+# Static musl builds use mimalloc as the global allocator (DESIGN 8: musl's
+# default allocator is too slow). zig is the cross C toolchain, installed as a
+# Python module; --break-system-packages keeps it a user-space install on
+# externally-managed interpreters (no sudo, no system packages touched).
 static:
 	rustup target add $(MUSL_TARGETS)
 	cargo install cargo-zigbuild
-	python3 -m pip install --user ziglang
+	python3 -m pip install --user --break-system-packages ziglang
 	for target in $(MUSL_TARGETS); do \
 		echo cargo zigbuild --release -p emx --target $$target; \
 		cargo zigbuild --release -p emx --target $$target || exit 1; \
+		ls -l target/$$target/release/emx; \
 	done
 
 clean:

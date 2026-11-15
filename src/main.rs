@@ -1,5 +1,12 @@
 #![forbid(unsafe_code)]
 
+// Static musl builds use mimalloc as the global allocator: musl's default
+// allocator is too slow for this workload (DESIGN 8). Only the musl target
+// pulls it in, so the ordinary glibc build is unchanged.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::ffi::OsString;
 use std::process::ExitCode;
 

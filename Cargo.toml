@@ -69,3 +69,8 @@ thiserror = { workspace = true }
 portable-pty = "0.9"
 tempfile = { workspace = true }
 vt100 = "0.15"
+
+# musl's default allocator is too slow for this workload (DESIGN 8); the
+# static builds swap in mimalloc. Only the musl target compiles it.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }

@@ -1153,6 +1153,39 @@ fn apply_edits(mut text: Text, edits: &[JournalEdit]) -> Result<Text, String> {
     Ok(text)
 }
 
+/// Parses journal bytes the way replay does, without touching the
+/// filesystem, so a fuzzer can drive the frame scanner, the record decoder
+/// and the edit-application arithmetic on arbitrary input. The identity
+/// base is not exercised here because rebuilding it reads the visited file;
+/// the snapshot base covers the in-memory edit path. Externally supplied
+/// bytes must never panic the parser, only return an error.
+#[doc(hidden)]
+pub fn parse_for_fuzz(bytes: &[u8]) -> Result<(), String> {
+    let (payloads, _) = scan(bytes)?;
+    let mut base: Option<Text> = None;
+    let mut edits: Vec<JournalEdit> = Vec::new();
+    for payload in payloads {
+        match decode(payload)? {
+            Record::Header(_) => {}
+            Record::EpochSnapshot { content } => {
+                base = Some(content);
+                edits.clear();
+            }
+            Record::EpochIdentity { .. } => {
+                base = None;
+                edits.clear();
+            }
+            Record::Insert { at, bytes } => edits.push(JournalEdit::Insert { at, bytes }),
+            Record::Delete { at, len } => edits.push(JournalEdit::Delete { at, len }),
+            Record::Saved { .. } | Record::Killed => {}
+        }
+    }
+    if let Some(text) = base {
+        let _ = apply_edits(text, &edits)?;
+    }
+    Ok(())
+}
+
 // ---- The editor's side ---------------------------------------------------
 
 /// A buffer's journal as the editor sees it. Nothing is written until the

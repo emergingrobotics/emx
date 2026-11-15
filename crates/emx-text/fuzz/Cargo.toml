@@ -1,0 +1,56 @@
+# Its own workspace: cargo-fuzz builds this crate on nightly with
+# sanitizers, separate from the 1.95.0-pinned main workspace. The main
+# workspace globs `crates/*`, which does not reach this nested directory.
+[workspace]
+
+[package]
+name = "emx-text-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/emergingrobotics/emx"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+emx-text = { path = ".." }
+emx-term = { path = "../../emx-term" }
+emx-core = { path = "../../emx-core" }
+
+[profile.release]
+debug = 1
+# Keep overflow and bounds checks on under the fuzzer so corruption shows
+# as a crash it records rather than silent wrong output.
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "piece_tree"
+path = "fuzz_targets/piece_tree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kitty_decode"
+path = "fuzz_targets/kitty_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_replay"
+path = "fuzz_targets/journal_replay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "emacs_regex"
+path = "fuzz_targets/emacs_regex.rs"
+test = false
+doc = false
+bench = false
