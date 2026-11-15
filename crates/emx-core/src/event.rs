@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use emx_proto::{ClientKind, Request, ServerMsg};
 use emx_text::{FileIdentity, Text};
-use emx_types::Key;
+use emx_types::{Key, MouseEvent};
 
 use crate::buffer::BufferId;
 use crate::completion::{Candidate, ListingError};
@@ -42,6 +42,7 @@ pub enum Event {
     },
     ClientDetached(ClientId),
     Key(ClientId, Key),
+    Mouse(ClientId, MouseEvent),
     /// A chunk of a bracketed paste. The chunks are collected until the
     /// `last` one, then inserted as one change, never looked up as keys.
     Paste {

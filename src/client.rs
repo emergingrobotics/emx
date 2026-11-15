@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use base64::Engine;
@@ -25,9 +25,9 @@ use emx_core::KeyboardEncoding;
 use emx_proto::{ClientKind, ClientMsg, LineReader, Request, ServerMsg, WirePath, write_msg};
 use emx_term::{
     Decoder, InputEvent, KEYBOARD_ENV, Protocol, Screen, StdinSource, Terminal, keyboard_override,
-    probe_protocol,
+    mouse_sequence, probe_protocol,
 };
-use emx_types::Grid;
+use emx_types::{Grid, MouseButton, MouseEvent, MouseKind};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
@@ -41,6 +41,9 @@ pub const KITTY_PROBE_TIMEOUT_MS: u64 = 1000;
 /// before it is the Escape key. Terminals send a sequence's bytes together,
 /// so this only needs to cover a slow link.
 pub const LEGACY_ESCAPE_TIMEOUT_MS: u64 = 50;
+/// Emacs `double-click-time`: presses of one button on one cell this
+/// close together count as a double or triple click.
+pub const DOUBLE_CLICK_MS: u64 = 500;
 pub const CONNECTION_LOST: &str = "emx: server connection lost";
 /// Debug builds panic after drawing the first frame when this is set, so
 /// tests can check that a panicking client restores the terminal.
@@ -446,6 +449,8 @@ fn session(
         link,
         decoder,
         display: Display::new(cols, rows),
+        mouse: false,
+        clicks: ClickCounter::default(),
         cwd,
         files: files.to_vec(),
         wait,
@@ -584,6 +589,9 @@ struct Client {
     link: Box<dyn Link>,
     decoder: Decoder,
     display: Display,
+    /// The server asked for mouse reports.
+    mouse: bool,
+    clicks: ClickCounter,
     cwd: PathBuf,
     files: Vec<FileArgument>,
     wait: bool,
@@ -681,12 +689,16 @@ impl Client {
     fn input_event(&mut self, event: InputEvent) -> Option<End> {
         match event {
             InputEvent::Key(key) => self.send(ClientMsg::Key { key }),
+            InputEvent::Mouse(event) if self.mouse => {
+                let event = self.clicks.count(event, Instant::now());
+                self.send(ClientMsg::Mouse { event })
+            }
             InputEvent::Paste { data, last } => self.send(ClientMsg::Paste {
                 data_b64: STANDARD.encode(data),
                 r#final: last,
             }),
             // Late probe replies, sequences no key maps to, and mouse
-            // reports, which are never asked for yet.
+            // reports from before the server turned reporting off.
             InputEvent::Mouse(_)
             | InputEvent::KittyFlags(_)
             | InputEvent::PrimaryDeviceAttributes
@@ -726,6 +738,14 @@ impl Client {
             },
             ServerMsg::Bell => {
                 terminal.write(BELL)?;
+                None
+            }
+            ServerMsg::Modes { mouse } => {
+                if mouse != self.mouse {
+                    self.mouse = mouse;
+                    self.clicks = ClickCounter::default();
+                    terminal.write(mouse_sequence(mouse))?;
+                }
                 None
             }
             ServerMsg::Response { id, result } => {
@@ -787,6 +807,46 @@ impl Client {
         } else {
             Some(End::quiet_failure())
         }
+    }
+}
+
+/// Counts clicks: presses of one button on one cell, each within
+/// `DOUBLE_CLICK_MS` of the last. A drag or release carries the count of
+/// the press it follows, as Emacs's drag events do.
+#[derive(Debug, Default)]
+struct ClickCounter {
+    last: Option<(MouseButton, u16, u16, Instant)>,
+    count: u8,
+}
+
+impl ClickCounter {
+    fn count(&mut self, mut event: MouseEvent, now: Instant) -> MouseEvent {
+        match event.kind {
+            MouseKind::Press if !event.button.is_wheel() => {
+                let again = self.last.is_some_and(|(button, col, row, at)| {
+                    (button, col, row) == (event.button, event.col, event.row)
+                        && now.saturating_duration_since(at)
+                            <= Duration::from_millis(DOUBLE_CLICK_MS)
+                });
+                self.count = if again {
+                    self.count.saturating_add(1)
+                } else {
+                    1
+                };
+                self.last = Some((event.button, event.col, event.row, now));
+                event.clicks = self.count;
+            }
+            MouseKind::Press | MouseKind::Move => event.clicks = 1,
+            MouseKind::Drag | MouseKind::Release => {
+                event.clicks = self.count.max(1);
+                if event.kind == MouseKind::Drag {
+                    // A drag ends the run: the next press starts counting
+                    // anew.
+                    self.last = None;
+                }
+            }
+        }
+        event
     }
 }
 
@@ -1126,6 +1186,64 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "refusing the server at /run/user/1000/emx/server.sock: it runs as uid 0, not uid 1000"
+        );
+    }
+
+    fn press(col: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseKind::Press,
+            button: MouseButton::Left,
+            col,
+            row: 0,
+            mods: emx_types::Mods::default(),
+            clicks: 1,
+        }
+    }
+
+    #[test]
+    fn clicks_are_counted_on_one_cell_within_the_double_click_time() {
+        let mut counter = ClickCounter::default();
+        let start = Instant::now();
+        let soon = |milliseconds| start + Duration::from_millis(milliseconds);
+        assert_eq!(counter.count(press(3), start).clicks, 1);
+        assert_eq!(counter.count(press(3), soon(200)).clicks, 2);
+        assert_eq!(counter.count(press(3), soon(400)).clicks, 3);
+        let release = MouseEvent {
+            kind: MouseKind::Release,
+            ..press(3)
+        };
+        assert_eq!(counter.count(release, soon(450)).clicks, 3);
+        assert_eq!(
+            counter
+                .count(press(3), soon(400 + DOUBLE_CLICK_MS + 1))
+                .clicks,
+            1,
+            "too late"
+        );
+        assert_eq!(
+            counter.count(press(4), soon(1000)).clicks,
+            1,
+            "another cell"
+        );
+        let drag = MouseEvent {
+            kind: MouseKind::Drag,
+            ..press(5)
+        };
+        assert_eq!(counter.count(drag, soon(1050)).clicks, 1);
+        assert_eq!(
+            counter.count(press(4), soon(1100)).clicks,
+            1,
+            "a drag ends the run"
+        );
+        let wheel = MouseEvent {
+            button: MouseButton::WheelUp,
+            ..press(4)
+        };
+        assert_eq!(counter.count(wheel, soon(1150)).clicks, 1);
+        assert_eq!(
+            counter.count(press(4), soon(1200)).clicks,
+            2,
+            "the wheel does not break a run"
         );
     }
 

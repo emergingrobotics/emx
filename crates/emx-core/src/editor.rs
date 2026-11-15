@@ -4,6 +4,7 @@ mod files;
 mod goto;
 mod kmacro;
 mod messages;
+mod mouse;
 mod occurring;
 mod rectangles;
 mod registers;
@@ -170,6 +171,8 @@ struct Client {
     /// A `goto-line` waiting for the background indexer to reach a line that
     /// lies beyond the counted prefix.
     pending_goto: Option<PendingGoto>,
+    /// The mouse drag the last press started, until its release.
+    mouse_drag: Option<mouse::MouseDrag>,
 }
 
 /// A `goto-line` whose target line is not yet indexed: the jump completes
@@ -337,6 +340,8 @@ pub struct Editor {
     last_kbd_macro: Option<Vec<Key>>,
     /// Emacs `killed-rectangle`, one line of the rectangle per entry.
     killed_rectangle: Option<Vec<Vec<u8>>>,
+    /// Emacs `xterm-mouse-mode`: terminal clients report the mouse.
+    mouse: bool,
 }
 
 impl Editor {
@@ -418,6 +423,7 @@ impl Editor {
             registers: HashMap::new(),
             last_kbd_macro: None,
             killed_rectangle: None,
+            mouse: config.mouse,
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -461,6 +467,10 @@ impl Editor {
             Event::Key(client, key) => {
                 self.note_terminal_activity(client);
                 self.handle_key(client, key.canonical());
+            }
+            Event::Mouse(client, event) => {
+                self.note_terminal_activity(client);
+                self.handle_mouse(client, event);
             }
             Event::Paste { client, data, last } => {
                 self.note_terminal_activity(client);
@@ -723,8 +733,13 @@ impl Editor {
                 register_read: None,
                 dabbrev: None,
                 pending_goto: None,
+                mouse_drag: None,
             },
         );
+        if kind == ClientKind::Tui && self.mouse {
+            self.effects
+                .push(Effect::Send(client, ServerMsg::Modes { mouse: true }));
+        }
         if kind == ClientKind::Tui {
             let selected = self.selected_window_id(client);
             self.bump_use_time(client, selected);

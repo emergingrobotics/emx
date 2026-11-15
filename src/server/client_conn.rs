@@ -366,6 +366,7 @@ pub(super) fn to_event(client: ClientId, message: ClientMsg, cwd: &Path) -> Resu
     Ok(match message {
         ClientMsg::Hello { .. } => return Err("hello sent twice".to_string()),
         ClientMsg::Key { key } => Event::Key(client, key),
+        ClientMsg::Mouse { event } => Event::Mouse(client, event),
         ClientMsg::Paste { data_b64, r#final } => Event::Paste {
             client,
             data: STANDARD

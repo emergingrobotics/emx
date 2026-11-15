@@ -461,7 +461,7 @@ impl EventsTool {
                 continue;
             };
             let value: Value = serde_json::from_str(&line).expect("one json line per event");
-            assert_eq!(value["v"], 1, "{line}");
+            assert_eq!(value["v"], emx_proto::PROTOCOL_VERSION, "{line}");
             if want(&value["event"]) {
                 return value;
             }

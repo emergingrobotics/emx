@@ -261,6 +261,34 @@ impl Node {
         }
     }
 
+    /// The smallest size along the axis a mouse drag may leave the node:
+    /// every live window keeps `window-min-width` columns or
+    /// `window-min-height` rows, as `window-resize` requires.
+    fn min_drag_size(&self, side_by_side: bool) -> u16 {
+        match &self.kind {
+            NodeKind::Live(_) => {
+                if side_by_side {
+                    WINDOW_MIN_WIDTH
+                } else {
+                    WINDOW_MIN_HEIGHT
+                }
+            }
+            NodeKind::Combination {
+                side_by_side: along,
+                children,
+            } => {
+                let sizes = children
+                    .iter()
+                    .map(|child| child.min_drag_size(side_by_side));
+                if *along == side_by_side {
+                    sizes.sum()
+                } else {
+                    sizes.max().unwrap_or(0)
+                }
+            }
+        }
+    }
+
     fn size_of_combination(&self) -> u16 {
         match &self.kind {
             NodeKind::Combination { side_by_side, .. } => self.size(*side_by_side),
@@ -659,6 +687,51 @@ impl Frame {
         children[taller].set_size(false, taller_rows);
         children[shorter].set_size(false, shorter_rows);
         parent.renormalize();
+    }
+
+    /// Emacs `adjust-window-trailing-edge`: moves the edge after `window`
+    /// (its bottom, or its right side when `side_by_side`) by `delta`
+    /// rows or columns, taking them from or giving them to what lies
+    /// beyond it. A window with nothing beyond it along that axis has no
+    /// edge to move. The move is clamped so every window keeps its
+    /// minimum size; returns how far the edge moved.
+    pub(crate) fn adjust_edge(&mut self, window: WindowId, side_by_side: bool, delta: i32) -> i32 {
+        let path = self.path(window);
+        for depth in (0..path.len()).rev() {
+            let (parent_path, index) = (&path[..depth], path[depth]);
+            let parent = self.root.at_mut(parent_path);
+            let NodeKind::Combination {
+                side_by_side: along,
+                children,
+            } = &mut parent.kind
+            else {
+                unreachable!("a parent is a combination")
+            };
+            if *along != side_by_side || index + 1 >= children.len() {
+                continue;
+            }
+            let before = i32::from(children[index].size(side_by_side));
+            let after = i32::from(children[index + 1].size(side_by_side));
+            let least = i32::from(children[index].min_drag_size(side_by_side));
+            let most = before + after - i32::from(children[index + 1].min_drag_size(side_by_side));
+            // A window already below its minimum (on a small terminal)
+            // is never made smaller still.
+            let wanted = if delta < 0 {
+                (before + delta).max(least.min(before))
+            } else {
+                (before + delta).min(most.max(before))
+            };
+            let moved = wanted - before;
+            if moved == 0 {
+                return 0;
+            }
+            let size = |value: i32| u16::try_from(value).expect("sizes stay within the frame");
+            children[index].set_size(side_by_side, size(wanted));
+            children[index + 1].set_size(side_by_side, size(after - moved));
+            parent.renormalize();
+            return moved;
+        }
+        0
     }
 
     /// The most rows a growing minibuffer can take from the windows of a

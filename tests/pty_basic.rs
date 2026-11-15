@@ -814,3 +814,36 @@ fn keyboard_encoding_is_configurable() {
     assert!(kitty.wait_exit().success());
     assert_restored(&kitty);
 }
+
+/// With `mouse = true`, the client turns on SGR mouse reporting when the
+/// server asks, a click moves point, and quitting turns reporting off.
+#[test]
+fn mouse_clicks_move_point() {
+    for probe in [Probe::Answer, Probe::Legacy] {
+        let env = TestEnv::with_config("mouse = true\n");
+        let _reaper = SessionReaper::new(&env);
+        let path = env.file("f.txt", "one\ntwo\n");
+        let mut pty = Pty::spawn_with(&env, &["f.txt"], probe, &[]);
+        pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
+        let on = b"\x1b[?1002h\x1b[?1006h";
+        let deadline = std::time::Instant::now() + WAIT;
+        while find(&pty.raw_output(), on).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{probe:?}: mouse never turned on"
+            );
+            thread::sleep(POLL);
+        }
+        // Row 2, column 3 (1-based): between "tw" and "o".
+        pty.write(b"\x1b[<0;3;2M\x1b[<0;3;2m");
+        pty.type_text("X");
+        pty.wait_text("twXo");
+        pty.keys("C-x C-s");
+        wait_file(&path, "one\ntwXo\n");
+        pty.keys("C-x C-c");
+        assert!(pty.wait_exit().success());
+        let tail = output_after_setup(&pty);
+        let off = rfind(&tail, b"\x1b[?1006l\x1b[?1002l").expect("mouse reporting turned off");
+        assert!(off > find(&tail, on).expect("turned on"));
+    }
+}

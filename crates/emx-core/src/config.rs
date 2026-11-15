@@ -54,6 +54,13 @@ pub const COMPLETION_ROWS: u64 = 10;
 /// Widest `completion_rows` accepted from config; a terminal is never this
 /// tall.
 pub const COMPLETION_ROWS_MAX: u64 = 1000;
+/// Mouse reporting is off until asked for: it takes over the terminal's
+/// own drag-to-select, as Emacs `-nw` leaves `xterm-mouse-mode` off.
+pub const MOUSE: bool = false;
+/// Emacs `mouse-wheel-scroll-amount`'s first element.
+pub const MOUSE_WHEEL_LINES: u64 = 5;
+/// The most lines one wheel step may scroll.
+pub const MOUSE_WHEEL_LINES_MAX: u64 = 1000;
 pub const MAX_WIRE_MESSAGE: u64 = 16 * MIB;
 pub const FRAME_QUEUE_DEPTH: u64 = 8;
 
@@ -100,6 +107,8 @@ pub struct Config {
     pub echo_keystrokes_ms: u64,
     pub cursor_event_interval_ms: u64,
     pub completion_rows: u64,
+    pub mouse: bool,
+    pub mouse_wheel_lines: u64,
 }
 
 impl Default for Config {
@@ -133,6 +142,8 @@ impl Default for Config {
             echo_keystrokes_ms: ECHO_KEYSTROKES_MS,
             cursor_event_interval_ms: CURSOR_EVENT_INTERVAL_MS,
             completion_rows: COMPLETION_ROWS,
+            mouse: MOUSE,
+            mouse_wheel_lines: MOUSE_WHEEL_LINES,
         }
     }
 }
@@ -243,6 +254,12 @@ impl Config {
                 reason: format!("must be between 1 and {TAB_WIDTH_MAX}"),
             });
         }
+        if !(1..=MOUSE_WHEEL_LINES_MAX).contains(&self.mouse_wheel_lines) {
+            return Err(InvalidSetting {
+                key: "mouse_wheel_lines",
+                reason: format!("must be between 1 and {MOUSE_WHEEL_LINES_MAX}"),
+            });
+        }
         if !(1..=COMPLETION_ROWS_MAX).contains(&self.completion_rows) {
             return Err(InvalidSetting {
                 key: "completion_rows",
@@ -350,7 +367,7 @@ mod tests {
              amalgamation_limit = 17\ncolumn_checkpoint_interval = 18\n\
              long_line_threshold = 19\necho_keystrokes_ms = 0\nmark_ring_max = 20\n\
              indent_tabs_mode = false\ncursor_event_interval_ms = 21\ncompletion_rows = 22\n\
-             keyboard_encoding = \"legacy\"\n",
+             keyboard_encoding = \"legacy\"\nmouse = true\nmouse_wheel_lines = 23\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -382,6 +399,8 @@ mod tests {
             echo_keystrokes_ms: 0,
             cursor_event_interval_ms: 21,
             completion_rows: 22,
+            mouse: true,
+            mouse_wheel_lines: 23,
         };
         assert_eq!(config, expected);
     }
@@ -483,6 +502,11 @@ mod tests {
         assert_eq!(invalid_key("tab_width = 17\n"), "tab_width");
         assert_eq!(invalid_key("completion_rows = 0\n"), "completion_rows");
         assert_eq!(invalid_key("completion_rows = 1001\n"), "completion_rows");
+        assert_eq!(invalid_key("mouse_wheel_lines = 0\n"), "mouse_wheel_lines");
+        assert_eq!(
+            invalid_key("mouse_wheel_lines = 1001\n"),
+            "mouse_wheel_lines"
+        );
         assert_eq!(load_str("tab_width = 16\n").expect("valid").tab_width, 16);
         assert_eq!(load_str("tab_width = 1\n").expect("valid").tab_width, 1);
     }

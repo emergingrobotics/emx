@@ -377,7 +377,10 @@ fn malformed_messages_disconnect_only_that_client() {
     let mut server = env.start_server();
     let mut bad = env.connect(ClientKind::Tui);
     let mut good = env.connect(ClientKind::Tui);
-    bad.send_raw("{\"type\":\"resize\",\"cols\":60000,\"rows\":60000,\"v\":1}");
+    bad.send_raw(&format!(
+        "{{\"type\":\"resize\",\"cols\":60000,\"rows\":60000,\"v\":{}}}",
+        emx_proto::PROTOCOL_VERSION
+    ));
     assert!(bad.closed_within(WAIT));
     good.keys("z");
     good.wait_text("z");

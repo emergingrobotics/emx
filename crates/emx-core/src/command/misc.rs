@@ -136,6 +136,15 @@ fn scroll_command(ctx: &mut CommandContext, direction: i64) -> Result<(), Comman
     }
 }
 
+/// Scrolls the context's window `count` rows: up (later text) when
+/// positive. For `mwheel-scroll`.
+pub(crate) fn scroll_window_lines(
+    ctx: &mut CommandContext,
+    count: i64,
+) -> Result<(), CommandError> {
+    window_scroll(ctx, count, false)
+}
+
 /// window.c `window_scroll_line_based`, which Emacs uses on terminals,
 /// with `scroll-margin` 0 and `scroll-preserve-screen-position` nil.
 fn window_scroll(ctx: &mut CommandContext, count: i64, whole: bool) -> Result<(), CommandError> {
@@ -263,6 +272,15 @@ pub(super) fn auto_revert_tail_mode(ctx: &mut CommandContext) -> Result<(), Comm
     };
     let state = if enabled { "enabled" } else { "disabled" };
     ctx.message(format!("Auto-Revert Tail mode {state}"));
+    Ok(())
+}
+
+/// Emacs `xterm-mouse-mode`, global: every terminal client of the
+/// session reports the mouse, or stops.
+pub(super) fn xterm_mouse_mode(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let enabled = ctx.editor().toggle_mouse_mode();
+    let state = if enabled { "enabled" } else { "disabled" };
+    ctx.message(format!("Xterm-Mouse mode {state}"));
     Ok(())
 }
 

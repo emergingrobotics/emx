@@ -154,7 +154,11 @@ fn wait_event(lines: &Receiver<String>, want: impl Fn(&Value) -> bool) -> Value 
             continue;
         };
         let value: Value = serde_json::from_str(&line).expect("each event is one json line");
-        assert_eq!(value["v"], 1, "events carry the protocol version: {line}");
+        assert_eq!(
+            value["v"],
+            emx_proto::PROTOCOL_VERSION,
+            "events carry the protocol version: {line}"
+        );
         assert_eq!(value["type"], "event", "{line}");
         if want(&value["event"]) {
             return value;

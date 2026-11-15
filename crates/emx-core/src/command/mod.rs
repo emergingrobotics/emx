@@ -16,7 +16,7 @@ mod window;
 pub(crate) use dabbrev::DabbrevState;
 pub(crate) use kill::{xterm_paste, yank_from_kill_ring};
 pub(crate) use mark::push_mark;
-pub(crate) use misc::RecenterPosition;
+pub(crate) use misc::{RecenterPosition, scroll_window_lines};
 pub(crate) use r#move::{
     char_after, char_before, forward_line, goto_line_offset_cached, goto_line_to, is_word,
     line_end, line_start, scan_words,
@@ -252,6 +252,10 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "auto-revert-tail-mode",
         run: misc::auto_revert_tail_mode,
+    },
+    CommandSpec {
+        name: "xterm-mouse-mode",
+        run: misc::xterm_mouse_mode,
     },
     CommandSpec {
         name: "scroll-up-command",
