@@ -97,6 +97,12 @@ portable-pty = "0.9"
 tempfile = { workspace = true }
 vt100 = "0.15"
 
+# notify's macOS backend (FSEvents); Linux uses inotify with no feature.
+[target.'cfg(target_os = "macos")'.dependencies]
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+# The peer's uid on a Unix socket (getpeereid; SO_PEERCRED is Linux's).
+nix = { version = "0.30", default-features = false, features = ["socket", "user"] }
+
 # musl's default allocator is too slow for this workload (DESIGN 8); the
 # static builds swap in mimalloc. Only the musl target compiles it.
 [target.'cfg(target_env = "musl")'.dependencies]

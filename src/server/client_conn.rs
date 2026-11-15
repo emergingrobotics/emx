@@ -46,9 +46,18 @@ pub enum AdmitError {
 }
 
 /// The peer's uid as `SO_PEERCRED` reports it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     rustix::net::sockopt::socket_peercred(stream)
         .map(|credentials| credentials.uid.as_raw())
+        .map_err(io::Error::from)
+}
+
+/// The peer's uid as `getpeereid` reports it (macOS).
+#[cfg(target_os = "macos")]
+pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    nix::unistd::getpeereid(stream)
+        .map(|(uid, _)| uid.as_raw())
         .map_err(io::Error::from)
 }
 

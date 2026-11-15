@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
-use rustix::fs::Advice;
 
 use crate::block_cache::{BLOCK_SIZE, BlockCache, block_length};
 use crate::source::ReadError;
@@ -603,7 +602,11 @@ pub fn index_file(
             ),
         )));
     }
-    rustix::fs::fadvise(cache.file(), 0, None, Advice::Sequential).map_err(io::Error::from)?;
+    // The whole file is read in order: let the kernel read ahead. Only a
+    // hint, so systems without it do without.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    rustix::fs::fadvise(cache.file(), 0, None, rustix::fs::Advice::Sequential)
+        .map_err(io::Error::from)?;
     // An append replaces the index with a newer generation and starts a fresh
     // indexer; counts this scan computes for the old generation are refused, so
     // a stale count never survives the append.

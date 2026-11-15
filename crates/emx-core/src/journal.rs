@@ -89,6 +89,7 @@ impl JournalId {
     /// recoverable condition. So this is a true internal invariant, and
     /// threading an error through the edit-journaling paths that call it (none
     /// of which can recover from "no entropy") would add a dead error channel.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn random() -> JournalId {
         let mut bytes = [0u8; 16];
         let mut filled = 0;
@@ -102,6 +103,18 @@ impl JournalId {
                 Err(error) => panic!("the kernel random source failed: {error}"),
             }
         }
+        JournalId(u128::from_le_bytes(bytes))
+    }
+
+    /// Elsewhere (macOS) the random device: as with `getrandom`, failing to
+    /// read it means the system is broken, not a condition to recover from.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub fn random() -> JournalId {
+        use std::io::Read;
+        let mut bytes = [0u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut device| device.read_exact(&mut bytes))
+            .unwrap_or_else(|error| panic!("the random device failed: {error}"));
         JournalId(u128::from_le_bytes(bytes))
     }
 
