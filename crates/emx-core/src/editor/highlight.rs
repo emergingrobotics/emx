@@ -141,7 +141,20 @@ impl Editor {
                 Language::from_shebang(first_line)
             }),
         };
+        let settings = self.config.file_settings(path.as_deref());
+        let checkpoints =
+            (settings.tab_width != self.buffers[buffer_id].settings.tab_width).then(|| {
+                emx_text::ColumnCheckpoints::new(
+                    usize::try_from(settings.tab_width).expect("tab_width is validated small"),
+                    self.config.column_checkpoint_interval,
+                    self.config.long_line_threshold,
+                )
+            });
         let target = &mut self.buffers[buffer_id];
+        target.settings = settings;
+        if let Some(checkpoints) = checkpoints {
+            target.checkpoints = checkpoints;
+        }
         if target.language.language != language {
             target.faces.clear();
             target.highlight = HighlightState::default();

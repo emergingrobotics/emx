@@ -707,9 +707,14 @@ impl<'a> CommandContext<'a> {
     }
 
     /// The command's `last-command` is `name`.
-    /// Emacs `tab-width`.
+    /// Emacs `tab-width` in the buffer.
     pub(crate) fn tab_width(&self) -> u64 {
-        self.editor.config().tab_width
+        self.buffer().settings.tab_width
+    }
+
+    /// Emacs `indent-tabs-mode` in the buffer.
+    pub(crate) fn indent_tabs_mode(&self) -> bool {
+        self.buffer().settings.indent_tabs_mode
     }
 
     pub fn last_command_is(&self, name: &str) -> bool {

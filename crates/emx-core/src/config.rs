@@ -95,6 +95,29 @@ pub enum KeyboardEncoding {
     Legacy,
 }
 
+/// Settings for the files whose name, or else extension, is the key of a
+/// `[file_types]` entry; unset ones are the global ones.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileTypeSettings {
+    pub tab_width: Option<u64>,
+    pub indent_tabs_mode: Option<bool>,
+    pub require_final_newline: Option<bool>,
+    pub delete_trailing_whitespace: Option<bool>,
+}
+
+/// What one buffer is edited and saved with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileSettings {
+    pub tab_width: u64,
+    pub indent_tabs_mode: bool,
+    /// Emacs `require-final-newline`: a save adds a missing final newline.
+    pub require_final_newline: bool,
+    /// A save first deletes the blanks at the ends of lines (Emacs
+    /// `delete-trailing-whitespace` in `before-save-hook`).
+    pub delete_trailing_whitespace: bool,
+}
+
 /// The built-in colors the terminal draws with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -151,6 +174,10 @@ pub struct Config {
     pub theme: ThemeChoice,
     /// Face name to SGR parameters (`keyword = "1;34"`), over the theme's.
     pub faces: BTreeMap<String, String>,
+    pub require_final_newline: bool,
+    pub delete_trailing_whitespace: bool,
+    /// Per file name or extension (`[file_types.go]`, `[file_types.Makefile]`).
+    pub file_types: BTreeMap<String, FileTypeSettings>,
 }
 
 impl Default for Config {
@@ -196,6 +223,9 @@ impl Default for Config {
             osc52_max_bytes: OSC52_MAX_BYTES,
             theme: ThemeChoice::Dark,
             faces: BTreeMap::new(),
+            require_final_newline: false,
+            delete_trailing_whitespace: false,
+            file_types: BTreeMap::new(),
         }
     }
 }
@@ -234,6 +264,34 @@ pub struct InvalidSetting {
 }
 
 impl Config {
+    /// The settings of a buffer visiting `path` (none for buffers that
+    /// visit no file): its `[file_types]` entry by whole name, else by
+    /// extension, over the global settings.
+    pub fn file_settings(&self, path: Option<&std::path::Path>) -> FileSettings {
+        let entry = path.and_then(|path| {
+            let by_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| self.file_types.get(name));
+            by_name.or_else(|| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .and_then(|extension| self.file_types.get(extension))
+            })
+        });
+        let entry = entry.cloned().unwrap_or_default();
+        FileSettings {
+            tab_width: entry.tab_width.unwrap_or(self.tab_width),
+            indent_tabs_mode: entry.indent_tabs_mode.unwrap_or(self.indent_tabs_mode),
+            require_final_newline: entry
+                .require_final_newline
+                .unwrap_or(self.require_final_newline),
+            delete_trailing_whitespace: entry
+                .delete_trailing_whitespace
+                .unwrap_or(self.delete_trailing_whitespace),
+        }
+    }
+
     /// `None` means no config file: all defaults. An explicit path that does
     /// not exist is an error, never a silent fallback to defaults.
     pub fn load(path: Option<&Path>) -> Result<Config, ConfigError> {
@@ -305,6 +363,17 @@ impl Config {
                 key: "tab_width",
                 reason: format!("must be between 1 and {TAB_WIDTH_MAX}"),
             });
+        }
+        for (name, settings) in &self.file_types {
+            if settings
+                .tab_width
+                .is_some_and(|width| !(1..=TAB_WIDTH_MAX).contains(&width))
+            {
+                return Err(InvalidSetting {
+                    key: "file_types",
+                    reason: format!("{name}: tab_width must be between 1 and {TAB_WIDTH_MAX}"),
+                });
+            }
         }
         for (name, parameters) in &self.faces {
             if emx_types::Face::from_name(name).is_none() {
@@ -455,7 +524,8 @@ mod tests {
              panel_width = 24\nquick_open_max_files = 25\nhighlight_max_file = 26\n\
              highlight_max_line = 27\nshow_paren_mode = false\nshow_paren_max_distance = 28\n\
              osc52_clipboard = false\nosc52_max_bytes = 29\ntheme = \"light\"\n\
-             [faces]\nkeyword = \"1;34\"\n",
+             require_final_newline = true\ndelete_trailing_whitespace = true\n\
+             [faces]\nkeyword = \"1;34\"\n[file_types.go]\nindent_tabs_mode = true\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -499,6 +569,15 @@ mod tests {
             osc52_max_bytes: 29,
             theme: ThemeChoice::Light,
             faces: BTreeMap::from([("keyword".to_string(), "1;34".to_string())]),
+            require_final_newline: true,
+            delete_trailing_whitespace: true,
+            file_types: BTreeMap::from([(
+                "go".to_string(),
+                FileTypeSettings {
+                    indent_tabs_mode: Some(true),
+                    ..FileTypeSettings::default()
+                },
+            )]),
         };
         assert_eq!(config, expected);
     }
@@ -607,6 +686,10 @@ mod tests {
         );
         assert_eq!(invalid_key("panel_width = 10\n"), "panel_width");
         assert_eq!(invalid_key("[faces]\nkeywrd = \"1\"\n"), "faces");
+        assert_eq!(
+            invalid_key("[file_types.rs]\ntab_width = 0\n"),
+            "file_types"
+        );
         assert_eq!(invalid_key("[faces]\nkeyword = \"1m\"\n"), "faces");
         assert_eq!(
             invalid_key("quick_open_max_files = 0\n"),

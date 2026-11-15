@@ -208,6 +208,8 @@ pub(crate) struct SaveFlow {
     /// A socket API save has nobody to answer questions: a save that
     /// would ask fails instead, naming the question.
     interactive: bool,
+    /// The save-time cleanups (final newline, trailing blanks) ran.
+    cleaned: bool,
 }
 
 impl SaveFlow {
@@ -228,6 +230,7 @@ impl SaveFlow {
             method: None,
             session,
             interactive: true,
+            cleaned: false,
         }
     }
 
@@ -889,7 +892,15 @@ impl Editor {
         let exists = loaded.identity.is_some();
         // Emacs `after-find-file`.
         target.read_only = !loaded.writable;
-        let message = if loaded.writable {
+        let binary = loaded.coding.is_binary() && exists;
+        if binary {
+            target.read_only = true;
+        }
+        let message = if binary {
+            Some(format!(
+                "{name} is a binary file: read-only (C-x C-q to edit it)"
+            ))
+        } else if loaded.writable {
             if loaded.auto_save_newer {
                 Some(format!(
                     "{name} has auto save data; consider M-x recover-this-file"
@@ -1070,6 +1081,64 @@ impl Editor {
         Ok(())
     }
 
+    /// The buffer's save-time settings: blanks at the ends of lines go, and
+    /// a missing final newline is added, as edits the save's undo can take
+    /// back. Only text already in memory is cleaned; a larger buffer is
+    /// saved as it is.
+    fn clean_before_save(&mut self, buffer: BufferId) {
+        let limit = self.config.in_memory_max;
+        let target = &self.buffers[buffer];
+        let settings = target.settings;
+        if !settings.require_final_newline && !settings.delete_trailing_whitespace {
+            return;
+        }
+        if target.text.len() > limit || target.read_only {
+            return;
+        }
+        let mut bytes = Vec::new();
+        if target
+            .text
+            .read_cached(0..target.text.len(), &mut bytes)
+            .is_err()
+        {
+            return;
+        }
+        let mut edits: Vec<(std::ops::Range<u64>, &[u8])> = Vec::new();
+        if settings.delete_trailing_whitespace {
+            let mut line_start = 0;
+            for end in bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'\n')
+                .map(|(index, _)| index)
+                .chain(std::iter::once(bytes.len()))
+            {
+                let mut blanks = end;
+                while blanks > line_start && matches!(bytes[blanks - 1], b' ' | b'\t') {
+                    blanks -= 1;
+                }
+                if blanks < end {
+                    edits.push((blanks as u64..end as u64, b""));
+                }
+                line_start = end + 1;
+            }
+        }
+        if settings.require_final_newline && bytes.last().is_some_and(|byte| *byte != b'\n') {
+            let end = bytes.len() as u64;
+            edits.push((end..end, b"\n"));
+        }
+        let target = &mut self.buffers[buffer];
+        for (range, replacement) in edits.into_iter().rev() {
+            let at = range.start;
+            if let Err(error) =
+                target.replace_range(range, replacement, at, &mut self.journal_outbox)
+            {
+                eprintln!("emx: cleaning {} before saving: {error}", target.name);
+                return;
+            }
+        }
+    }
+
     /// A buffer being read, being saved, or damaged has no text to save
     /// (and a save in flight must finish before another starts).
     fn check_savable(&self, buffer: BufferId) -> Result<(), CommandError> {
@@ -1184,6 +1253,10 @@ impl Editor {
             return self.resume_session(client, flow.session);
         }
         self.check_savable(buffer)?;
+        if !flow.cleaned {
+            flow.cleaned = true;
+            self.clean_before_save(buffer);
+        }
         let Some(binding) = self
             .buffers
             .get(buffer)

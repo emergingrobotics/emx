@@ -127,6 +127,9 @@ impl SaveProgress {
     }
 }
 
+/// How much of a file's start is looked at for NUL bytes.
+pub const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
 /// The buffer coding's modeline letter (Emacs `mode-line-mule-info`): a
 /// visited file whose bytes are all ASCII stays undecided (`-`) until a
 /// save writes something else; everything else is UTF-8 (`U`).
@@ -134,6 +137,9 @@ impl SaveProgress {
 pub enum CodingMnemonic {
     Undecided,
     Utf8,
+    /// A binary file (Emacs `no-conversion`): its bytes are shown escaped
+    /// and saved as they are.
+    Binary,
 }
 
 impl CodingMnemonic {
@@ -141,6 +147,27 @@ impl CodingMnemonic {
         match self {
             CodingMnemonic::Undecided => '-',
             CodingMnemonic::Utf8 => 'U',
+            CodingMnemonic::Binary => '=',
+        }
+    }
+
+    /// A file with a NUL byte in its first `BINARY_SNIFF_BYTES` is binary,
+    /// as Emacs's `inhibit-null-byte-detection` default decides.
+    pub fn sniff(bytes: &[u8]) -> CodingMnemonic {
+        let start = &bytes[..bytes.len().min(BINARY_SNIFF_BYTES)];
+        if start.contains(&0) {
+            CodingMnemonic::Binary
+        } else if bytes.is_ascii() {
+            CodingMnemonic::Undecided
+        } else {
+            CodingMnemonic::Utf8
+        }
+    }
+
+    pub fn is_binary(self) -> bool {
+        match self {
+            CodingMnemonic::Binary => true,
+            CodingMnemonic::Undecided | CodingMnemonic::Utf8 => false,
         }
     }
 }
@@ -245,6 +272,8 @@ pub struct Buffer {
     /// The language the buffer's file is in, for highlighting,
     /// indentation and comments.
     pub(crate) language: crate::editor::LanguageState,
+    /// Tab width, indentation and save-time settings for the file.
+    pub(crate) settings: crate::config::FileSettings,
     pub(crate) highlight: crate::editor::HighlightState,
     /// Emacs `recent-auto-save-p`: auto-saved since last read or saved, so
     /// the auto-save file is this session's and a save may delete it.
@@ -296,6 +325,14 @@ impl Buffer {
             special_mode: None,
             tree: None,
             language: crate::editor::LanguageState::default(),
+            // The editor sets the config's settings as it creates the
+            // buffer, and the file's once it knows which file it visits.
+            settings: crate::config::FileSettings {
+                tab_width: crate::config::TAB_WIDTH,
+                indent_tabs_mode: crate::config::INDENT_TABS_MODE,
+                require_final_newline: false,
+                delete_trailing_whitespace: false,
+            },
             highlight: crate::editor::HighlightState::default(),
             auto_saved_since_save: false,
             checkpoints,

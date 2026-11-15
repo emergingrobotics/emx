@@ -134,3 +134,68 @@ fn comment_dwim_adds_finds_and_toggles_comments() {
     harness.keys("M-;");
     assert!(harness.echo().contains("No comment syntax is defined"));
 }
+
+#[test]
+fn binary_files_open_read_only_and_show_no_conversion() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut harness = open(directory.path(), "blob.bin", "ab\0cd\u{1}\n");
+    assert!(
+        harness.echo().contains("blob.bin is a binary file"),
+        "{}",
+        harness.echo()
+    );
+    let modeline = harness.screen()[22].clone();
+    assert!(modeline.starts_with("-UU=:%%"), "{modeline:?}");
+    harness.type_text("x");
+    assert!(harness.echo().contains("read-only"), "{}", harness.echo());
+    harness.keys("C-x C-q");
+    harness.type_text("x");
+    assert!(harness.text().starts_with('x'));
+}
+
+fn open_with(dir: &Path, name: &str, content: &str, config: Config) -> Harness {
+    fs::write(dir.join(name), content).unwrap();
+    let mut harness = Harness::with_config(config);
+    harness.set_default_directory(dir);
+    harness.keys("C-x C-f");
+    harness.type_text(name);
+    harness.keys("RET");
+    harness
+}
+
+#[test]
+fn file_types_set_tab_width_and_save_time_cleanups() {
+    use emx_core::config::FileTypeSettings;
+    use std::collections::BTreeMap;
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        file_types: BTreeMap::from([(
+            "md".to_string(),
+            FileTypeSettings {
+                tab_width: Some(4),
+                require_final_newline: Some(true),
+                delete_trailing_whitespace: Some(true),
+                ..FileTypeSettings::default()
+            },
+        )]),
+        ..Config::default()
+    };
+    let mut harness = open_with(directory.path(), "a.md", "\tx  \ny\t", config.clone());
+    assert_eq!(harness.screen()[0].trim_end(), "    x", "a tab is 4 wide");
+    harness.keys("M->");
+    harness.type_text("z");
+    harness.keys("C-x C-s");
+    assert_eq!(
+        fs::read_to_string(directory.path().join("a.md")).unwrap(),
+        "\tx\ny\tz\n"
+    );
+    harness.keys("C-/");
+    assert_eq!(
+        harness.text(),
+        "\tx  \ny\tz",
+        "the cleanup undoes on its own"
+    );
+    // Other files keep the global settings.
+    let harness = open_with(directory.path(), "b.txt", "\tx  ", config);
+    assert_eq!(harness.screen()[0].trim_end(), "        x");
+}

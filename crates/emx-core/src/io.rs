@@ -358,11 +358,7 @@ pub fn load_file(path: &Path, config: &Config) -> Result<Loaded, LoadError> {
     let writable = access_writable(path);
     let (sources, identity, coding, needs_index) = if metadata.len() <= config.in_memory_max {
         let (bytes, identity) = read_whole(path)?;
-        let coding = if bytes.is_ascii() {
-            CodingMnemonic::Undecided
-        } else {
-            CodingMnemonic::Utf8
-        };
+        let coding = CodingMnemonic::sniff(&bytes);
         (Sources::memory(Arc::from(bytes)), identity, coding, false)
     } else {
         let capacity = usize::try_from(config.block_cache_bytes).unwrap_or(usize::MAX);

@@ -19,7 +19,7 @@ pub(super) fn kill_rectangle(ctx: &mut CommandContext) -> Result<(), CommandErro
     let (mark, point) = ctx.mark_and_point()?;
     let (start, end) = (mark.min(point), mark.max(point));
     let text = ctx.buffer().text.clone();
-    let tab_width = ctx.editor().config().tab_width;
+    let tab_width = ctx.tab_width();
     let (start_col, end_col) = rectangle_columns(&text, start, end, tab_width)?;
     let mut extracted = Vec::new();
     let mut deletions = Vec::new();
@@ -54,7 +54,7 @@ pub(super) fn yank_rectangle(ctx: &mut CommandContext) -> Result<(), CommandErro
 /// corner, point at the lower-right.
 fn insert_rectangle(ctx: &mut CommandContext, rectangle: &[Vec<u8>]) -> Result<(), CommandError> {
     let origin = ctx.point();
-    let tab_width = ctx.editor().config().tab_width;
+    let tab_width = ctx.tab_width();
     let text = ctx.buffer().text.clone();
     let insert_column = current_column(&text, origin, tab_width)?;
     push_mark(ctx, origin, true, false);
@@ -96,7 +96,7 @@ pub(crate) fn apply_string_rectangle(
 ) -> Result<(), CommandError> {
     ctx.check_editable()?;
     let text = ctx.buffer().text.clone();
-    let tab_width = ctx.editor().config().tab_width;
+    let tab_width = ctx.tab_width();
     let (start_col, end_col) = rectangle_columns(&text, start, end, tab_width)?;
     let line_count = rectangle_line_count(&text, start, end)?;
     let mut line = line_start(&text, start)?;
@@ -218,7 +218,7 @@ fn at_line_start(text: &Text, pos: u64) -> Result<bool, ReadError> {
 
 /// Emacs `move-to-column` with FORCE: pad with spaces to reach `column`.
 fn pad_to_column(ctx: &mut CommandContext, column: u64) -> Result<(), CommandError> {
-    let tab_width = ctx.editor().config().tab_width;
+    let tab_width = ctx.tab_width();
     let text = ctx.buffer().text.clone();
     let current = current_column(&text, ctx.point(), tab_width)?;
     if current < column {
@@ -325,7 +325,7 @@ pub(super) fn clear_rectangle(ctx: &mut CommandContext) -> Result<(), CommandErr
     ctx.check_editable()?;
     let (_, start_col, end_col, lines) = rectangle(ctx)?;
     let tab_width = ctx.tab_width();
-    let tabs = ctx.editor().config().indent_tabs_mode;
+    let tabs = ctx.indent_tabs_mode();
     let first = lines.first().copied().unwrap_or(0);
     for index in 0..lines.len() {
         let text = ctx.buffer().text.clone();
@@ -360,7 +360,7 @@ pub(super) fn open_rectangle(ctx: &mut CommandContext) -> Result<(), CommandErro
     ctx.check_editable()?;
     let (start, start_col, end_col, lines) = rectangle(ctx)?;
     let tab_width = ctx.tab_width();
-    let tabs = ctx.editor().config().indent_tabs_mode;
+    let tabs = ctx.indent_tabs_mode();
     let first = lines.first().copied().unwrap_or(0);
     let corner = ctx
         .buffer_mut()

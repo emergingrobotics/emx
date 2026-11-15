@@ -463,6 +463,7 @@ impl Editor {
         let id = self
             .buffers
             .insert_with_key(|id| Buffer::new(id, name.to_string(), text, limits, checkpoints));
+        self.buffers[id].settings = self.config.file_settings(None);
         // Creating a buffer is a command's change: it gets its boundary.
         self.buffers[id].undo.boundary(0);
         self.recency.push(id);
@@ -1321,6 +1322,12 @@ impl Editor {
             .frame_number
             .expect("only terminal clients are rendered");
         (number, self.session == Session::Server)
+    }
+
+    /// The tab width the buffer's text is laid out with.
+    pub(crate) fn buffer_tab_width(&self, buffer: BufferId) -> usize {
+        usize::try_from(self.buffers[buffer].settings.tab_width)
+            .expect("tab_width is validated small")
     }
 
     pub(crate) fn tab_width(&self) -> usize {

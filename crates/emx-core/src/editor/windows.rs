@@ -733,9 +733,10 @@ impl Editor {
     ) -> Layout<'t> {
         let (cols, _) = self.window_size(client, window);
         let reader = Reader::new(text, fetch);
+        let tab_width = self.buffer_tab_width(self.window(client, window).buffer);
         match self.window_hscroll(client, window) {
-            Some(hscroll) => Layout::truncating(reader, cols, self.tab_width(), hscroll),
-            None => Layout::new(reader, cols, self.tab_width()),
+            Some(hscroll) => Layout::truncating(reader, cols, tab_width, hscroll),
+            None => Layout::new(reader, cols, tab_width),
         }
     }
 
@@ -758,7 +759,7 @@ impl Editor {
         let layout = Layout::truncating(
             Reader::new(&text, Fetch::CachedOnly),
             cols,
-            self.tab_width(),
+            self.buffer_tab_width(target.buffer),
             0,
         );
         let line_start = layout.line_start(point)?;
@@ -816,7 +817,7 @@ impl Editor {
         }
         if target.start_row_skip > 0 {
             let text = self.buffers[target.buffer].text.clone();
-            let tab_width = self.tab_width();
+            let tab_width = self.buffer_tab_width(target.buffer);
             let reader = Reader::new(&text, Fetch::CachedOnly);
             let start = self.window_start(client, window);
             let first_shown = Layout::new(reader, target.start_cols, tab_width).row_start(start)?;
