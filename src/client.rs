@@ -766,6 +766,7 @@ impl Client {
                 terminal.write(BELL)?;
                 None
             }
+            ServerMsg::Suspend => self.suspend(terminal)?,
             ServerMsg::Clipboard { data_b64 } => {
                 terminal.write(&osc52(&data_b64))?;
                 None
@@ -798,6 +799,27 @@ impl Client {
                 End::failure(format!("emx: {reason}"))
             }),
         })
+    }
+
+    /// `suspend-frame`: restores the terminal and stops the process group,
+    /// as SIGTSTP from the shell would; once `fg` continues it, takes the
+    /// terminal again and asks for a whole frame, of a new size if the
+    /// terminal was resized meanwhile.
+    fn suspend(&mut self, terminal: &mut Terminal) -> anyhow::Result<Option<End>> {
+        terminal.suspend()?;
+        rustix::process::kill_current_process_group(rustix::process::Signal::TSTP)
+            .context("suspending emx")?;
+        // Execution continues here on SIGCONT.
+        terminal.resume()?;
+        if self.mouse {
+            terminal.write(mouse_sequence(true))?;
+        }
+        let (cols, rows) = clamp_size(terminal.size()?);
+        if self.display.resize(cols, rows) {
+            return Ok(self.send(ClientMsg::Resize { cols, rows }));
+        }
+        self.display = self.display.fresh();
+        Ok(self.send(ClientMsg::Redraw))
     }
 
     /// The connection ended. One that ends before the first frame is

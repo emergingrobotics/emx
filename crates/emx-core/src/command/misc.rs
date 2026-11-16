@@ -70,6 +70,14 @@ pub(super) fn digit_argument(ctx: &mut CommandContext) -> Result<(), CommandErro
 
 /// Emacs `keyboard-quit`: deactivate the mark, abort any keyboard macro in
 /// progress, then signal `quit`.
+/// Emacs `suspend-frame` (`C-z`): a terminal client stops itself, as the
+/// shell's job control would, until `fg` resumes it.
+pub(super) fn suspend_frame(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().suspend_client(client);
+    Ok(())
+}
+
 pub(super) fn keyboard_quit(ctx: &mut CommandContext) -> Result<(), CommandError> {
     ctx.buffer_mut().mark_active = false;
     // An occur still searching on a worker is quit too, as Emacs's

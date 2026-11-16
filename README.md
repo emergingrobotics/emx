@@ -97,6 +97,36 @@ Run `emx --help` or `emx help COMMAND` for details. Key bindings can be overridd
 
 Rust, C, Go, Python, JavaScript, Bash, JSON, TOML and YAML files are highlighted with tree-sitter, chosen by file name or a `#!` line. In those files `TAB` and `RET` indent by the language's rules and `M-;` comments. The matching paren of the one at point is highlighted in every file.
 
+### Rectangles
+
+`C-x r k` / `C-x r y` / `C-x r t` kill, yank and replace a rectangle; `C-x r M-w` copies it, `C-x r d` deletes it, `C-x r c` blanks it, `C-x r o` opens blank space in it, and `C-x r N` numbers its lines.
+
+### Logs and binary files
+
+`M-x ansi-color-mode` shows a log's ANSI color codes as colors and hides them; the file is unchanged. A file with NUL bytes in its first 8 KiB opens read-only as binary (the modeline shows `=`); `C-x C-q` makes it writable. Bytes that are not UTF-8 are shown as `\ooo` and saved unchanged; emx does not convert Latin-1 or UTF-16 files.
+
+### Clipboard
+
+Text you kill or copy also goes to the system clipboard through the terminal (OSC 52). Inside tmux, set `set -g set-clipboard on`. Turn it off with `osc52_clipboard = false`.
+
+### Colors and per-file settings
+
+```toml
+theme = "light"                # or "dark" (the default)
+
+[faces]                        # any face, as SGR parameters
+keyword = "1;34"
+comment = "2;37"
+
+[file_types.md]                # by extension, or a whole file name
+tab_width = 4
+indent_tabs_mode = false
+require_final_newline = true
+delete_trailing_whitespace = true
+```
+
+`require_final_newline` and `delete_trailing_whitespace` can also be set for every file. The cleanups happen when you save, and `C-/` undoes them.
+
 ### Mouse
 
 Mouse support is off by default, because turning it on takes over the terminal's own drag-to-select. Turn it on with `mouse = true` in the config, or for the session with `M-x xterm-mouse-mode`. Then a click moves the cursor or selects a window, a drag selects text, double and triple clicks select a word and a line, the right button extends the selection, the wheel scrolls the window under the pointer, and dragging a modeline or border resizes windows and the file panel. Hold Shift to use the terminal's own selection. Inside tmux, also `set -g mouse on`.

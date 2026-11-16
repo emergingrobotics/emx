@@ -241,7 +241,8 @@ static PANIC_HOOK: Once = Once::new();
 /// modes for as long as it lives. Dropping it, or a panic anywhere,
 /// restores the terminal exactly once.
 pub struct Terminal {
-    _not_constructible_elsewhere: (),
+    /// The protocol `set_protocol` chose, set again on `resume`.
+    protocol: Option<Protocol>,
 }
 
 impl Terminal {
@@ -254,15 +255,37 @@ impl Terminal {
             ACTIVE.store(false, Ordering::SeqCst);
             return Err(error.into());
         }
-        let terminal = Terminal {
-            _not_constructible_elsewhere: (),
-        };
+        let terminal = Terminal { protocol: None };
         write_stdout(&setup_sequence())?;
         Ok(terminal)
     }
 
+    /// Gives the terminal back as it was found, as on drop, until `resume`.
+    pub fn suspend(&mut self) -> Result<(), TermError> {
+        Ok(restore()?)
+    }
+
+    /// Takes the terminal again after `suspend`: raw mode, the setup
+    /// sequence and the protocol's keyboard modes. Mouse reporting is the
+    /// caller's to set again.
+    pub fn resume(&mut self) -> Result<(), TermError> {
+        if ACTIVE.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Err(error) = crossterm::terminal::enable_raw_mode() {
+            ACTIVE.store(false, Ordering::SeqCst);
+            return Err(error.into());
+        }
+        write_stdout(&setup_sequence())?;
+        if let Some(protocol) = self.protocol {
+            self.set_protocol(protocol)?;
+        }
+        Ok(())
+    }
+
     /// Sets the keyboard modes of the protocol the probe chose.
     pub fn set_protocol(&mut self, protocol: Protocol) -> Result<(), TermError> {
+        self.protocol = Some(protocol);
         PROTOCOL.store(
             match protocol {
                 Protocol::Kitty => KITTY_PROTOCOL,

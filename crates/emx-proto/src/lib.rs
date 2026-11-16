@@ -267,6 +267,10 @@ pub enum ServerMsg {
         cursor: Option<(u16, u16)>,
     },
     Bell,
+    /// `suspend-frame`: the client gives the terminal back and stops
+    /// itself; once resumed it takes the terminal again and asks for a
+    /// redraw.
+    Suspend,
     /// The terminal modes the client sets: mouse reporting on or off. Sent
     /// to a terminal client after `Welcome` and whenever they change.
     Modes {

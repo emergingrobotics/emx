@@ -103,7 +103,7 @@ What users get. Each item links to its design.
 
 - **First release (milestones M1-M4):** core and session server, agent-aware live reload, Emacs tier-1 parity, and large-file support, on Kitty-protocol terminals. Dogfooding starts after M2.
 - **Next release (M5-M7, done):** Linux terminal coverage (GNOME Terminal, Alacritty, xterm, the Linux console, tmux, screen), the file panel with mouse support, and tree-sitter syntax highlighting.
-- **After that:** polish (including macOS terminals), then the agent patch API.
+- **After that (done):** polish (OSC 52 clipboard, themes, ANSI-color log view, binary files, per-file-type settings, macOS builds), the agent patch API (`emx apply-patch`), and more rectangle commands.
 
 Full milestone contents are in [DESIGN.md section 12](DESIGN.md#12-milestones).
 

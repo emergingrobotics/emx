@@ -27,7 +27,7 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 102] = [
+const DEFAULT_BINDINGS: [(&str, &str); 104] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
@@ -48,6 +48,7 @@ const DEFAULT_BINDINGS: [(&str, &str); 102] = [
     ("C-<end>", "end-of-buffer"),
     ("RET", "newline"),
     ("C-d", "delete-char"),
+    ("<delete>", "delete-char"),
     ("DEL", "delete-backward-char"),
     ("C-k", "kill-line"),
     ("M-d", "kill-word"),
@@ -76,6 +77,7 @@ const DEFAULT_BINDINGS: [(&str, &str); 102] = [
     ("C-x s", "save-some-buffers"),
     ("C-x k", "kill-buffer"),
     ("C-x C-c", "save-buffers-kill-terminal"),
+    ("C-z", "suspend-frame"),
     ("C-x #", "server-edit"),
     ("C-x C-q", "read-only-mode"),
     ("C-x 2", "split-window-below"),

@@ -191,7 +191,7 @@ The author's usual stack is Go. Rust is chosen here for `regex-automata` (revers
 
 The **first release** is M1 through M4: the first build others are asked to use daily. It supports Kitty-protocol terminals only. The **next release** is M5 through M7: Linux terminal coverage, the file panel with mouse support, and syntax highlighting. M8 onward ship after that. Dogfooding starts after M2.
 
-Status (2026-11-15): M1 through M7 are done; M5-M7 follow `docs/superpowers/plans/2026-11-15-emx-next-release.md`. The static x86_64 binary is 13 MB with the bundled grammars and `gix` (5 MB before them).
+Status (2026-11-15): M1 through M10 are done; M5-M7 follow `docs/superpowers/plans/2026-11-15-emx-next-release.md`. The static x86_64 binary is 13 MB with the bundled grammars and `gix` (5 MB before them). Two parts of M8 are partial: Latin-1 and UTF-16 files are kept byte for byte (shown with escapes) rather than detected and converted, because a converted buffer's coding would also have to survive the edit journal's crash recovery; and macOS builds but is not tested at run time.
 
 Revised 2026-11-15: terminal coverage moved ahead of the file panel; mouse support widened from the panel to the whole editor; sexp movement, fill, the help system, version control, running programs, LSP, three-way merge, and remote file support moved out of scope (VISION.md Non-Goals).
 

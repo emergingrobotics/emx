@@ -5,7 +5,7 @@
 
 use emx_core::testing::Harness;
 use emx_core::{Config, Session};
-use emx_proto::ClientKind;
+use emx_proto::{ClientKind, ServerMsg};
 
 fn with_config(config: Config, text: &str) -> Harness {
     let mut harness = Harness::with_config(config);
@@ -210,4 +210,27 @@ fn arrow_and_home_keys_follow_emacs_bindings() {
     assert_eq!(harness.point(), 0);
     harness.keys("C-@ C-f C-w");
     assert_eq!(harness.text(), "bc\ndef");
+}
+
+#[test]
+fn delete_key_deletes_the_character_under_point() {
+    let mut harness = Harness::with_text("a|bc");
+    harness.keys("<delete>");
+    assert_eq!(harness.text(), "ac");
+    assert_eq!(harness.point(), 1);
+    assert_eq!(harness.echo(), "");
+}
+
+#[test]
+fn control_z_suspends_a_terminal_client() {
+    let mut harness = Harness::with_text("a|bc");
+    harness.take_sent();
+    harness.keys("C-z");
+    assert!(
+        harness
+            .take_sent()
+            .iter()
+            .any(|message| matches!(message, ServerMsg::Suspend))
+    );
+    assert_eq!(harness.text(), "abc");
 }

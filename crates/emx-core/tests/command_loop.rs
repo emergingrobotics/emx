@@ -133,7 +133,7 @@ fn undefined_messages_describe_keys_like_emacs() {
         ("ESC z", "M-z is undefined"),
         ("C-x C-y", "C-x C-y is undefined"),
         ("C-c Z", "C-c Z is undefined"),
-        ("C-S-z", "C-S-z is undefined"),
+        ("C-S-q", "C-S-q is undefined"),
         ("<f5>", "<f5> is undefined"),
     ] {
         let mut harness = Harness::new();

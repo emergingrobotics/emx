@@ -78,6 +78,8 @@ pub enum Session {
 const PASTE_COMMAND: &str = "xterm-paste";
 /// How Emacs describes a bracketed-paste event in a key sequence.
 const PASTE_EVENT_DESCRIPTION: &str = "<xterm-paste>";
+/// `suspend-frame` from a client with no terminal to give back.
+const NOT_SUSPENDABLE: &str = "This client cannot be suspended";
 const QUIT_KEY: Key = command::QUIT_KEY;
 
 /// Emacs's per-keyboard command-loop state.
@@ -1424,6 +1426,16 @@ impl Editor {
 
     pub(crate) fn signaled(&self, client_id: ClientId) -> bool {
         self.client(client_id).signaled
+    }
+
+    /// Only terminals can be suspended; other clients are told so.
+    pub(crate) fn suspend_client(&mut self, client_id: ClientId) {
+        if self.client(client_id).kind == ClientKind::Tui {
+            self.effects
+                .push(Effect::Send(client_id, ServerMsg::Suspend));
+        } else {
+            self.set_echo(client_id, NOT_SUSPENDABLE.to_string());
+        }
     }
 
     /// Only terminals have a bell.

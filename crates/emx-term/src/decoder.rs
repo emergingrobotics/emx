@@ -762,12 +762,16 @@ fn interpret_reply(reply: &[u8], final_byte: u8) -> Option<InputEvent> {
                 _ => None,
             }
         }
+        // Only the reply's form matters, not the attributes it lists, so
+        // empty fields (`CSI ? 62 ; c`, sent by some multiplexers) are
+        // accepted: rejecting one would leave the probe waiting for its
+        // whole timeout.
         b'c' => {
             let fields = parse_fields(reply)?;
-            let well_formed = !fields.is_empty()
-                && fields
-                    .iter()
-                    .all(|field| matches!(field.as_slice(), [Some(_)]));
+            let well_formed = fields
+                .iter()
+                .any(|field| matches!(field.as_slice(), [Some(_)]))
+                && fields.iter().all(|field| matches!(field.as_slice(), [_]));
             well_formed.then_some(InputEvent::PrimaryDeviceAttributes)
         }
         _ => None,

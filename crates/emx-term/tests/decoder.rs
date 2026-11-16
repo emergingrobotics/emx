@@ -197,6 +197,11 @@ fn decode_terminal_replies() {
         decode(b"\x1b[?1;2c"),
         vec![InputEvent::PrimaryDeviceAttributes]
     );
+    assert_eq!(
+        decode(b"\x1b[?62;c"),
+        vec![InputEvent::PrimaryDeviceAttributes],
+        "an empty field still ends the probe"
+    );
 }
 
 #[test]

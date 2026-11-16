@@ -247,6 +247,10 @@ static COMMANDS: &[CommandSpec] = &[
         run: misc::keyboard_quit,
     },
     CommandSpec {
+        name: "suspend-frame",
+        run: misc::suspend_frame,
+    },
+    CommandSpec {
         name: "execute-extended-command",
         run: misc::execute_extended_command,
     },
