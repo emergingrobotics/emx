@@ -33,7 +33,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/emergingrobotics/emx"
@@ -51,11 +51,11 @@ panic = "abort"
 # Internal crates carry a version as well as a path so the published emx
 # resolves them from crates.io. Keep the version in step with
 # workspace.package.version.
-emx-core = { path = "crates/emx-core", version = "0.0.4" }
-emx-proto = { path = "crates/emx-proto", version = "0.0.4" }
-emx-term = { path = "crates/emx-term", version = "0.0.4" }
-emx-text = { path = "crates/emx-text", version = "0.0.4" }
-emx-types = { path = "crates/emx-types", version = "0.0.4" }
+emx-core = { path = "crates/emx-core", version = "0.0.5" }
+emx-proto = { path = "crates/emx-proto", version = "0.0.5" }
+emx-term = { path = "crates/emx-term", version = "0.0.5" }
+emx-text = { path = "crates/emx-text", version = "0.0.5" }
+emx-types = { path = "crates/emx-types", version = "0.0.5" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

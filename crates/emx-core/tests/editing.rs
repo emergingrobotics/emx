@@ -222,6 +222,24 @@ fn delete_key_deletes_the_character_under_point() {
 }
 
 #[test]
+fn delete_key_deletes_an_active_region() {
+    let mut harness = Harness::with_text("a|bcd");
+    harness.keys("C-SPC C-f C-f <delete>");
+    assert_eq!(harness.text(), "ad");
+    assert_eq!(harness.point(), 1);
+    assert!(harness.kill_ring().is_empty(), "deleted, not killed");
+    harness.keys("C-SPC <delete>");
+    assert_eq!(harness.text(), "a", "an empty region deletes a character");
+}
+
+#[test]
+fn control_d_never_deletes_the_region() {
+    let mut harness = Harness::with_text("a|bcd");
+    harness.keys("C-SPC C-f C-f C-d");
+    assert_eq!(harness.text(), "abc");
+}
+
+#[test]
 fn control_z_suspends_a_terminal_client() {
     let mut harness = Harness::with_text("a|bc");
     harness.take_sent();

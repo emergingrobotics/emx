@@ -246,6 +246,21 @@ pub(super) fn delete_char(ctx: &mut CommandContext) -> Result<(), CommandError> 
     delete_chars(ctx, count, kill)
 }
 
+/// `<delete>`: Emacs `delete-forward-char`. With an active non-empty
+/// region and N = 1 it deletes the region instead; a prefix argument makes
+/// it kill.
+pub(super) fn delete_forward_char(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let count = ctx.prefix_arg.numeric_value();
+    if count == 1 && ctx.use_region() {
+        let region = ctx.region()?;
+        let point = ctx.point();
+        ctx.delete_with_point(region, point)?;
+        return Ok(());
+    }
+    let kill = ctx.prefix_arg != PrefixArg::None;
+    delete_chars(ctx, count, kill)
+}
+
 /// `DEL`: Emacs `delete-backward-char`. With an active non-empty region and
 /// N = 1 it deletes the region instead; a prefix argument makes it kill.
 pub(super) fn delete_backward_char(ctx: &mut CommandContext) -> Result<(), CommandError> {

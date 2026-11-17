@@ -48,7 +48,7 @@ const DEFAULT_BINDINGS: [(&str, &str); 104] = [
     ("C-<end>", "end-of-buffer"),
     ("RET", "newline"),
     ("C-d", "delete-char"),
-    ("<delete>", "delete-char"),
+    ("<delete>", "delete-forward-char"),
     ("DEL", "delete-backward-char"),
     ("C-k", "kill-line"),
     ("M-d", "kill-word"),

@@ -187,6 +187,10 @@ static COMMANDS: &[CommandSpec] = &[
         run: edit::delete_backward_char,
     },
     CommandSpec {
+        name: "delete-forward-char",
+        run: edit::delete_forward_char,
+    },
+    CommandSpec {
         name: "undo",
         run: edit::undo,
     },
