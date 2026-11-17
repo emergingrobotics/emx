@@ -53,12 +53,12 @@ Client/server is the architecture from milestone 1, inspired by [herdr](https://
 ## 4. Emacs Keybindings
 
 - **Movement:** `C-f/b/n/p`, `M-f/b`, `C-a/e`, `M-a/e`, `C-v`, `M-v`, `M-<`, `M->`, `M-g g`, `C-l` (recenter cycling).
-- **Editing:** `C-d`, `M-d`, `C-k`, `C-w`, `M-w`, `C-y`, `M-y`, `C-/` `C-_` `C-x u` undo, `M-u/l/c`, `C-t`, `M-t`, `C-o`, `C-x C-o`, `M-/` (dabbrev).
+- **Editing:** `C-d`, `DEL` and `<delete>` (both delete an active region, as `delete-backward-char` and `delete-forward-char` do), `M-d`, `C-k`, `C-w`, `M-w`, `C-y`, `M-y`, `C-/` `C-_` `C-x u` undo, `M-u/l/c`, `C-t`, `M-t`, `C-o`, `C-x C-o`, `M-/` (dabbrev).
 - **Mark and region:** `C-SPC`, `C-x C-x`, `C-x h`, mark ring, rectangle commands (`C-x r k/y/t`), registers.
 - **Search:** incremental `C-s`/`C-r` with wrap and case smartness; `M-%` query-replace; regexp variants; `occur`. Lazy highlighting of other matches is bounded to the visible region on large files (Goal 2 over Goal 3).
 - **Files/buffers/windows:** `C-x C-f`, `C-x C-s`, `C-x C-w`, `C-x b`, `C-x k`, `C-x 2/3/0/1/o`.
 - **Minibuffer completion:** vertical incremental completion in the style of `fido-vertical-mode` / vertico. Candidates are listed vertically and narrow as you type; `RET` accepts. Vanilla Emacs completion is not emulated. Used by `C-x C-f`, `C-x b`, and `M-x` (a command palette over the built-in command set). History per prompt.
-- **Universal argument** (`C-u`), keyboard macros (`C-x ( ) e`), `C-g` always aborts.
+- **Universal argument** (`C-u`), keyboard macros (`C-x ( ) e`), `C-g` always aborts. `C-z` (`suspend-frame`) stops the terminal client for the shell's `fg`; the server and other clients keep running.
 - **Undo follows Emacs's model:** undo is itself undoable, and `C-g` (or any non-undo command) breaks the undo chain. `undo-redo` (Emacs 28) is also provided. Undo history is memory-bounded for huge files.
 - **Syntax-aware commands** that Emacs gets from major modes (`TAB` indentation, `M-;` comment) come from built-in per-language rules and tree-sitter, since there is no Lisp. These sit in tier 2 of the command list. Sexp movement (`C-M-f/b`) and filling (`M-q`) are out of scope.
 - **Keybindings are data:** a default Emacs keymap, user-overridable via TOML. Defaults avoid stealing Emacs prefixes: the tree panel toggles with `F8` and `M-x toggle-tree`, not `C-x t` (Emacs's tab-bar prefix).

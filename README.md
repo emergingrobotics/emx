@@ -4,15 +4,15 @@ A fast terminal editor with Emacs keybindings, built for humans working alongsid
 
 ## Install
 
-emx runs on Linux. You need a Rust toolchain recent enough for edition 2024 (1.85 or later); [rustup](https://rustup.rs) installs one.
+emx runs on Linux. Building it needs Rust 1.88 or later; [rustup](https://rustup.rs) installs one. Distribution `cargo` packages are often older and fail with "this version of Cargo is older than the `2024` edition"; run `rustup update stable`, or use a static binary (below).
 
 From crates.io:
 
 ```sh
-cargo install emx
+cargo install --locked emx
 ```
 
-This puts `emx` in `~/.cargo/bin`. To install into `~/.local/bin` instead, add `--root ~/.local`.
+This puts `emx` in `~/.cargo/bin`. To install into `~/.local/bin` instead, add `--root ~/.local`. Running the same command again upgrades to the newest release.
 
 From a checkout of this repository:
 
@@ -20,6 +20,22 @@ From a checkout of this repository:
 make install                      # builds and copies emx to ~/.local/bin
 make install-sys                  # builds and copies emx to /usr/local/bin (uses sudo)
 ```
+
+### Other hosts
+
+For a host without a new enough Rust, build static binaries, which run on any Linux of their architecture whatever its libc, and copy the one matching the host's `uname -m`:
+
+```sh
+make static
+scp target/x86_64-unknown-linux-musl/release/emx  HOST:.local/bin/emx   # x86_64
+scp target/aarch64-unknown-linux-musl/release/emx HOST:.local/bin/emx   # aarch64
+```
+
+`make deb` packages the same binaries as `.deb` files.
+
+### Upgrading
+
+New terminals attach to the session server that is already running, so a new emx takes effect once the old server exits. It exits by itself 3 seconds after its last terminal closes (`C-x C-c` in each), but stays up while any buffer has unsaved changes. To stop it at once, run `pkill -x emx`, which does not offer to save. Check the version with `emx --version`.
 
 ## Getting Started Fast
 
@@ -39,6 +55,7 @@ Keys follow Emacs: `C-x` means Control+x, `M-x` means Alt+x (or Esc then x).
 | `C-x C-s` | Save |
 | `C-x s` | Save all modified buffers |
 | `C-x C-c` | Quit (asks about unsaved buffers) |
+| `C-z` | Suspend to the shell; `fg` resumes |
 | `C-g` | Cancel the current command |
 | `C-f` `C-b` `C-n` `C-p` | Move right, left, down, up (arrow keys work too) |
 | `C-a` / `C-e` | Start / end of line |
@@ -50,6 +67,7 @@ Keys follow Emacs: `C-x` means Control+x, `M-x` means Alt+x (or Esc then x).
 | `C-SPC` | Set the mark (start a selection) |
 | `C-w` / `M-w` / `C-y` | Cut / copy / paste |
 | `C-k` | Cut to end of line |
+| `DEL` / `Delete` | Delete the character before / under the cursor, or the selection if one is active |
 | `C-/` | Undo |
 | `C-x b` / `C-x C-b` | Switch buffer / list buffers |
 | `C-x 2` / `C-x 3` / `C-x o` / `C-x 1` | Split below / split right / other window / close other windows |
@@ -133,7 +151,7 @@ Mouse support is off by default, because turning it on takes over the terminal's
 
 ### Terminals
 
-emx works in Kitty-protocol terminals (kitty, WezTerm, Ghostty, foot, recent Alacritty) and in legacy terminals: xterm, GNOME Terminal and other VTE terminals, Alacritty, the Linux console, tmux and GNU screen. It asks the terminal at startup which it is. To skip the question, set `EMX_KEYBOARD=kitty` or `EMX_KEYBOARD=legacy`.
+emx works in Kitty-protocol terminals (kitty, WezTerm, Ghostty, foot, recent Alacritty) and in legacy terminals: xterm, GNOME Terminal and other VTE terminals, Alacritty, the Linux console, tmux and GNU screen. It asks the terminal at startup which it is, and waits up to one second for the answer; a terminal or multiplexer that does not answer makes every start take that second. To skip the question, set `keyboard_encoding = "kitty"` or `"legacy"` in the config, or `EMX_KEYBOARD=kitty` or `EMX_KEYBOARD=legacy` in the environment.
 
 On macOS, emx builds (`make macos`, or `cargo install` on a Mac) and uses the same keyboard handling in Terminal.app and iTerm2; set Option to act as Meta in the terminal's settings, or `M-` keys will not work. macOS is less tested than Linux.
 
