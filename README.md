@@ -4,9 +4,9 @@ A fast terminal editor with Emacs keybindings, built for humans working alongsid
 
 ## Install
 
-emx runs on Linux, on x86_64 and aarch64.
+emx runs on Linux, on x86_64 and aarch64. Install it with Homebrew.
 
-### Homebrew (recommended)
+### Homebrew
 
 ```sh
 brew tap gherlein/tap
@@ -14,24 +14,17 @@ brew trust gherlein/tap
 brew install emx
 ```
 
-Homebrew refuses to load formulae from a tap it does not trust, so the `brew trust` step is required. `brew upgrade emx` picks up new releases. The formula installs a prebuilt static binary that needs nothing else installed. It is Linux-only for now; on macOS use cargo (below).
+Homebrew refuses to load formulae from a tap it does not trust, so the `brew trust` step is required. `brew upgrade emx` picks up new releases. The formula installs a prebuilt static binary that needs nothing else: no Rust toolchain, no libraries.
 
 Prebuilt `.tar.gz` archives holding the bare binary are also on the [Releases](https://github.com/emergingrobotics/emx/releases) page.
 
-### Cargo, to keep up with code changes
+### Cargo, if you already work in Rust
 
-Homebrew gets tagged releases. To follow development more closely, build with cargo, which needs Rust 1.88 or later ([rustup](https://rustup.rs) installs one; distribution `cargo` packages are often older and fail with "this version of Cargo is older than the `2024` edition", so run `rustup update stable`).
-
-The newest version published to crates.io (this also works on macOS):
+If you have a Rust toolchain and want to build emx yourself (to follow `main` between releases, or on macOS, which has no prebuilt binary yet), use cargo. It needs Rust 1.88 or later; distribution `cargo` packages are often older and fail with "this version of Cargo is older than the `2024` edition", so use [rustup](https://rustup.rs) and `rustup update stable`.
 
 ```sh
-cargo install --locked emx
-```
-
-The latest code on `main`, before it is released:
-
-```sh
-cargo install --locked --git https://github.com/emergingrobotics/emx emx
+cargo install --locked emx                                                  # newest release on crates.io
+cargo install --locked --git https://github.com/emergingrobotics/emx emx   # latest code on main
 ```
 
 Either puts `emx` in `~/.cargo/bin`; add `--root ~/.local` to install into `~/.local/bin` instead. Running the same command again upgrades. If you also have the Homebrew copy, check which one runs with `type -a emx`.
