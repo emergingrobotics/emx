@@ -4,9 +4,9 @@ A fast terminal editor with Emacs keybindings, built for humans working alongsid
 
 ## Install
 
-emx runs on Linux. Prebuilt static binaries for x86_64 and aarch64 need nothing else installed. Building from source needs Rust 1.88 or later; [rustup](https://rustup.rs) installs one. Distribution `cargo` packages are often older and fail with "this version of Cargo is older than the `2024` edition"; run `rustup update stable`, or use a prebuilt binary.
+emx runs on Linux, on x86_64 and aarch64.
 
-With Homebrew (Linux):
+### Homebrew (recommended)
 
 ```sh
 brew tap gherlein/tap
@@ -14,25 +14,33 @@ brew trust gherlein/tap
 brew install emx
 ```
 
-Homebrew refuses to load formulae from a tap it does not trust, so the `brew trust` step is required. `brew upgrade emx` picks up new releases.
+Homebrew refuses to load formulae from a tap it does not trust, so the `brew trust` step is required. `brew upgrade emx` picks up new releases. The formula installs a prebuilt static binary that needs nothing else installed. It is Linux-only for now; on macOS use cargo (below).
 
-On Debian or Ubuntu, download the `.deb` for your architecture (`amd64` or `arm64`) from [Releases](https://github.com/emergingrobotics/emx/releases) and install it, which puts `emx` in `/usr/bin`:
+Prebuilt `.tar.gz` archives holding the bare binary are also on the [Releases](https://github.com/emergingrobotics/emx/releases) page.
 
-```sh
-sudo apt install ./emx_X.Y.Z_linux_amd64.deb
-```
+### Cargo, to keep up with code changes
 
-The same page has `.tar.gz` archives holding the bare binary, for any other Linux.
+Homebrew gets tagged releases. To follow development more closely, build with cargo, which needs Rust 1.88 or later ([rustup](https://rustup.rs) installs one; distribution `cargo` packages are often older and fail with "this version of Cargo is older than the `2024` edition", so run `rustup update stable`).
 
-From crates.io (this also works on macOS, for which there is no prebuilt binary):
+The newest version published to crates.io (this also works on macOS):
 
 ```sh
 cargo install --locked emx
 ```
 
-This puts `emx` in `~/.cargo/bin`. To install into `~/.local/bin` instead, add `--root ~/.local`. Running the same command again upgrades to the newest release.
+The latest code on `main`, before it is released:
 
-From a checkout of this repository:
+```sh
+cargo install --locked --git https://github.com/emergingrobotics/emx emx
+```
+
+Either puts `emx` in `~/.cargo/bin`; add `--root ~/.local` to install into `~/.local/bin` instead. Running the same command again upgrades. If you also have the Homebrew copy, check which one runs with `type -a emx`.
+
+### Debian packages
+
+`make deb` builds `.deb` packages (`amd64` and `arm64`) of the static binary into `dist/`, which install with `sudo apt install ./dist/emx_X.Y.Z_linux_amd64.deb` and put `emx` in `/usr/bin`. We hope to publish Debian packages as a supported install route later.
+
+### From a checkout
 
 ```sh
 make install                      # builds and copies emx to /usr/local/bin (asks for sudo)
@@ -53,7 +61,7 @@ scp target/x86_64-unknown-linux-musl/release/emx  HOST:.local/bin/emx   # x86_64
 scp target/aarch64-unknown-linux-musl/release/emx HOST:.local/bin/emx   # aarch64
 ```
 
-`make deb` builds the same static binaries packaged as `.deb` files in `dist/`. `make prereqs` installs the musl targets, cargo-zigbuild and zig these need, if missing.
+`make prereqs` installs the musl targets, cargo-zigbuild and zig these need, if missing.
 
 ### Upgrading
 
@@ -114,7 +122,9 @@ git diff FILE | emx apply-patch FILE   # apply a unified diff to FILE's open buf
 
 `emx apply-patch` puts the hunks into the open buffer, on top of any unsaved edits, as one change that `C-/` undoes. If any hunk does not apply, nothing changes and it exits with an error. It never saves.
 
-Run `emx --help` or `emx help COMMAND` for details. Key bindings can be overridden in `~/.config/emx/config.toml`.
+Run `emx --help` or `emx help COMMAND` for details. Key bindings can be overridden in `~/.config/emx/config.toml`. `M-x` is Alt+x, or Esc then x (not both).
+
+The config is read when the session server starts, not by each new `emx`: every later `emx` attaches to the running server. After changing it, close every emx (`C-x C-c`) and the server exits 3 seconds later, unless a buffer has unsaved changes; the next `emx` reads the new config.
 
 ### File panel
 
@@ -149,6 +159,8 @@ Rust, C, Go, Python, JavaScript, Bash, JSON, TOML and YAML files are highlighted
 
 Text you kill or copy also goes to the system clipboard through the terminal (OSC 52). Inside tmux, set `set -g set-clipboard on`. Turn it off with `osc52_clipboard = false`. A copy (`M-w`, or a mouse selection with `mouse_drag_copy_region`) flashes "Copied to clipboard" in the `success` face for `clipboard_notice_ms` (default 1500; 0 keeps it until the next key). A copy larger than `osc52_max_bytes` is not sent and says so in the `warning` face; it is still in the kill ring. emx cannot tell whether the terminal accepted the text: OSC 52 has no reply.
 
+There are two pastes. `C-y` yanks from emx's kill ring, which every kill and copy (mouse copies included) goes to. The terminal's own paste key (Ctrl+Shift+V in kitty) pastes the system clipboard, which is also how text copied in other programs gets into emx.
+
 ### Colors and per-file settings
 
 ```toml
@@ -169,7 +181,14 @@ delete_trailing_whitespace = true
 
 ### Mouse
 
-Mouse support is off by default, because turning it on takes over the terminal's own drag-to-select. Turn it on with `mouse = true` in the config, or for the session with `M-x xterm-mouse-mode`. Then a click moves the cursor or selects a window, a drag selects text, double and triple clicks select a word and a line, the right button extends the selection, the wheel scrolls the window under the pointer, and dragging a modeline or border resizes windows and the file panel. Hold Shift to use the terminal's own selection. Inside tmux, also `set -g mouse on`. With `mouse_drag_copy_region = true` (Emacs `mouse-drag-copy-region`), releasing a drag, or a double or triple click, also copies the selection to the kill ring and the clipboard, as a terminal or multiplexer selection does.
+Mouse support is off by default, because turning it on takes over the terminal's own drag-to-select. Turn it on in the config, or for the running session with `M-x xterm-mouse-mode`:
+
+```toml
+mouse = true
+mouse_drag_copy_region = true   # a mouse selection copies, as in a terminal
+```
+
+With the mouse on, a click moves the cursor or selects a window, a drag selects text, double and triple clicks select a word and a line, the right button extends the selection, the wheel scrolls the window under the pointer, and dragging a modeline or border resizes windows and the file panel. Hold Shift to use the terminal's own selection. Inside tmux, also `set -g mouse on`. With `mouse_drag_copy_region = true` (Emacs `mouse-drag-copy-region`), releasing a drag, or a double or triple click, also copies the selection to the kill ring and the clipboard, as a terminal or multiplexer selection does, and flashes "Copied to clipboard" (see Clipboard).
 
 ### Terminals
 
