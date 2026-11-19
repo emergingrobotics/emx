@@ -261,6 +261,34 @@ impl Node {
         }
     }
 
+    /// The smallest size along the axis a mouse drag may leave the node:
+    /// every live window keeps `window-min-width` columns or
+    /// `window-min-height` rows, as `window-resize` requires.
+    fn min_drag_size(&self, side_by_side: bool) -> u16 {
+        match &self.kind {
+            NodeKind::Live(_) => {
+                if side_by_side {
+                    WINDOW_MIN_WIDTH
+                } else {
+                    WINDOW_MIN_HEIGHT
+                }
+            }
+            NodeKind::Combination {
+                side_by_side: along,
+                children,
+            } => {
+                let sizes = children
+                    .iter()
+                    .map(|child| child.min_drag_size(side_by_side));
+                if *along == side_by_side {
+                    sizes.sum()
+                } else {
+                    sizes.max().unwrap_or(0)
+                }
+            }
+        }
+    }
+
     fn size_of_combination(&self) -> u16 {
         match &self.kind {
             NodeKind::Combination { side_by_side, .. } => self.size(*side_by_side),
@@ -373,9 +401,22 @@ fn distribute(total: u16, normals: &[f64]) -> Vec<u16> {
     sizes
 }
 
+/// The file panel: a side window in the frame's leftmost columns, outside
+/// the window tree, as an Emacs side window is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Panel {
+    pub window: WindowId,
+    /// The width asked for, its border included; a narrow terminal gives
+    /// the panel less, or hides it.
+    pub wanted_cols: u16,
+}
+
+/// A panel narrower than this, its border included, is not shown.
+pub(crate) const PANEL_MIN_COLS: u16 = 3;
+
 /// One client's windows: a tree of live windows filling the frame above
-/// the echo area. Windows and point are per client; buffers are shared
-/// between clients.
+/// the echo area, and the file panel to its left when open. Windows and
+/// point are per client; buffers are shared between clients.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub selected: WindowId,
@@ -383,6 +424,9 @@ pub struct Frame {
     /// Emacs `window-prev-buffers` of each window, most recent first.
     pub prev_buffers: SecondaryMap<WindowId, Vec<PrevBuffer>>,
     root: Node,
+    /// The frame's columns: the panel's and the window tree's.
+    width: u16,
+    panel: Option<Panel>,
 }
 
 impl Frame {
@@ -397,6 +441,8 @@ impl Frame {
             windows,
             prev_buffers,
             root: Node::live(selected, cols, window_area_rows(rows)),
+            width: cols,
+            panel: None,
         }
     }
 
@@ -404,25 +450,121 @@ impl Frame {
         &self.windows[self.selected]
     }
 
-    /// The frame's width: the root window's.
+    /// The window tree's width: the root window's.
     pub(crate) fn cols(&self) -> u16 {
         self.root.cols
     }
 
-    /// The terminal changed size: the windows keep their shares of it.
-    pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
-        self.root.resize(cols, window_area_rows(rows));
+    /// The whole frame's width, the panel included.
+    pub(crate) fn width(&self) -> u16 {
+        self.width
     }
 
-    /// Every live window with its place, in Emacs's cyclic order (the
-    /// window tree left to right, top to bottom).
+    /// The terminal changed size: the windows keep their shares of it.
+    pub(crate) fn resize(&mut self, cols: u16, rows: u16) {
+        self.width = cols;
+        let panel = self.panel_cols();
+        self.root.resize(cols - panel, window_area_rows(rows));
+    }
+
+    /// Every live window of the tree with its place, in Emacs's cyclic
+    /// order (left to right, top to bottom); the panel is not one.
     pub(crate) fn boxes(&self) -> Vec<(WindowId, WindowBox)> {
         let mut boxes = Vec::new();
-        self.root.collect_boxes(0, 0, &mut boxes);
+        self.root.collect_boxes(self.panel_cols(), 0, &mut boxes);
         boxes
     }
 
+    /// The columns the panel takes now: what it asked for, as far as the
+    /// windows can spare it while keeping `window-min-width`; none when
+    /// that is too little to show it.
+    fn panel_cols(&self) -> u16 {
+        let Some(panel) = self.panel else {
+            return 0;
+        };
+        let cols = panel
+            .wanted_cols
+            .min(self.width.saturating_sub(WINDOW_MIN_WIDTH));
+        if cols < PANEL_MIN_COLS { 0 } else { cols }
+    }
+
+    pub(crate) fn panel(&self) -> Option<Panel> {
+        self.panel
+    }
+
+    pub(crate) fn is_panel(&self, window: WindowId) -> bool {
+        self.panel.is_some_and(|panel| panel.window == window)
+    }
+
+    /// The panel window and its place, when it is open and has room.
+    pub(crate) fn panel_box(&self) -> Option<(WindowId, WindowBox)> {
+        let panel = self.panel?;
+        let cols = self.panel_cols();
+        (cols > 0).then_some((
+            panel.window,
+            WindowBox {
+                left: 0,
+                top: 0,
+                cols,
+                rows: self.root.rows,
+            },
+        ))
+    }
+
+    /// Opens the panel showing `window`, `cols` wide; the window tree gives
+    /// up the columns.
+    pub(crate) fn open_panel(&mut self, window: Window, cols: u16) -> WindowId {
+        assert!(self.panel.is_none(), "a frame has one panel");
+        let id = self.windows.insert(window);
+        self.prev_buffers.insert(id, Vec::new());
+        self.panel = Some(Panel {
+            window: id,
+            wanted_cols: cols,
+        });
+        self.relayout();
+        id
+    }
+
+    /// Closes the panel; the window tree takes its columns back. Returns
+    /// its window and history, whose markers the caller deletes. The
+    /// caller selects another window first if the panel's was selected.
+    pub(crate) fn close_panel(&mut self) -> Option<(Window, Vec<PrevBuffer>)> {
+        let panel = self.panel.take()?;
+        assert!(
+            self.selected != panel.window,
+            "another window is selected before the panel closes"
+        );
+        self.relayout();
+        Some(self.remove_window(panel.window))
+    }
+
+    /// Asks for a panel `cols` wide; returns the columns it has now.
+    pub(crate) fn set_panel_cols(&mut self, cols: u16) -> u16 {
+        if let Some(panel) = &mut self.panel {
+            panel.wanted_cols = cols;
+        }
+        self.relayout();
+        self.panel_cols()
+    }
+
+    fn relayout(&mut self) {
+        let rows = self.root.rows;
+        let panel = self.panel_cols();
+        self.root.resize(self.width - panel, rows);
+    }
+
     pub(crate) fn window_box(&self, window: WindowId) -> WindowBox {
+        if self.is_panel(window) {
+            return self.panel_box().map_or(
+                WindowBox {
+                    left: 0,
+                    top: 0,
+                    cols: 0,
+                    rows: self.root.rows,
+                },
+                |(_, place)| place,
+            );
+        }
         self.boxes()
             .into_iter()
             .find(|(id, _)| *id == window)
@@ -435,15 +577,22 @@ impl Frame {
         self.boxes().into_iter().map(|(id, _)| id).collect()
     }
 
-    /// Live windows in cyclic order starting with the selected one, as
-    /// Emacs's `window-list-1` lists them.
+    /// Live windows of the tree in cyclic order starting with the
+    /// selected one, as Emacs's `window-list-1` lists them; from the first
+    /// when the panel is selected.
     pub(crate) fn order_from_selected(&self) -> Vec<WindowId> {
         let mut order = self.order();
-        let selected = order
-            .iter()
-            .position(|id| *id == self.selected)
-            .expect("the selected window is live");
-        order.rotate_left(selected);
+        if let Some(selected) = order.iter().position(|id| *id == self.selected) {
+            order.rotate_left(selected);
+        }
+        order
+    }
+
+    /// Every window `other-window` cycles through: the panel, then the
+    /// tree's windows, as Emacs lists a left side window first.
+    pub(crate) fn cycle_order(&self) -> Vec<WindowId> {
+        let mut order: Vec<WindowId> = self.panel_box().map(|(id, _)| id).into_iter().collect();
+        order.extend(self.order());
         order
     }
 
@@ -659,6 +808,51 @@ impl Frame {
         children[taller].set_size(false, taller_rows);
         children[shorter].set_size(false, shorter_rows);
         parent.renormalize();
+    }
+
+    /// Emacs `adjust-window-trailing-edge`: moves the edge after `window`
+    /// (its bottom, or its right side when `side_by_side`) by `delta`
+    /// rows or columns, taking them from or giving them to what lies
+    /// beyond it. A window with nothing beyond it along that axis has no
+    /// edge to move. The move is clamped so every window keeps its
+    /// minimum size; returns how far the edge moved.
+    pub(crate) fn adjust_edge(&mut self, window: WindowId, side_by_side: bool, delta: i32) -> i32 {
+        let path = self.path(window);
+        for depth in (0..path.len()).rev() {
+            let (parent_path, index) = (&path[..depth], path[depth]);
+            let parent = self.root.at_mut(parent_path);
+            let NodeKind::Combination {
+                side_by_side: along,
+                children,
+            } = &mut parent.kind
+            else {
+                unreachable!("a parent is a combination")
+            };
+            if *along != side_by_side || index + 1 >= children.len() {
+                continue;
+            }
+            let before = i32::from(children[index].size(side_by_side));
+            let after = i32::from(children[index + 1].size(side_by_side));
+            let least = i32::from(children[index].min_drag_size(side_by_side));
+            let most = before + after - i32::from(children[index + 1].min_drag_size(side_by_side));
+            // A window already below its minimum (on a small terminal)
+            // is never made smaller still.
+            let wanted = if delta < 0 {
+                (before + delta).max(least.min(before))
+            } else {
+                (before + delta).min(most.max(before))
+            };
+            let moved = wanted - before;
+            if moved == 0 {
+                return 0;
+            }
+            let size = |value: i32| u16::try_from(value).expect("sizes stay within the frame");
+            children[index].set_size(side_by_side, size(wanted));
+            children[index + 1].set_size(side_by_side, size(after - moved));
+            parent.renormalize();
+            return moved;
+        }
+        0
     }
 
     /// The most rows a growing minibuffer can take from the windows of a
@@ -894,6 +1088,20 @@ impl LineWalker<'_, '_> {
         ControlFlow::Continue(at)
     }
 
+    /// A unit that takes no room: point can be on it, where the next
+    /// shown glyph is.
+    fn hidden(&mut self, pos: u64) -> ControlFlow<()> {
+        let col = match self.hscroll {
+            Some(hscroll) => self.truncated_place(hscroll, self.x, 0).0,
+            None => self.x,
+        };
+        (self.visit)(&LineEvent::Unit {
+            pos,
+            row: self.row,
+            col,
+        })
+    }
+
     fn unit(&mut self, pos: u64, bytes: &[u8], unit: DisplayUnit) -> ControlFlow<()> {
         let column = self.continued_columns + self.x as u64;
         let tab_width = self.tab_width;
@@ -1024,6 +1232,8 @@ pub(crate) struct Layout<'a> {
     /// `Some` for a window that truncates lines: how far it is scrolled
     /// to the left.
     hscroll: Option<u64>,
+    /// `ansi-color-mode`: SGR sequences take no room.
+    ansi: bool,
 }
 
 impl<'a> Layout<'a> {
@@ -1034,7 +1244,14 @@ impl<'a> Layout<'a> {
             cols,
             tab_width,
             hscroll: None,
+            ansi: false,
         }
+    }
+
+    /// The same layout with SGR sequences hidden when `ansi`.
+    pub(crate) fn with_ansi(mut self, ansi: bool) -> Layout<'a> {
+        self.ansi = ansi;
+        self
     }
 
     /// Lines are truncated at the window's edges (Emacs `truncate-lines`),
@@ -1050,6 +1267,7 @@ impl<'a> Layout<'a> {
             cols,
             tab_width,
             hscroll: Some(hscroll),
+            ansi: false,
         }
     }
 
@@ -1107,9 +1325,19 @@ impl<'a> Layout<'a> {
                     .rposition(|(offset, _)| *offset < settled)
                     .unwrap_or(0)
             };
+            let hidden = if self.ansi {
+                crate::ansi::sgr_sequences(segment)
+            } else {
+                Vec::new()
+            };
             for (offset, unit) in &units[..usable] {
                 let unit_pos = pos + *offset as u64;
-                if walker.unit(unit_pos, &segment[*offset..], *unit).is_break() {
+                let flow = if hidden.iter().any(|range| range.contains(offset)) {
+                    walker.hidden(unit_pos)
+                } else {
+                    walker.unit(unit_pos, &segment[*offset..], *unit)
+                };
+                if flow.is_break() {
                     return Ok(());
                 }
             }

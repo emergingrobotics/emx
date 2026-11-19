@@ -15,9 +15,115 @@ pub enum Face {
     EscapeGlyph,
     Error,
     Warning,
+    /// Emacs `success`: an action reported as done, as a copy.
+    Success,
     ChangedMarker,
     /// The selected completion candidate (Emacs `icomplete-selected-match`).
     CompletionSelected,
+    /// A directory in the file panel.
+    PanelDirectory,
+    /// Git status in the file panel: modified, added, untracked, and an
+    /// ignored entry shown on request.
+    GitModified,
+    GitAdded,
+    GitUntracked,
+    GitIgnored,
+    /// Syntax highlighting, after Emacs's font-lock faces.
+    Comment,
+    String,
+    Keyword,
+    Type,
+    Function,
+    Variable,
+    Constant,
+    Builtin,
+    Preprocessor,
+    /// Emacs `show-paren-match` and `show-paren-mismatch`.
+    ShowParenMatch,
+    ShowParenMismatch,
+    /// Text colored by ANSI SGR codes (`ansi-color-mode`): the 16 colors
+    /// 0-15, or 16 for the terminal's default.
+    Ansi {
+        foreground: u8,
+        background: u8,
+        bold: bool,
+    },
+}
+
+impl Face {
+    pub const ALL: [Face; 30] = [
+        Face::Default,
+        Face::ModeLine,
+        Face::ModeLineInactive,
+        Face::HeaderLine,
+        Face::Region,
+        Face::IsearchMatch,
+        Face::LazyHighlight,
+        Face::MinibufferPrompt,
+        Face::EscapeGlyph,
+        Face::Error,
+        Face::Warning,
+        Face::Success,
+        Face::ChangedMarker,
+        Face::CompletionSelected,
+        Face::PanelDirectory,
+        Face::GitModified,
+        Face::GitAdded,
+        Face::GitUntracked,
+        Face::GitIgnored,
+        Face::Comment,
+        Face::String,
+        Face::Keyword,
+        Face::Type,
+        Face::Function,
+        Face::Variable,
+        Face::Constant,
+        Face::Builtin,
+        Face::Preprocessor,
+        Face::ShowParenMatch,
+        Face::ShowParenMismatch,
+    ];
+
+    /// The face's name in the config's `[faces]` table.
+    pub fn name(self) -> &'static str {
+        match self {
+            Face::Default => "default",
+            Face::ModeLine => "mode_line",
+            Face::ModeLineInactive => "mode_line_inactive",
+            Face::HeaderLine => "header_line",
+            Face::Region => "region",
+            Face::IsearchMatch => "isearch_match",
+            Face::LazyHighlight => "lazy_highlight",
+            Face::MinibufferPrompt => "minibuffer_prompt",
+            Face::EscapeGlyph => "escape_glyph",
+            Face::Error => "error",
+            Face::Warning => "warning",
+            Face::Success => "success",
+            Face::ChangedMarker => "changed_marker",
+            Face::CompletionSelected => "completion_selected",
+            Face::PanelDirectory => "panel_directory",
+            Face::GitModified => "git_modified",
+            Face::GitAdded => "git_added",
+            Face::GitUntracked => "git_untracked",
+            Face::GitIgnored => "git_ignored",
+            Face::Comment => "comment",
+            Face::String => "string",
+            Face::Keyword => "keyword",
+            Face::Type => "type",
+            Face::Function => "function",
+            Face::Variable => "variable",
+            Face::Constant => "constant",
+            Face::Builtin => "builtin",
+            Face::Preprocessor => "preprocessor",
+            Face::ShowParenMatch => "show_paren_match",
+            Face::ShowParenMismatch => "show_paren_mismatch",
+            Face::Ansi { .. } => "ansi",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Face> {
+        Face::ALL.into_iter().find(|face| face.name() == name)
+    }
 }
 
 /// A width of 0 marks the trailing half of a wide character.
@@ -78,6 +184,16 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn face_names_round_trip() {
+        for face in Face::ALL {
+            assert_eq!(Face::from_name(face.name()), Some(face));
+        }
+        assert_eq!(Face::Keyword.name(), "keyword");
+        assert_eq!(Face::ModeLineInactive.name(), "mode_line_inactive");
+        assert_eq!(Face::from_name("nope"), None);
+    }
 
     #[test]
     fn new_grid_is_blank() {

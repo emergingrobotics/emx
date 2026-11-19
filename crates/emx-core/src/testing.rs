@@ -103,6 +103,9 @@ pub struct Harness {
     journal_ops: Vec<JournalOp>,
     /// The paths the editor asked to be watched and has not let go.
     watched: BTreeSet<PathBuf>,
+    /// The directories the file panel watches.
+    watched_trees: BTreeSet<PathBuf>,
+    highlighter: crate::syntax::Highlighter,
     /// Every message sent, to whom.
     messages: Vec<(ClientId, ServerMsg)>,
     next_client: u64,
@@ -151,6 +154,8 @@ impl Harness {
             io_errors: Vec::new(),
             journal_ops: Vec::new(),
             watched: BTreeSet::new(),
+            watched_trees: BTreeSet::new(),
+            highlighter: crate::syntax::Highlighter::new(),
             messages: Vec::new(),
             next_client: HARNESS_CLIENT.0 + 1,
             next_request: 1,
@@ -556,6 +561,22 @@ impl Harness {
                     result: diff::run_diff(&job),
                 });
             }
+            Effect::Highlight(job) => return Some(self.highlighter.run(&job)),
+            Effect::Tree { client, job } => {
+                return Some(crate::tree::run_tree_job(client, &job));
+            }
+            Effect::WatchTree { dir } => {
+                assert!(
+                    self.watched_trees.insert(dir),
+                    "a directory is watched once"
+                );
+            }
+            Effect::UnwatchTree { dir } => {
+                assert!(
+                    self.watched_trees.remove(&dir),
+                    "only watched directories are let go"
+                );
+            }
             Effect::ReadAutoSave { buffer, file } => {
                 let result = autosave::read_auto_save(&file).map_err(|error| {
                     format!(
@@ -679,6 +700,10 @@ impl Harness {
     }
 
     /// The paths being watched.
+    pub fn watched_trees(&self) -> &BTreeSet<PathBuf> {
+        &self.watched_trees
+    }
+
     pub fn watched(&self) -> &BTreeSet<PathBuf> {
         &self.watched
     }
@@ -710,6 +735,12 @@ impl Harness {
         for id in std::mem::take(&mut self.timers) {
             self.handle(Event::Timer(id));
         }
+    }
+
+    /// The timers pending now, which are then no longer fired by
+    /// `fire_timers`; for firing them later, out of order.
+    pub fn take_timers(&mut self) -> Vec<TimerId> {
+        std::mem::take(&mut self.timers)
     }
 
     /// Messages sent to clients since the last call.
@@ -795,6 +826,13 @@ impl Harness {
 
     pub fn client(&self) -> ClientId {
         self.client
+    }
+
+    /// Gives the selected buffer these face spans, replacing any.
+    pub fn set_faces(&mut self, spans: Vec<(std::ops::Range<u64>, emx_types::Face)>) {
+        let buffer = self.buffer_mut();
+        let length = buffer.text.len();
+        buffer.faces.replace_range(0..length, spans);
     }
 
     pub fn editor(&self) -> &Editor {

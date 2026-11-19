@@ -90,7 +90,12 @@ pub(super) fn newline(ctx: &mut CommandContext) -> Result<(), CommandError> {
         })?;
     let count = usize::try_from(count).expect("a count within in_memory_max fits in usize");
     ctx.insert(&vec![NEWLINE; count])?;
-    electric_indent_after_newline(ctx)
+    electric_indent_after_newline(ctx)?;
+    // A language's mode indents the new line by its own rules.
+    if let Some(language) = super::syntax::buffer_language(ctx) {
+        super::syntax::indent_line(ctx, language)?;
+    }
+    Ok(())
 }
 
 /// `electric-indent-post-self-insert-function` after a newline, where
@@ -115,7 +120,7 @@ fn electric_indent_after_newline(ctx: &mut CommandContext) -> Result<(), Command
         if indentation_end == line - 1 {
             0
         } else {
-            current_column(&text, indentation_end, ctx.editor().config().tab_width)?
+            current_column(&text, indentation_end, ctx.tab_width())?
         }
     };
     // Point is at the start of the new line, so `indent-according-to-mode`
@@ -126,7 +131,7 @@ fn electric_indent_after_newline(ctx: &mut CommandContext) -> Result<(), Command
 /// Emacs `indent-line-to`: replace the current line's indentation so it
 /// reaches `column`, and leave point after it.
 fn indent_line_to(ctx: &mut CommandContext, column: u64) -> Result<(), CommandError> {
-    let tab_width = ctx.editor().config().tab_width;
+    let tab_width = ctx.tab_width();
     let text = ctx.buffer().text.clone();
     let line = line_start(&text, ctx.point())?;
     let indentation_end = skip_blanks_forward(&text, line, line_end(&text, line)?)?;
@@ -153,8 +158,8 @@ fn indent_line_to(ctx: &mut CommandContext, column: u64) -> Result<(), CommandEr
 /// Emacs `indent-to` with MINIMUM 0: tabs (when `indent_tabs_mode`) then
 /// spaces from point's column to `column`, leaving point after them.
 fn indent_to(ctx: &mut CommandContext, column: u64) -> Result<(), CommandError> {
-    let tab_width = ctx.editor().config().tab_width;
-    let tabs_allowed = ctx.editor().config().indent_tabs_mode;
+    let tab_width = ctx.tab_width();
+    let tabs_allowed = ctx.indent_tabs_mode();
     let text = ctx.buffer().text.clone();
     let mut from = current_column(&text, ctx.point(), tab_width)?;
     if from >= column {
@@ -180,7 +185,7 @@ fn move_to_column_force(
     line: u64,
     goal: u64,
 ) -> Result<u64, CommandError> {
-    let tab_width = ctx.editor().config().tab_width;
+    let tab_width = ctx.tab_width();
     let text = ctx.buffer().text.clone();
     let position = move_to_column(&text, line, goal, tab_width)?;
     let column = current_column(&text, position, tab_width)?;
@@ -237,6 +242,21 @@ fn skip_blanks_forward(text: &Text, pos: u64, limit: u64) -> Result<u64, ReadErr
 /// deletes the region.
 pub(super) fn delete_char(ctx: &mut CommandContext) -> Result<(), CommandError> {
     let count = ctx.prefix_arg.numeric_value();
+    let kill = ctx.prefix_arg != PrefixArg::None;
+    delete_chars(ctx, count, kill)
+}
+
+/// `<delete>`: Emacs `delete-forward-char`. With an active non-empty
+/// region and N = 1 it deletes the region instead; a prefix argument makes
+/// it kill.
+pub(super) fn delete_forward_char(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let count = ctx.prefix_arg.numeric_value();
+    if count == 1 && ctx.use_region() {
+        let region = ctx.region()?;
+        let point = ctx.point();
+        ctx.delete_with_point(region, point)?;
+        return Ok(());
+    }
     let kill = ctx.prefix_arg != PrefixArg::None;
     delete_chars(ctx, count, kill)
 }
@@ -662,12 +682,15 @@ fn at_line_start(text: &Text, pos: u64) -> Result<bool, ReadError> {
 /// `indent-relative`, spacing out under the next indent point of the
 /// previous non-blank line, or to the next tab stop when there is none.
 pub(super) fn indent_for_tab_command(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    if let Some(language) = super::syntax::buffer_language(ctx) {
+        return super::syntax::indent_line(ctx, language);
+    }
     ctx.check_editable()?;
     let indent = relative_indent_column(ctx)?;
     match indent {
         Some(column) => {
             let opoint = ctx.point();
-            let tab_width = ctx.editor().config().tab_width;
+            let tab_width = ctx.tab_width();
             let text = ctx.buffer().text.clone();
             let current = current_column(&text, opoint, tab_width)?;
             if current < column {
@@ -687,7 +710,7 @@ pub(super) fn indent_for_tab_command(ctx: &mut CommandContext) -> Result<(), Com
 /// the current column, as Emacs `indent-relative` finds it; `None` when
 /// there is no such line or indent point.
 fn relative_indent_column(ctx: &mut CommandContext) -> Result<Option<u64>, CommandError> {
-    let tab_width = ctx.editor().config().tab_width;
+    let tab_width = ctx.tab_width();
     let text = &ctx.buffer().text;
     let start_column = current_column(text, ctx.point(), tab_width)?;
     let line = line_start(text, ctx.point())?;
@@ -753,8 +776,8 @@ fn skip_whitespace(text: &Text, pos: u64, limit: u64) -> Result<u64, ReadError> 
 /// Emacs `indent-to`, leaving point after the inserted whitespace, used when
 /// point is already at the indentation being set.
 fn indent_to_column(ctx: &mut CommandContext, column: u64) -> Result<(), CommandError> {
-    let tab_width = ctx.editor().config().tab_width;
-    let tabs_allowed = ctx.editor().config().indent_tabs_mode;
+    let tab_width = ctx.tab_width();
+    let tabs_allowed = ctx.indent_tabs_mode();
     let text = ctx.buffer().text.clone();
     let from = current_column(&text, ctx.point(), tab_width)?;
     if from >= column {
@@ -776,7 +799,7 @@ fn indent_to_column(ctx: &mut CommandContext, column: u64) -> Result<(), Command
 /// Emacs `tab-to-tab-stop` with the default (empty) `tab-stop-list`: indent
 /// to the next multiple of `tab-width`.
 fn tab_to_tab_stop(ctx: &mut CommandContext) -> Result<(), CommandError> {
-    let tab_width = ctx.editor().config().tab_width;
+    let tab_width = ctx.tab_width();
     let text = ctx.buffer().text.clone();
     let column = current_column(&text, ctx.point(), tab_width)?;
     let next = (column / tab_width + 1) * tab_width;

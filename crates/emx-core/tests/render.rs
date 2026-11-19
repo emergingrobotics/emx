@@ -885,3 +885,28 @@ fn zero_width_and_format_characters_render_as_one_blank() {
     assert_eq!(grid.row(0)[1].text, "b");
     assert_eq!(harness.cursor(), Some((2, 0)));
 }
+
+/// A buffer's own faces are drawn under the region and search faces, and
+/// move with the text when it is edited.
+#[test]
+fn face_spans_are_drawn_and_follow_edits() {
+    let mut harness = Harness::with_text("|let x = 1;");
+    harness.set_faces(vec![(0..3, Face::Error), (8..9, Face::Warning)]);
+    let faces = |harness: &Harness| -> Vec<Face> {
+        harness.grid().row(0)[..10]
+            .iter()
+            .map(|cell| cell.face)
+            .collect()
+    };
+    let d = Face::Default;
+    let (e, w) = (Face::Error, Face::Warning);
+    assert_eq!(faces(&harness), vec![e, e, e, d, d, d, d, d, w, d]);
+    harness.type_text("  ");
+    assert_eq!(faces(&harness), vec![d, d, e, e, e, d, d, d, d, d]);
+    harness.keys("C-a C-SPC C-f");
+    assert_eq!(
+        faces(&harness)[..3],
+        [Face::Region, d, e],
+        "the region is drawn over the span"
+    );
+}

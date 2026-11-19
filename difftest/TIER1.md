@@ -34,6 +34,7 @@ Bindings below are the defaults in `crates/emx-core/src/keymap.rs`
 |---|---|
 | `cases/m1-basic.jsonl` | Movement, editing, kill/yank, mark, undo fundamentals (M1). |
 | `cases/m3-tier1.jsonl` | Sentences, word case, transpose, open/blank lines, rectangles, registers, goto-line, dabbrev, macros, mark ring. |
+| `cases/m10-rectangles.jsonl` | The rectangle commands added in M10: delete, copy, clear, open, number lines. |
 | `cases/m3-tier1-extra.jsonl` | Undo/undo-redo alternate bindings, `M-g M-g`, `C-x e` no-macro paths. |
 | `cases/m3-search.jsonl` | isearch (forward/backward/regexp), query-replace (+regexp), occur. |
 | `cases/m3-completion.jsonl` | `M-x`, `yank-pop` minibuffer (`M-y` browse). |
@@ -102,6 +103,11 @@ unchanged; the cases pin that it never errors or moves point.
 | `C-x r k` | `kill-rectangle` | 7 | `m3-tier1`: kill-rectangle-basic/-wide/-one-line |
 | `C-x r y` | `yank-rectangle` | 4 | `m3-tier1`: yank-rectangle-basic/-inline/-into-text |
 | `C-x r t` | `string-rectangle` | 4 | `m3-tier1`: string-rectangle-basic/-longer/-then-move |
+| `C-x r d` | `delete-rectangle` | 3 | `m10-rectangles`: delete-rectangle/-short-line/-keeps-killed-rectangle |
+| `C-x r M-w` | `copy-rectangle-as-kill` | 2 | `m10-rectangles`: copy-rectangle-as-kill/-short-line |
+| `C-x r c` | `clear-rectangle` | 3 | `m10-rectangles`: clear-rectangle/-short-line/-to-line-end |
+| `C-x r o` | `open-rectangle` | 2 | `m10-rectangles`: open-rectangle/-short-line |
+| `C-x r N` | `rectangle-number-lines` | 3 | `m10-rectangles`: number-lines/-column/-ten |
 | `C-x r s` | `copy-to-register` | 10 | `m3-tier1`: copy-to-register-noarg/-delete/-reversed |
 | `C-x r i` | `insert-register` | 7 | `m3-tier1`: copy-insert-register/-arg, insert-register-twice |
 | `C-x r SPC` | `point-to-register` | 3 | `m3-tier1`: point-jump-register, point-jump-after-edit, point-register-two |

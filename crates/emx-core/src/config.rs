@@ -54,13 +54,82 @@ pub const COMPLETION_ROWS: u64 = 10;
 /// Widest `completion_rows` accepted from config; a terminal is never this
 /// tall.
 pub const COMPLETION_ROWS_MAX: u64 = 1000;
+/// Mouse reporting is off until asked for: it takes over the terminal's
+/// own drag-to-select, as Emacs `-nw` leaves `xterm-mouse-mode` off.
+pub const MOUSE: bool = false;
+/// Emacs `mouse-drag-copy-region`: off, so a drag only sets the region.
+pub const MOUSE_DRAG_COPY_REGION: bool = false;
+/// Emacs `mouse-wheel-scroll-amount`'s first element.
+pub const MOUSE_WHEEL_LINES: u64 = 5;
+/// The most lines one wheel step may scroll.
+pub const MOUSE_WHEEL_LINES_MAX: u64 = 1000;
+/// The file panel's width, its border included.
+pub const PANEL_WIDTH: u64 = 30;
+/// The panel's width must be from 11 (ten text columns and the border)
+/// up to the widest terminal the server accepts.
+pub const PANEL_WIDTH_MIN: u64 = 11;
+pub const PANEL_WIDTH_MAX: u64 = 1000;
+/// The most files `project-find-file` lists.
+pub const QUICK_OPEN_MAX_FILES: u64 = 100_000;
+/// Highlighting is off for files above this size, and for lines above
+/// this length (DESIGN section 5).
+pub const HIGHLIGHT_MAX_FILE: u64 = 50 * 1000 * 1000;
+pub const HIGHLIGHT_MAX_LINE: u64 = 10 * 1000;
+/// Kills go to the system clipboard through the terminal (OSC 52).
+pub const OSC52_CLIPBOARD: bool = true;
+/// Longer kills are not sent: terminals refuse large OSC 52 payloads
+/// (xterm's limit is about 100 KB of base64).
+pub const OSC52_MAX_BYTES: u64 = 74_994;
+/// How long "Copied to clipboard" stays in the echo area; zero keeps it
+/// until the next input, as an Emacs message.
+pub const CLIPBOARD_NOTICE_MS: u64 = 1500;
+/// Emacs `show-paren-mode`, on by default since Emacs 28.
+pub const SHOW_PAREN_MODE: bool = true;
+/// How far a paren's match is looked for (Emacs
+/// `blink-matching-paren-distance`).
+pub const SHOW_PAREN_MAX_DISTANCE: u64 = 100 * 1024;
 pub const MAX_WIRE_MESSAGE: u64 = 16 * MIB;
 pub const FRAME_QUEUE_DEPTH: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KeyboardEncoding {
+    /// Ask the terminal at startup.
+    Auto,
     Kitty,
+    Legacy,
+}
+
+/// Settings for the files whose name, or else extension, is the key of a
+/// `[file_types]` entry; unset ones are the global ones.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileTypeSettings {
+    pub tab_width: Option<u64>,
+    pub indent_tabs_mode: Option<bool>,
+    pub require_final_newline: Option<bool>,
+    pub delete_trailing_whitespace: Option<bool>,
+}
+
+/// What one buffer is edited and saved with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileSettings {
+    pub tab_width: u64,
+    pub indent_tabs_mode: bool,
+    /// Emacs `require-final-newline`: a save adds a missing final newline.
+    pub require_final_newline: bool,
+    /// A save first deletes the blanks at the ends of lines (Emacs
+    /// `delete-trailing-whitespace` in `before-save-hook`).
+    pub delete_trailing_whitespace: bool,
+}
+
+/// The built-in colors the terminal draws with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    #[default]
+    Dark,
+    Light,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -97,6 +166,26 @@ pub struct Config {
     pub echo_keystrokes_ms: u64,
     pub cursor_event_interval_ms: u64,
     pub completion_rows: u64,
+    pub mouse: bool,
+    pub mouse_drag_copy_region: bool,
+    pub mouse_wheel_lines: u64,
+    pub panel_width: u64,
+    pub quick_open_max_files: u64,
+    pub highlight_max_file: u64,
+    pub highlight_max_line: u64,
+    pub show_paren_mode: bool,
+    pub show_paren_max_distance: u64,
+    pub osc52_clipboard: bool,
+    pub osc52_max_bytes: u64,
+    /// Zero is valid: the notice then stays until the next input.
+    pub clipboard_notice_ms: u64,
+    pub theme: ThemeChoice,
+    /// Face name to SGR parameters (`keyword = "1;34"`), over the theme's.
+    pub faces: BTreeMap<String, String>,
+    pub require_final_newline: bool,
+    pub delete_trailing_whitespace: bool,
+    /// Per file name or extension (`[file_types.go]`, `[file_types.Makefile]`).
+    pub file_types: BTreeMap<String, FileTypeSettings>,
 }
 
 impl Default for Config {
@@ -111,7 +200,7 @@ impl Default for Config {
             journal_snapshot_max: JOURNAL_SNAPSHOT_MAX,
             large_save_warn: LARGE_SAVE_WARN,
             search_match_cap: SEARCH_MATCH_CAP,
-            keyboard_encoding: KeyboardEncoding::Kitty,
+            keyboard_encoding: KeyboardEncoding::Auto,
             daemon_grace_ms: DAEMON_GRACE_MS,
             undo_limit: UNDO_LIMIT,
             undo_strong_limit: UNDO_STRONG_LIMIT,
@@ -130,6 +219,23 @@ impl Default for Config {
             echo_keystrokes_ms: ECHO_KEYSTROKES_MS,
             cursor_event_interval_ms: CURSOR_EVENT_INTERVAL_MS,
             completion_rows: COMPLETION_ROWS,
+            mouse: MOUSE,
+            mouse_drag_copy_region: MOUSE_DRAG_COPY_REGION,
+            mouse_wheel_lines: MOUSE_WHEEL_LINES,
+            panel_width: PANEL_WIDTH,
+            quick_open_max_files: QUICK_OPEN_MAX_FILES,
+            highlight_max_file: HIGHLIGHT_MAX_FILE,
+            highlight_max_line: HIGHLIGHT_MAX_LINE,
+            show_paren_mode: SHOW_PAREN_MODE,
+            show_paren_max_distance: SHOW_PAREN_MAX_DISTANCE,
+            osc52_clipboard: OSC52_CLIPBOARD,
+            osc52_max_bytes: OSC52_MAX_BYTES,
+            clipboard_notice_ms: CLIPBOARD_NOTICE_MS,
+            theme: ThemeChoice::Dark,
+            faces: BTreeMap::new(),
+            require_final_newline: false,
+            delete_trailing_whitespace: false,
+            file_types: BTreeMap::new(),
         }
     }
 }
@@ -168,6 +274,34 @@ pub struct InvalidSetting {
 }
 
 impl Config {
+    /// The settings of a buffer visiting `path` (none for buffers that
+    /// visit no file): its `[file_types]` entry by whole name, else by
+    /// extension, over the global settings.
+    pub fn file_settings(&self, path: Option<&std::path::Path>) -> FileSettings {
+        let entry = path.and_then(|path| {
+            let by_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| self.file_types.get(name));
+            by_name.or_else(|| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .and_then(|extension| self.file_types.get(extension))
+            })
+        });
+        let entry = entry.cloned().unwrap_or_default();
+        FileSettings {
+            tab_width: entry.tab_width.unwrap_or(self.tab_width),
+            indent_tabs_mode: entry.indent_tabs_mode.unwrap_or(self.indent_tabs_mode),
+            require_final_newline: entry
+                .require_final_newline
+                .unwrap_or(self.require_final_newline),
+            delete_trailing_whitespace: entry
+                .delete_trailing_whitespace
+                .unwrap_or(self.delete_trailing_whitespace),
+        }
+    }
+
     /// `None` means no config file: all defaults. An explicit path that does
     /// not exist is an error, never a silent fallback to defaults.
     pub fn load(path: Option<&Path>) -> Result<Config, ConfigError> {
@@ -240,6 +374,55 @@ impl Config {
                 reason: format!("must be between 1 and {TAB_WIDTH_MAX}"),
             });
         }
+        for (name, settings) in &self.file_types {
+            if settings
+                .tab_width
+                .is_some_and(|width| !(1..=TAB_WIDTH_MAX).contains(&width))
+            {
+                return Err(InvalidSetting {
+                    key: "file_types",
+                    reason: format!("{name}: tab_width must be between 1 and {TAB_WIDTH_MAX}"),
+                });
+            }
+        }
+        for (name, parameters) in &self.faces {
+            if emx_types::Face::from_name(name).is_none() {
+                return Err(InvalidSetting {
+                    key: "faces",
+                    reason: format!("has no face named {name}"),
+                });
+            }
+            let valid = !parameters.is_empty()
+                && parameters
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b';');
+            if !valid {
+                return Err(InvalidSetting {
+                    key: "faces",
+                    reason: format!(
+                        "{name}: {parameters:?} is not SGR parameters (digits and ';')"
+                    ),
+                });
+            }
+        }
+        if !(PANEL_WIDTH_MIN..=PANEL_WIDTH_MAX).contains(&self.panel_width) {
+            return Err(InvalidSetting {
+                key: "panel_width",
+                reason: format!("must be between {PANEL_WIDTH_MIN} and {PANEL_WIDTH_MAX}"),
+            });
+        }
+        if self.quick_open_max_files == 0 {
+            return Err(InvalidSetting {
+                key: "quick_open_max_files",
+                reason: "must be greater than 0".to_string(),
+            });
+        }
+        if !(1..=MOUSE_WHEEL_LINES_MAX).contains(&self.mouse_wheel_lines) {
+            return Err(InvalidSetting {
+                key: "mouse_wheel_lines",
+                reason: format!("must be between 1 and {MOUSE_WHEEL_LINES_MAX}"),
+            });
+        }
         if !(1..=COMPLETION_ROWS_MAX).contains(&self.completion_rows) {
             return Err(InvalidSetting {
                 key: "completion_rows",
@@ -290,7 +473,7 @@ mod tests {
         assert_eq!(config.undo_strong_limit, 240_000);
         assert_eq!(config.undo_outer_limit, 24_000_000);
         assert_eq!(config.in_memory_max, 16 * 1024 * 1024);
-        assert_eq!(config.keyboard_encoding, KeyboardEncoding::Kitty);
+        assert_eq!(config.keyboard_encoding, KeyboardEncoding::Auto);
     }
 
     #[test]
@@ -317,8 +500,14 @@ mod tests {
     fn invalid_value_is_an_error_naming_the_key() {
         let error = load_str("undo_limit = \"big\"\n").expect_err("bad value rejected");
         assert!(error.to_string().contains("undo_limit"), "{error}");
-        let error = load_str("keyboard_encoding = \"legacy\"\n").expect_err("only kitty");
+        let error = load_str("keyboard_encoding = \"vt100\"\n").expect_err("unknown encoding");
         assert!(error.to_string().contains("keyboard_encoding"), "{error}");
+        assert_eq!(
+            load_str("keyboard_encoding = \"legacy\"\n")
+                .expect("legacy")
+                .keyboard_encoding,
+            KeyboardEncoding::Legacy
+        );
     }
 
     #[test]
@@ -340,7 +529,14 @@ mod tests {
              auto_save_timeout_s = 16\ntab_width = 4\nnext_screen_context_lines = 0\n\
              amalgamation_limit = 17\ncolumn_checkpoint_interval = 18\n\
              long_line_threshold = 19\necho_keystrokes_ms = 0\nmark_ring_max = 20\n\
-             indent_tabs_mode = false\ncursor_event_interval_ms = 21\ncompletion_rows = 22\n",
+             indent_tabs_mode = false\ncursor_event_interval_ms = 21\ncompletion_rows = 22\n\
+             keyboard_encoding = \"legacy\"\nmouse = true\nmouse_drag_copy_region = true\n\
+             mouse_wheel_lines = 23\n\
+             panel_width = 24\nquick_open_max_files = 25\nhighlight_max_file = 26\n\
+             highlight_max_line = 27\nshow_paren_mode = false\nshow_paren_max_distance = 28\n\
+             osc52_clipboard = false\nosc52_max_bytes = 29\nclipboard_notice_ms = 0\ntheme = \"light\"\n\
+             require_final_newline = true\ndelete_trailing_whitespace = true\n\
+             [faces]\nkeyword = \"1;34\"\n[file_types.go]\nindent_tabs_mode = true\n",
         )
         .expect("valid config");
         let expected = Config {
@@ -354,7 +550,7 @@ mod tests {
             journal_fsync_ms: 7,
             journal_snapshot_max: 8,
             large_save_warn: 9,
-            keyboard_encoding: KeyboardEncoding::Kitty,
+            keyboard_encoding: KeyboardEncoding::Legacy,
             daemon_grace_ms: 10,
             undo_limit: 11,
             undo_strong_limit: 12,
@@ -372,6 +568,29 @@ mod tests {
             echo_keystrokes_ms: 0,
             cursor_event_interval_ms: 21,
             completion_rows: 22,
+            mouse: true,
+            mouse_drag_copy_region: true,
+            mouse_wheel_lines: 23,
+            panel_width: 24,
+            quick_open_max_files: 25,
+            highlight_max_file: 26,
+            highlight_max_line: 27,
+            show_paren_mode: false,
+            show_paren_max_distance: 28,
+            osc52_clipboard: false,
+            osc52_max_bytes: 29,
+            clipboard_notice_ms: 0,
+            theme: ThemeChoice::Light,
+            faces: BTreeMap::from([("keyword".to_string(), "1;34".to_string())]),
+            require_final_newline: true,
+            delete_trailing_whitespace: true,
+            file_types: BTreeMap::from([(
+                "go".to_string(),
+                FileTypeSettings {
+                    indent_tabs_mode: Some(true),
+                    ..FileTypeSettings::default()
+                },
+            )]),
         };
         assert_eq!(config, expected);
     }
@@ -473,6 +692,22 @@ mod tests {
         assert_eq!(invalid_key("tab_width = 17\n"), "tab_width");
         assert_eq!(invalid_key("completion_rows = 0\n"), "completion_rows");
         assert_eq!(invalid_key("completion_rows = 1001\n"), "completion_rows");
+        assert_eq!(invalid_key("mouse_wheel_lines = 0\n"), "mouse_wheel_lines");
+        assert_eq!(
+            invalid_key("mouse_wheel_lines = 1001\n"),
+            "mouse_wheel_lines"
+        );
+        assert_eq!(invalid_key("panel_width = 10\n"), "panel_width");
+        assert_eq!(invalid_key("[faces]\nkeywrd = \"1\"\n"), "faces");
+        assert_eq!(
+            invalid_key("[file_types.rs]\ntab_width = 0\n"),
+            "file_types"
+        );
+        assert_eq!(invalid_key("[faces]\nkeyword = \"1m\"\n"), "faces");
+        assert_eq!(
+            invalid_key("quick_open_max_files = 0\n"),
+            "quick_open_max_files"
+        );
         assert_eq!(load_str("tab_width = 16\n").expect("valid").tab_width, 16);
         assert_eq!(load_str("tab_width = 1\n").expect("valid").tab_width, 1);
     }

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod ansi;
 pub mod autosave;
 mod buffer;
 pub mod command;
@@ -8,6 +9,7 @@ pub mod config;
 pub mod diff;
 mod editor;
 mod event;
+pub mod faces;
 pub mod inplace;
 pub mod io;
 mod isearch;
@@ -16,10 +18,14 @@ mod keymap;
 mod killring;
 mod marker;
 mod minibuffer;
+mod paren;
+pub mod patch;
 pub mod reload;
 mod render;
 pub mod search_job;
+pub mod syntax;
 pub mod testing;
+pub mod tree;
 mod undo;
 mod window;
 
@@ -28,7 +34,7 @@ pub use buffer::{
     IndexingProgress, SaveProgress,
 };
 pub use command::{CommandContext, CommandError, CommandSpec, PrefixArg};
-pub use config::{Config, ConfigError, InvalidSetting, KeyboardEncoding};
+pub use config::{Config, ConfigError, InvalidSetting, KeyboardEncoding, ThemeChoice};
 pub use editor::{Editor, Session};
 pub use event::{AutoSaveJob, ClientId, Effect, Event, ListingId, ReloadJob, SearchId, TimerId};
 pub use journal::JournalOutbox;

@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use emx_types::{Cell, Grid, Key};
+use emx_types::{Cell, Grid, Key, MouseEvent};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_WIRE_MESSAGE: usize = 16 * 1024 * 1024;
 
 const VERSION_FIELD: &str = "v";
@@ -108,6 +108,10 @@ pub enum ClientMsg {
     Key {
         key: Key,
     },
+    /// A mouse report; sent only while the server asks for mouse reporting.
+    Mouse {
+        event: MouseEvent,
+    },
     /// One chunk of a bracketed paste; the editor inserts the whole paste
     /// once the chunk with `final` set arrives.
     Paste {
@@ -149,6 +153,12 @@ pub enum Request {
     DiffExternal {
         path: WirePath,
     },
+    /// Applies a unified diff of one file to the buffer visiting `path`,
+    /// on top of unsaved edits, as one undoable change; never saves.
+    ApplyPatch {
+        path: WirePath,
+        patch_b64: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +197,9 @@ pub mod error_code {
     pub const NO_EXTERNAL_CHANGE: &str = "no_external_change";
     /// `diff-external` could not read or diff the texts.
     pub const DIFF_FAILED: &str = "diff_failed";
+    /// `apply-patch`: the patch is malformed, a hunk does not apply, or
+    /// the buffer cannot take it; nothing changed.
+    pub const PATCH_FAILED: &str = "patch_failed";
     /// The connection broke the protocol; the server closes it.
     pub const PROTOCOL: &str = "protocol";
 }
@@ -254,6 +267,19 @@ pub enum ServerMsg {
         cursor: Option<(u16, u16)>,
     },
     Bell,
+    /// `suspend-frame`: the client gives the terminal back and stops
+    /// itself; once resumed it takes the terminal again and asks for a
+    /// redraw.
+    Suspend,
+    /// The terminal modes the client sets: mouse reporting on or off. Sent
+    /// to a terminal client after `Welcome` and whenever they change.
+    Modes {
+        mouse: bool,
+    },
+    /// Text for the system clipboard: the client sets it with OSC 52.
+    Clipboard {
+        data_b64: String,
+    },
     Response {
         id: u64,
         result: Result<Response, WireError>,

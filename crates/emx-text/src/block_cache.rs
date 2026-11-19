@@ -239,6 +239,7 @@ impl BlockCache {
         Ok(buffer)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn file(&self) -> &File {
         &self.file
     }

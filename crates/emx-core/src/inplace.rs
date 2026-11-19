@@ -17,7 +17,6 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 
 use emx_text::{BLOCK_SIZE, FileIdentity, Original, PieceSource, Text};
-use rustix::fs::FallocateFlags;
 
 use crate::io::{SaveError, SaveSink, SinkFactory, file_sink, write_text};
 
@@ -191,12 +190,18 @@ fn writes_only_inserted_text(text: &Text, moves: &[Move]) -> bool {
 /// Allocates the space a growing file needs before any byte moves, so a
 /// full disk fails the save before the file is touched. Filesystems that
 /// cannot preallocate are written without it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn reserve(file: &File, new_len: u64) -> io::Result<()> {
     let current = file.metadata()?.len();
     if new_len <= current {
         return Ok(());
     }
-    match rustix::fs::fallocate(file, FallocateFlags::KEEP_SIZE, current, new_len - current) {
+    match rustix::fs::fallocate(
+        file,
+        rustix::fs::FallocateFlags::KEEP_SIZE,
+        current,
+        new_len - current,
+    ) {
         Ok(()) => Ok(()),
         Err(errno)
             if errno == rustix::io::Errno::OPNOTSUPP || errno == rustix::io::Errno::NOSYS =>
@@ -205,6 +210,14 @@ fn reserve(file: &File, new_len: u64) -> io::Result<()> {
         }
         Err(errno) => Err(errno.into()),
     }
+}
+
+/// Without `fallocate` (macOS), a growing file is written without
+/// preallocation; a full disk then fails the save part way, which the
+/// in-place path already reports.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn reserve(_file: &File, _new_len: u64) -> io::Result<()> {
+    Ok(())
 }
 
 /// Copies `len` bytes within the file in `BLOCK_SIZE` chunks: front to back

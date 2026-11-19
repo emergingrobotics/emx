@@ -22,7 +22,9 @@ use emx_proto::{ClientMsg, LineReader, RowUpdate, ServerMsg, write_msg};
 use emx_types::{Cell, Face};
 
 const POLL: Duration = Duration::from_millis(20);
-const UNSUPPORTED: &str = "emx: this terminal does not support the Kitty keyboard protocol";
+/// xterm `modifyOtherKeys` level 1 on, and reset.
+const MODIFY_OTHER_KEYS_ON: &[u8] = b"\x1b[>4;1m";
+const MODIFY_OTHER_KEYS_RESET: &[u8] = b"\x1b[>4m";
 const CONNECTION_LOST: &str = "emx: server connection lost";
 const RACERS: usize = 4;
 const STARTUP_DELAY_MS: &str = "1500";
@@ -129,20 +131,64 @@ fn type_and_save_noserver() {
     );
 }
 
+/// A legacy terminal, one that answers only device attributes and one
+/// that answers nothing, is driven with legacy key encodings: Meta as an
+/// ESC prefix, Ctrl keys as control bytes.
 #[test]
-fn unsupported_terminal_exits_with_message() {
+fn legacy_terminals_edit_and_restore() {
+    for probe in [Probe::Legacy, Probe::Silent] {
+        for server in [false, true] {
+            let env = TestEnv::new();
+            let _reaper = SessionReaper::new(&env);
+            let path = env.file("f.txt", "one\ntwo\n");
+            let args: &[&str] = if server {
+                &["f.txt"]
+            } else {
+                &["--no-server", "f.txt"]
+            };
+            let mut pty = Pty::spawn_with(&env, args, probe, &[]);
+            pty.wait_modeline(|modeline| {
+                modeline.contains("f.txt") && !modeline.contains("Loading")
+            });
+            pty.keys("M->");
+            pty.type_text("end");
+            pty.keys("M-<");
+            pty.type_text("start ");
+            pty.keys("C-e M-b M-u");
+            pty.keys("C-x C-s");
+            wait_file(&path, "start ONE\ntwo\nend");
+            pty.keys("C-x C-c");
+            let status = pty.wait_exit();
+            assert!(status.success(), "{probe:?} server {server}: {status}");
+            let tail = output_after_setup(&pty);
+            let text = String::from_utf8_lossy(&tail);
+            assert!(find(&tail, PUSH_KITTY_FLAGS).is_none(), "{text:?}");
+            let on = find(&tail, MODIFY_OTHER_KEYS_ON).expect("modifyOtherKeys set");
+            let reset = rfind(&tail, MODIFY_OTHER_KEYS_RESET).expect("modifyOtherKeys reset");
+            assert!(on < reset, "{text:?}");
+            assert!(!pty.alternate_screen(), "{probe:?}: terminal restored");
+            assert!(!pty.bracketed_paste(), "{probe:?}: terminal restored");
+        }
+    }
+}
+
+/// A legacy terminal's Escape key, typed alone, reaches the editor once
+/// the escape timeout passes, and is still a Meta prefix for the next key
+/// (Emacs's `esc-map`): ESC, a pause, then `x` is `M-x`.
+#[test]
+fn legacy_lone_escape_is_the_escape_key() {
     let env = TestEnv::new();
     let _reaper = SessionReaper::new(&env);
     env.file("f.txt", "text\n");
-    for args in [&["--no-server", "f.txt"][..], &["f.txt"][..]] {
-        let mut pty = Pty::spawn_with(&env, args, Probe::Silent, &[]);
-        let status = pty.wait_exit();
-        assert_eq!(status.exit_code(), 1, "{args:?}: {status}");
-        let output = pty.raw_output_text();
-        assert!(output.contains(UNSUPPORTED), "{args:?}: {output:?}");
-        assert!(!pty.alternate_screen(), "{args:?}: terminal restored");
-        assert!(!pty.bracketed_paste(), "{args:?}: terminal restored");
-    }
+    let mut pty = Pty::spawn_with(&env, &["--no-server", "f.txt"], Probe::Legacy, &[]);
+    pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
+    pty.write(b"\x1b");
+    pty.wait_text("ESC-");
+    pty.type_text("x");
+    pty.wait_text("M-x ");
+    pty.keys("C-g");
+    pty.keys("C-x C-c");
+    assert!(pty.wait_exit().success());
 }
 
 #[test]
@@ -740,7 +786,133 @@ fn noserver_messages_after_exit_reach_the_terminal() {
         output.contains("EMX_TEST_EDITOR_FAILURE is set: the editor thread fails"),
         "{output:?}"
     );
-    let mut unsupported = Pty::spawn_with(&env, &["--no-server", "f.txt"], Probe::Silent, &[]);
-    assert_eq!(unsupported.wait_exit().exit_code(), 1);
-    assert!(unsupported.raw_output_text().contains(UNSUPPORTED));
+}
+
+/// `keyboard_encoding` in the config skips the probe, and `EMX_KEYBOARD`
+/// overrides the config.
+#[test]
+fn keyboard_encoding_is_configurable() {
+    let env = TestEnv::with_config("keyboard_encoding = \"legacy\"\n");
+    let _reaper = SessionReaper::new(&env);
+    env.file("f.txt", "text\n");
+    let legacy = Pty::spawn_with(&env, &["--no-server", "f.txt"], Probe::Legacy, &[]);
+    legacy.wait_modeline(|modeline| modeline.contains("f.txt"));
+    legacy.keys("C-x C-c");
+    let mut legacy = legacy;
+    assert!(legacy.wait_exit().success());
+    let output = legacy.raw_output();
+    assert!(find(&output, b"\x1b[?u").is_none(), "no probe was sent");
+    assert!(find(&output, MODIFY_OTHER_KEYS_ON).is_some());
+    let mut kitty = Pty::spawn_with(
+        &env,
+        &["--no-server", "f.txt"],
+        Probe::Answer,
+        &[("EMX_KEYBOARD", "kitty")],
+    );
+    kitty.wait_modeline(|modeline| modeline.contains("f.txt"));
+    kitty.keys("C-x C-c");
+    assert!(kitty.wait_exit().success());
+    assert_restored(&kitty);
+}
+
+/// With `mouse = true`, the client turns on SGR mouse reporting when the
+/// server asks, a click moves point, and quitting turns reporting off.
+#[test]
+fn mouse_clicks_move_point() {
+    for probe in [Probe::Answer, Probe::Legacy] {
+        let env = TestEnv::with_config("mouse = true\n");
+        let _reaper = SessionReaper::new(&env);
+        let path = env.file("f.txt", "one\ntwo\n");
+        let mut pty = Pty::spawn_with(&env, &["f.txt"], probe, &[]);
+        pty.wait_modeline(|modeline| modeline.contains("f.txt") && !modeline.contains("Loading"));
+        let on = b"\x1b[?1002h\x1b[?1006h";
+        let deadline = std::time::Instant::now() + WAIT;
+        while find(&pty.raw_output(), on).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{probe:?}: mouse never turned on"
+            );
+            thread::sleep(POLL);
+        }
+        // Row 2, column 3 (1-based): between "tw" and "o".
+        pty.write(b"\x1b[<0;3;2M\x1b[<0;3;2m");
+        pty.type_text("X");
+        pty.wait_text("twXo");
+        pty.keys("C-x C-s");
+        wait_file(&path, "one\ntwXo\n");
+        pty.keys("C-x C-c");
+        assert!(pty.wait_exit().success());
+        let tail = output_after_setup(&pty);
+        let off = rfind(&tail, b"\x1b[?1006l\x1b[?1002l").expect("mouse reporting turned off");
+        assert!(off > find(&tail, on).expect("turned on"));
+    }
+}
+
+/// The file panel through the real server: F8 lists the project, `RET`
+/// opens a file, and a file created outside the editor appears on its
+/// own (the tree watcher).
+#[test]
+fn file_panel_lists_opens_and_updates_live() {
+    let env = TestEnv::new();
+    let _reaper = SessionReaper::new(&env);
+    std::fs::create_dir(env.work.join(".git")).expect("a project");
+    env.file("alpha.txt", "alpha contents\n");
+    env.file("beta.txt", "beta\n");
+    let mut pty = Pty::spawn(&env, &["alpha.txt"]);
+    pty.wait_modeline(|modeline| modeline.contains("alpha.txt") && !modeline.contains("Loading"));
+    pty.keys("<f8>");
+    pty.wait_screen("the panel", |rows| {
+        rows.iter().any(|row| row.starts_with("    alpha.txt"))
+            && rows.iter().any(|row| row.starts_with("    beta.txt"))
+    });
+    std::fs::write(env.work.join("gamma.txt"), "").expect("a new file");
+    pty.wait_screen("the new file", |rows| {
+        rows.iter().any(|row| row.starts_with("    gamma.txt"))
+    });
+    // beta.txt is the second entry.
+    pty.keys("n n RET");
+    pty.wait_modeline(|modeline| modeline.contains("beta.txt"));
+    pty.keys("C-x C-c");
+    assert!(pty.wait_exit().success());
+}
+
+/// Highlighting through the real server: the highlighter thread's faces
+/// reach the terminal (keywords are cyan).
+#[test]
+fn rust_files_are_highlighted_through_the_server() {
+    let env = TestEnv::new();
+    let _reaper = SessionReaper::new(&env);
+    env.file("main.rs", "fn main() {}\n");
+    let pty = Pty::spawn(&env, &["main.rs"]);
+    pty.wait_modeline(|modeline| modeline.contains("(Rust)"));
+    let keyword = b"\x1b[0;36mfn";
+    let deadline = std::time::Instant::now() + WAIT;
+    while find(&pty.raw_output(), keyword).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no highlighted keyword: {:?}",
+            pty.raw_output_text()
+        );
+        thread::sleep(POLL);
+    }
+}
+
+/// The config's theme and face colors reach the terminal.
+#[test]
+fn themes_and_face_colors_come_from_the_config() {
+    let env = TestEnv::with_config("theme = \"light\"\n[faces]\nkeyword = \"1;34\"\n");
+    let _reaper = SessionReaper::new(&env);
+    env.file("main.rs", "fn main() {}\n");
+    let pty = Pty::spawn(&env, &["--no-server", "main.rs"]);
+    pty.wait_modeline(|modeline| modeline.contains("(Rust)"));
+    let keyword = b"\x1b[0;1;34mfn";
+    let deadline = std::time::Instant::now() + WAIT;
+    while find(&pty.raw_output(), keyword).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            pty.raw_output_text()
+        );
+        thread::sleep(POLL);
+    }
 }

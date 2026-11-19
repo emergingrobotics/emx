@@ -1,13 +1,21 @@
-//! Decoder for terminal input with Kitty keyboard protocol flags 5
-//! ("disambiguate escape codes" | "report alternate keys") pushed.
+//! Decoder for terminal input, in one of two protocols.
 //!
-//! Under those flags Escape never arrives as a bare 0x1b (it is `CSI 27 u`),
-//! so a trailing 0x1b is always the start of a sequence and the decoder can
-//! wait for more bytes without a timeout. Decoding never depends on where
-//! `feed` boundaries fall, and no escape-introduced byte is ever turned into
-//! a key unless it forms a recognized key sequence.
+//! With Kitty keyboard protocol flags 5 ("disambiguate escape codes" |
+//! "report alternate keys") pushed, Escape never arrives as a bare 0x1b (it
+//! is `CSI 27 u`), so a trailing 0x1b is always the start of a sequence and
+//! the decoder waits for more bytes without a timeout, and no
+//! escape-introduced byte is ever turned into a key unless it forms a
+//! recognized key sequence.
+//!
+//! Legacy terminals send Meta as an ESC prefix and Escape as a bare 0x1b.
+//! There an ESC that does not open a sequence is the Escape key, which the
+//! keymap folds with the next key into a Meta key as Emacs's `esc-map`
+//! does; one that might still open a sequence waits until more bytes come
+//! or the caller's timeout calls `timeout`.
+//!
+//! In both, decoding never depends on where `feed` boundaries fall.
 
-use emx_types::{Key, KeyCode, Mods};
+use emx_types::{Key, KeyCode, Mods, MouseButton, MouseEvent, MouseKind};
 
 /// Longest escape sequence the decoder buffers; a sequence with no final
 /// byte within this many bytes is reported as `Unknown` and decoding resyncs.
@@ -43,6 +51,23 @@ const KNOWN_MODIFIERS: u32 = MODIFIER_SHIFT
     | MODIFIER_META
     | MODIFIER_CAPS_LOCK
     | MODIFIER_NUM_LOCK;
+
+/// The first parameter of xterm's `modifyOtherKeys` report,
+/// `CSI 27 ; modifiers ; code ~`.
+const MODIFY_OTHER_KEYS: u32 = 27;
+/// The Linux console's F1-F5: `ESC [ [ A` through `ESC [ [ E`.
+const CONSOLE_FUNCTION_KEY_LENGTH: usize = 4;
+const CONSOLE_FUNCTION_KEYS: std::ops::RangeInclusive<u8> = b'A'..=b'E';
+
+const SGR_MOUSE_PRESS: u8 = b'M';
+const SGR_MOUSE_RELEASE: u8 = b'm';
+const MOUSE_BUTTON_BITS: u32 = 0b11;
+const MOUSE_SHIFT: u32 = 4;
+const MOUSE_META: u32 = 8;
+const MOUSE_CTRL: u32 = 16;
+const MOUSE_MOTION: u32 = 32;
+const MOUSE_WHEEL: u32 = 64;
+const MOUSE_EXTRA_BUTTONS: u32 = 128;
 
 const EVENT_PRESS: u32 = 1;
 const EVENT_REPEAT: u32 = 2;
@@ -126,9 +151,18 @@ const LETTER_KEYS: [(u8, KeyCode); 10] = [
     (b'S', KeyCode::F(4)),
 ];
 
+/// How the terminal encodes keys: decided once, by the probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Kitty,
+    Legacy,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputEvent {
     Key(Key),
+    /// An SGR mouse report; `clicks` is always 1, the client counts them.
+    Mouse(MouseEvent),
     /// One chunk of pasted bytes with CR LF and lone CR turned into LF, as
     /// Emacs `xterm--pasted-text` does. A paste arrives as one or more
     /// chunks of at most `PASTE_CHUNK_MAX` raw bytes; `last` marks the end.
@@ -179,8 +213,9 @@ enum Scan {
     NeedMore(usize),
 }
 
-#[derive(Debug, Default)]
-pub struct KittyDecoder {
+#[derive(Debug)]
+pub struct Decoder {
+    protocol: Protocol,
     pending: Vec<u8>,
     paste: Option<PasteInProgress>,
     /// Set after an oversized sequence was reported, until its end.
@@ -195,9 +230,50 @@ enum Step {
     Incomplete,
 }
 
-impl KittyDecoder {
-    pub fn new() -> KittyDecoder {
-        KittyDecoder::default()
+impl Decoder {
+    pub fn new(protocol: Protocol) -> Decoder {
+        Decoder {
+            protocol,
+            pending: Vec::new(),
+            paste: None,
+            discarding: None,
+        }
+    }
+
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
+    /// A legacy terminal's ESC is held that may yet open a sequence: the
+    /// caller should call `timeout` if no input follows soon.
+    pub fn waiting_for_escape(&self) -> bool {
+        self.protocol == Protocol::Legacy
+            && self.paste.is_none()
+            && self.discarding.is_none()
+            && self.pending.first() == Some(&ESCAPE)
+    }
+
+    /// No input followed a held ESC: it is the Escape key, and what came
+    /// after it decodes on its own (`ESC [` typed by hand is `M-[`, as in
+    /// Emacs).
+    pub fn timeout(&mut self) -> Vec<InputEvent> {
+        self.timeout_accounted()
+            .into_iter()
+            .filter_map(|decoded| decoded.event)
+            .collect()
+    }
+
+    pub(crate) fn timeout_accounted(&mut self) -> Vec<Decoded> {
+        if !self.waiting_for_escape() {
+            return Vec::new();
+        }
+        self.pending.remove(0);
+        let mut decoded = vec![Decoded {
+            event: Some(key_event(KeyCode::Escape, Mods::default())),
+            consumed: 1,
+        }];
+        decoded.extend(self.feed_accounted(&[]));
+        decoded
     }
 
     /// Bytes held for a sequence, character or paste chunk that has not
@@ -258,7 +334,7 @@ impl KittyDecoder {
                 self.discarding = None;
                 continue;
             }
-            match decode_step(&self.pending[offset..]) {
+            match decode_step(&self.pending[offset..], self.protocol) {
                 Step::Event(event, consumed) => {
                     decoded.push(Decoded {
                         event: Some(event),
@@ -370,11 +446,14 @@ fn ctrl() -> Mods {
 }
 
 /// `bytes` is never empty.
-fn decode_step(bytes: &[u8]) -> Step {
+fn decode_step(bytes: &[u8], protocol: Protocol) -> Step {
     let first = bytes[0];
     let plain = Mods::default();
     match first {
-        ESCAPE => decode_escape(bytes),
+        ESCAPE => match protocol {
+            Protocol::Kitty => decode_escape(bytes),
+            Protocol::Legacy => decode_legacy_escape(bytes),
+        },
         b'\r' => Step::Event(key_event(KeyCode::Enter, plain), 1),
         b'\t' => Step::Event(key_event(KeyCode::Tab, plain), 1),
         0x7f => Step::Event(key_event(KeyCode::Backspace, plain), 1),
@@ -419,7 +498,7 @@ fn decode_utf8(bytes: &[u8]) -> Step {
 }
 
 /// Raw ESC followed by anything that does not open a sequence is reported
-/// as unknown: legacy alt+key (`ESC x`) is not supported in this release. A
+/// as unknown: under the Kitty protocol, alt+key is never `ESC x`. A
 /// following ESC or non-ASCII byte is left to decode on its own.
 fn decode_escape(bytes: &[u8]) -> Step {
     let Some(&second) = bytes.get(1) else {
@@ -434,6 +513,49 @@ fn decode_escape(bytes: &[u8]) -> Step {
         ESCAPE => unknown(bytes, 1),
         ascii if ascii.is_ascii() => unknown(bytes, SEQUENCE_BODY_START),
         _ => unknown(bytes, 1),
+    }
+}
+
+/// A legacy terminal's ESC: the start of a CSI or SS3 key sequence, or
+/// else the Escape key, the byte after it decoding on its own. Control
+/// strings are not recognized: the terminal sends them only in reply to
+/// queries emx does not make, and `ESC ]` is a key (`M-]`).
+fn decode_legacy_escape(bytes: &[u8]) -> Step {
+    let escape_key = Step::Event(key_event(KeyCode::Escape, Mods::default()), 1);
+    let Some(&second) = bytes.get(1) else {
+        return Step::Incomplete;
+    };
+    match second {
+        b'[' if bytes.get(SEQUENCE_BODY_START) == Some(&b'[') => {
+            match bytes.get(CONSOLE_FUNCTION_KEY_LENGTH - 1) {
+                None => Step::Incomplete,
+                Some(letter) if CONSOLE_FUNCTION_KEYS.contains(letter) => Step::Event(
+                    key_event(
+                        KeyCode::F(1 + letter - CONSOLE_FUNCTION_KEYS.start()),
+                        Mods::default(),
+                    ),
+                    CONSOLE_FUNCTION_KEY_LENGTH,
+                ),
+                Some(_) => escape_key,
+            }
+        }
+        b'[' => decode_legacy_sequence(bytes, interpret_csi_sequence),
+        b'O' => decode_legacy_sequence(bytes, interpret_ss3_sequence),
+        _ => escape_key,
+    }
+}
+
+/// As `decode_sequence`, but a byte that cannot continue the sequence
+/// means the ESC was the Escape key, typed before keys that only looked
+/// like a sequence's start.
+fn decode_legacy_sequence(
+    bytes: &[u8],
+    interpret: impl Fn(&[u8]) -> Option<Interpretation>,
+) -> Step {
+    let limited = &bytes[..bytes.len().min(MAX_PENDING_SEQUENCE)];
+    match scan(Body::Control, limited, SEQUENCE_BODY_START) {
+        Scan::Invalid(_) => Step::Event(key_event(KeyCode::Escape, Mods::default()), 1),
+        _ => decode_sequence(bytes, Body::Control, interpret),
     }
 }
 
@@ -548,6 +670,9 @@ fn interpret_csi(parameters: &[u8], final_byte: u8) -> Option<Interpretation> {
     if let Some(reply) = parameters.strip_prefix(b"?") {
         return interpret_reply(reply, final_byte).map(Interpretation::Event);
     }
+    if let Some(report) = parameters.strip_prefix(b"<") {
+        return interpret_sgr_mouse(report, final_byte).map(Interpretation::Event);
+    }
     let fields = parse_fields(parameters)?;
     match final_byte {
         b'u' => interpret_unicode_key(&fields).map(Interpretation::Event),
@@ -561,15 +686,71 @@ fn interpret_csi(parameters: &[u8], final_byte: u8) -> Option<Interpretation> {
         ))),
         letter => {
             let code = letter_key(letter)?;
-            let mods = match fields.as_slice() {
-                [] => Mods::default(),
-                [number] if single_number(number)? == 1 => Mods::default(),
-                [number, modifiers] if single_number(number)? == 1 => parse_modifiers(modifiers)?,
-                _ => return None,
-            };
+            let mods = letter_mods(&fields)?;
             Some(Interpretation::Event(key_event(code, mods)))
         }
     }
+}
+
+/// The fields of a cursor or function key's `1 ; modifiers` form.
+fn letter_mods(fields: &[Vec<Option<u32>>]) -> Option<Mods> {
+    match fields {
+        [] => Some(Mods::default()),
+        [number] if single_number(number)? == 1 => Some(Mods::default()),
+        [number, modifiers] if single_number(number)? == 1 => parse_modifiers(modifiers),
+        _ => None,
+    }
+}
+
+/// `CSI < button ; col ; row M|m`, with 1-based cell coordinates.
+fn interpret_sgr_mouse(report: &[u8], final_byte: u8) -> Option<InputEvent> {
+    if final_byte != SGR_MOUSE_PRESS && final_byte != SGR_MOUSE_RELEASE {
+        return None;
+    }
+    let fields = parse_fields(report)?;
+    let [bits, col, row] = fields.as_slice() else {
+        return None;
+    };
+    let bits = single_number(bits)?;
+    let col = u16::try_from(single_number(col)?.checked_sub(1)?).ok()?;
+    let row = u16::try_from(single_number(row)?.checked_sub(1)?).ok()?;
+    if bits & MOUSE_EXTRA_BUTTONS != 0 {
+        return None;
+    }
+    let button = match (bits & MOUSE_WHEEL != 0, bits & MOUSE_BUTTON_BITS) {
+        (false, 0) => MouseButton::Left,
+        (false, 1) => MouseButton::Middle,
+        (false, 2) => MouseButton::Right,
+        (false, _) => MouseButton::None,
+        (true, 0) => MouseButton::WheelUp,
+        (true, 1) => MouseButton::WheelDown,
+        (true, 2) => MouseButton::WheelLeft,
+        (true, _) => MouseButton::WheelRight,
+    };
+    let kind = if final_byte == SGR_MOUSE_RELEASE {
+        MouseKind::Release
+    } else if bits & MOUSE_MOTION != 0 {
+        if button == MouseButton::None {
+            MouseKind::Move
+        } else {
+            MouseKind::Drag
+        }
+    } else {
+        MouseKind::Press
+    };
+    Some(InputEvent::Mouse(MouseEvent {
+        kind,
+        button,
+        col,
+        row,
+        mods: Mods {
+            ctrl: bits & MOUSE_CTRL != 0,
+            meta: bits & MOUSE_META != 0,
+            shift: bits & MOUSE_SHIFT != 0,
+            super_: false,
+        },
+        clicks: 1,
+    }))
 }
 
 fn interpret_reply(reply: &[u8], final_byte: u8) -> Option<InputEvent> {
@@ -581,12 +762,16 @@ fn interpret_reply(reply: &[u8], final_byte: u8) -> Option<InputEvent> {
                 _ => None,
             }
         }
+        // Only the reply's form matters, not the attributes it lists, so
+        // empty fields (`CSI ? 62 ; c`, sent by some multiplexers) are
+        // accepted: rejecting one would leave the probe waiting for its
+        // whole timeout.
         b'c' => {
             let fields = parse_fields(reply)?;
-            let well_formed = !fields.is_empty()
-                && fields
-                    .iter()
-                    .all(|field| matches!(field.as_slice(), [Some(_)]));
+            let well_formed = fields
+                .iter()
+                .any(|field| matches!(field.as_slice(), [Some(_)]))
+                && fields.iter().all(|field| matches!(field.as_slice(), [_]));
             well_formed.then_some(InputEvent::PrimaryDeviceAttributes)
         }
         _ => None,
@@ -681,6 +866,11 @@ fn interpret_unicode_key(fields: &[Vec<Option<u32>>]) -> Option<InputEvent> {
 }
 
 fn interpret_tilde(fields: &[Vec<Option<u32>>]) -> Option<Interpretation> {
+    if let [number, modifiers, code] = fields
+        && single_number(number)? == MODIFY_OTHER_KEYS
+    {
+        return interpret_modify_other_keys(modifiers, code).map(Interpretation::Event);
+    }
     let (number, mods) = match fields {
         [number] => (single_number(number)?, None),
         [number, modifiers] => (single_number(number)?, Some(parse_modifiers(modifiers)?)),
@@ -697,6 +887,24 @@ fn interpret_tilde(fields: &[Vec<Option<u32>>]) -> Option<Interpretation> {
         code,
         mods.unwrap_or_default(),
     )))
+}
+
+/// xterm's `CSI 27 ; modifiers ; code ~`. The code is the character
+/// typed, already shifted, so Shift is dropped from a character without
+/// case (C-% is ctrl+shift+5 sent as 37), as Emacs's xterm.el maps it.
+fn interpret_modify_other_keys(
+    modifiers: &[Option<u32>],
+    code: &[Option<u32>],
+) -> Option<InputEvent> {
+    let mut mods = parse_modifiers(modifiers)?;
+    let key_code = unicode_key_code(single_number(code)?)?;
+    if let KeyCode::Char(character) = key_code
+        && !character.is_lowercase()
+        && !character.is_uppercase()
+    {
+        mods.shift = false;
+    }
+    Some(key_event(key_code, mods))
 }
 
 #[cfg(test)]
@@ -716,7 +924,7 @@ mod tests {
             ),
             chunk in 1usize..40,
         ) {
-            let mut decoder = KittyDecoder::new();
+            let mut decoder = Decoder::new(Protocol::Kitty);
             let mut consumed = 0;
             for piece in input.chunks(chunk) {
                 for decoded in decoder.feed_accounted(piece) {
@@ -733,7 +941,7 @@ mod tests {
     #[test]
     fn unknown_events_carry_exactly_their_bytes() {
         let input = b"\x1b[5555~\xff\x1bOz";
-        let decoded = KittyDecoder::new().feed_accounted(input);
+        let decoded = Decoder::new(Protocol::Kitty).feed_accounted(input);
         let mut rebuilt = Vec::new();
         for item in decoded {
             match item.event {

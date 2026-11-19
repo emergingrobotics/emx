@@ -2,9 +2,12 @@ mod buffer_menu;
 mod completing;
 mod files;
 mod goto;
+mod highlight;
 mod kmacro;
 mod messages;
+mod mouse;
 mod occurring;
+mod panel;
 mod rectangles;
 mod registers;
 mod reload;
@@ -20,7 +23,7 @@ use std::time::Duration;
 
 use emx_proto::{ClientKind, ServerMsg, diff_grids};
 use emx_text::{ColumnCheckpoints, ReadError, Sources, Text};
-use emx_types::{Grid, Key, KeyCode, Mods};
+use emx_types::{Face, Grid, Key, KeyCode, Mods};
 use slotmap::SlotMap;
 
 use crate::buffer::{Buffer, BufferId, ChangeRecorder};
@@ -39,6 +42,8 @@ use crate::render::{PrefetchRequest, render};
 use crate::undo::{UndoLimits, outer_limit_warning};
 pub(crate) use files::Purpose;
 use files::{AutoSaveRequest, ExitWait, SaveFlow, SaveRequest};
+pub(crate) use highlight::{HighlightState, LanguageState};
+pub(crate) use panel::TreeData;
 use registers::{RegisterRead, RegisterValue};
 use reload::ReloadRequest;
 use replacing::QueryReplace;
@@ -73,6 +78,12 @@ pub enum Session {
 const PASTE_COMMAND: &str = "xterm-paste";
 /// How Emacs describes a bracketed-paste event in a key sequence.
 const PASTE_EVENT_DESCRIPTION: &str = "<xterm-paste>";
+/// `suspend-frame` from a client with no terminal to give back.
+const NOT_SUSPENDABLE: &str = "This client cannot be suspended";
+const COPIED_NOTICE: &str = "Copied to clipboard";
+/// An echo-area notice delay meaning it stays until the next input, as
+/// `clipboard_notice_ms = 0` asks.
+const NO_EXPIRY: u64 = 0;
 const QUIT_KEY: Key = command::QUIT_KEY;
 
 /// Emacs's per-keyboard command-loop state.
@@ -170,6 +181,23 @@ struct Client {
     /// A `goto-line` waiting for the background indexer to reach a line that
     /// lies beyond the counted prefix.
     pending_goto: Option<PendingGoto>,
+    /// The mouse drag the last press started, until its release.
+    mouse_drag: Option<mouse::MouseDrag>,
+    /// A notice in the echo area drawn in its own face.
+    echo_flash: Option<EchoFlash>,
+    /// A `project-find-file` waiting for the project's files.
+    quick_open: Option<panel::QuickOpen>,
+}
+
+/// A notice shown in the echo area in its own face. The face applies only
+/// while the echo area still shows the notice's text, so any later message
+/// is drawn plainly without every writer of the echo area clearing this.
+#[derive(Debug)]
+struct EchoFlash {
+    text: String,
+    face: Face,
+    /// Clears the notice; `None` leaves it to the next input.
+    timer: Option<TimerId>,
 }
 
 /// A `goto-line` whose target line is not yet indexed: the jump completes
@@ -206,6 +234,8 @@ enum TimerPurpose {
     /// Clears a message shown over the client's minibuffer, if it is still
     /// the one with this serial.
     MinibufferMessage(ClientId, u64),
+    /// Clears the client's echo-area notice, if this is still its timer.
+    EchoFlash(ClientId),
     /// Emacs `auto-save-timeout`.
     AutoSaveIdle,
     /// The client's cursor may be reported to `emx events` again.
@@ -214,6 +244,8 @@ enum TimerPurpose {
     Settle(BufferId),
     /// The automatic reloads of one settle round are summarized.
     ReloadSummary,
+    /// A client's file panel lists changed directories again.
+    TreeRefresh(ClientId),
 }
 
 /// How a command finished, for the command loop's bookkeeping.
@@ -311,6 +343,8 @@ pub struct Editor {
     /// `isearch-mode-map` and `occur-mode-map`.
     isearch_keymap: Keymap,
     occur_keymap: Keymap,
+    /// The file panel's map.
+    tree_keymap: Keymap,
     /// Names the next `Effect::StartSearch`.
     next_search: u64,
     /// Emacs `search-ring` and `regexp-search-ring`, newest first.
@@ -337,6 +371,20 @@ pub struct Editor {
     last_kbd_macro: Option<Vec<Key>>,
     /// Emacs `killed-rectangle`, one line of the rectangle per entry.
     killed_rectangle: Option<Vec<Vec<u8>>>,
+    /// Emacs `xterm-mouse-mode`: terminal clients report the mouse.
+    mouse: bool,
+    /// Each client's file panel buffer.
+    trees: BTreeMap<ClientId, BufferId>,
+    /// The width the next panel opens with, its border included: the
+    /// config's, until a panel is resized.
+    panel_width: u16,
+    /// The kill ring generation last sent to a terminal's clipboard.
+    clipboard_generation: u64,
+    /// The current event made a copy that is announced once it reaches the
+    /// clipboard.
+    clipboard_notice: bool,
+    /// The terminal client whose input the current event is.
+    input_client: Option<ClientId>,
 }
 
 impl Editor {
@@ -404,6 +452,7 @@ impl Editor {
             buffer_menu_keymap: Keymap::buffer_menu(),
             isearch_keymap: Keymap::isearch(),
             occur_keymap: Keymap::occur(),
+            tree_keymap: Keymap::tree(),
             next_search: 0,
             search_ring: VecDeque::new(),
             regexp_search_ring: VecDeque::new(),
@@ -418,6 +467,12 @@ impl Editor {
             registers: HashMap::new(),
             last_kbd_macro: None,
             killed_rectangle: None,
+            mouse: config.mouse,
+            trees: BTreeMap::new(),
+            panel_width: u16::try_from(config.panel_width).expect("panel_width is validated small"),
+            clipboard_generation: 0,
+            clipboard_notice: false,
+            input_client: None,
             config,
         };
         editor.scratch = editor.create_buffer(SCRATCH_BUFFER);
@@ -433,6 +488,7 @@ impl Editor {
         let id = self
             .buffers
             .insert_with_key(|id| Buffer::new(id, name.to_string(), text, limits, checkpoints));
+        self.buffers[id].settings = self.config.file_settings(None);
         // Creating a buffer is a command's change: it gets its boundary.
         self.buffers[id].undo.boundary(0);
         self.recency.push(id);
@@ -450,6 +506,11 @@ impl Editor {
 
     pub fn handle(&mut self, event: Event) {
         self.journal_outbox.begin_event();
+        self.input_client = match &event {
+            Event::Key(client, _) | Event::Mouse(client, _) => Some(*client),
+            Event::Paste { client, .. } => Some(*client),
+            _ => None,
+        };
         match event {
             Event::ClientAttached {
                 client,
@@ -462,6 +523,22 @@ impl Editor {
                 self.note_terminal_activity(client);
                 self.handle_key(client, key.canonical());
             }
+            Event::Mouse(client, event) => {
+                self.note_terminal_activity(client);
+                self.handle_mouse(client, event);
+            }
+            Event::Tree { client, outcome } => {
+                if self.clients.contains_key(&client) {
+                    self.tree_result(client, outcome);
+                }
+            }
+            Event::TreeChanged { dir } => self.tree_changed(&dir),
+            Event::Highlighted {
+                buffer,
+                generation,
+                range,
+                spans,
+            } => self.highlighted(buffer, generation, range, spans),
             Event::Paste { client, data, last } => {
                 self.note_terminal_activity(client);
                 self.paste_chunk(client, data, last);
@@ -491,7 +568,10 @@ impl Editor {
             } => self.save_progress(buffer, written_bytes, total_bytes),
             Event::Timer(id) => self.handle_timer(id),
             Event::FileLoaded { buffer, result } => self.file_loaded(buffer, result),
-            Event::SaveFinished { buffer, result } => self.save_finished(buffer, result),
+            Event::SaveFinished { buffer, result } => {
+                self.save_finished(buffer, result);
+                self.files_changed_for_trees();
+            }
             Event::AutoSaved { buffer, result } => self.auto_saved(buffer, result),
             Event::AutoSaveRead { buffer, result } => self.auto_save_read(buffer, result),
             Event::Recovered(buffers) => self.recovered(buffers),
@@ -502,7 +582,10 @@ impl Editor {
                 self.polled_paths.remove(&path);
             }
             Event::Observed { buffer, result } => self.observed(buffer, result),
-            Event::Reloaded { buffer, result } => self.reloaded(buffer, result),
+            Event::Reloaded { buffer, result } => {
+                self.reloaded(buffer, result);
+                self.files_changed_for_trees();
+            }
             Event::AppendRead { buffer, result } => self.append_read(buffer, result),
             Event::DiffReady {
                 requester, result, ..
@@ -512,6 +595,7 @@ impl Editor {
             }
             Event::SearchResult { client, id, result } => self.search_result(client, id, result),
         }
+        self.send_clipboard();
         self.sync_watches();
         self.redisplay();
         self.report_cursors();
@@ -527,6 +611,7 @@ impl Editor {
             self.fit_frame(*client_id);
             self.keep_points_visible(*client_id);
         }
+        self.request_highlights();
         for client_id in client_ids {
             if self.client(client_id).kind != ClientKind::Tui {
                 continue;
@@ -723,8 +808,15 @@ impl Editor {
                 register_read: None,
                 dabbrev: None,
                 pending_goto: None,
+                mouse_drag: None,
+                echo_flash: None,
+                quick_open: None,
             },
         );
+        if kind == ClientKind::Tui && self.mouse {
+            self.effects
+                .push(Effect::Send(client, ServerMsg::Modes { mouse: true }));
+        }
         if kind == ClientKind::Tui {
             let selected = self.selected_window_id(client);
             self.bump_use_time(client, selected);
@@ -735,6 +827,19 @@ impl Editor {
 
     fn detach(&mut self, client: ClientId) {
         self.cancel_search(client);
+        if let Some(panel) = self.frame(client).panel()
+            && self.frame(client).selected == panel.window
+        {
+            let main = self.main_window(client);
+            self.client_mut(client).frame.selected = main;
+        }
+        if let Some(buffer) = self.trees.remove(&client) {
+            self.forget_tree(buffer);
+            if let Some((window, history)) = self.client_mut(client).frame.close_panel() {
+                self.discard_window(window, history);
+            }
+            self.kill_buffer(buffer);
+        }
         let mut removed = self
             .clients
             .remove(&client)
@@ -764,6 +869,91 @@ impl Editor {
         self.client_detached(client, removed.kind);
         self.grace_timer = None;
         self.maybe_arm_grace();
+    }
+
+    /// A new kill goes to the system clipboard of the terminal whose input
+    /// made it (DESIGN section 7: kill ring to clipboard only). A copy asked
+    /// to be announced flashes a notice, or warns when it is too large to
+    /// send.
+    fn send_clipboard(&mut self) {
+        let notice = std::mem::take(&mut self.clipboard_notice);
+        let generation = self.kill_ring.generation();
+        if generation == self.clipboard_generation {
+            return;
+        }
+        self.clipboard_generation = generation;
+        if !self.config.osc52_clipboard {
+            return;
+        }
+        let Some(client) = self.input_client else {
+            return;
+        };
+        let Some(text) = self.kill_ring.newest() else {
+            return;
+        };
+        if self
+            .clients
+            .get(&client)
+            .is_none_or(|state| state.kind != ClientKind::Tui)
+        {
+            return;
+        }
+        let length = text.len() as u64;
+        let limit = self.config.osc52_max_bytes;
+        if length > limit {
+            if notice {
+                let message = format!(
+                    "Not copied to clipboard: {length} bytes is over osc52_max_bytes ({limit})"
+                );
+                self.flash_echo(client, message, Face::Warning, NO_EXPIRY);
+            }
+            return;
+        }
+        let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text);
+        self.effects
+            .push(Effect::Send(client, ServerMsg::Clipboard { data_b64 }));
+        if notice {
+            let delay = self.config.clipboard_notice_ms;
+            self.flash_echo(client, COPIED_NOTICE.to_string(), Face::Success, delay);
+        }
+    }
+
+    pub(crate) fn request_clipboard_notice(&mut self) {
+        self.clipboard_notice = true;
+    }
+
+    /// Shows `text` in the echo area in `face`, cleared after `delay_ms`
+    /// unless that is `NO_EXPIRY`, which leaves it to the next input.
+    fn flash_echo(&mut self, client_id: ClientId, text: String, face: Face, delay_ms: u64) {
+        self.set_echo(client_id, text.clone());
+        let timer = (delay_ms != NO_EXPIRY)
+            .then(|| self.set_timer(TimerPurpose::EchoFlash(client_id), delay_ms));
+        self.client_mut(client_id).echo_flash = Some(EchoFlash { text, face, timer });
+    }
+
+    fn echo_flash_expired(&mut self, client_id: ClientId, id: TimerId) {
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
+        let Some(flash) = &client.echo_flash else {
+            return;
+        };
+        if flash.timer != Some(id) {
+            return;
+        }
+        if client.echo == flash.text {
+            client.echo.clear();
+        }
+        client.echo_flash = None;
+    }
+
+    /// The face the echo area's message is drawn in.
+    pub(crate) fn echo_face(&self, client_id: ClientId) -> Face {
+        let client = self.client(client_id);
+        match &client.echo_flash {
+            Some(flash) if client.minibuffer.is_none() && client.echo == flash.text => flash.face,
+            _ => Face::Default,
+        }
     }
 
     fn set_timer(&mut self, purpose: TimerPurpose, after_ms: u64) -> TimerId {
@@ -805,10 +995,12 @@ impl Editor {
             TimerPurpose::MinibufferMessage(client, serial) => {
                 self.minibuffer_message_expired(client, serial);
             }
+            TimerPurpose::EchoFlash(client) => self.echo_flash_expired(client, id),
             TimerPurpose::AutoSaveIdle => self.auto_save_idle(id),
             TimerPurpose::CursorEvent(client) => self.cursor_timer_expired(client, id),
             TimerPurpose::Settle(buffer) => self.settle_timer(buffer, id),
             TimerPurpose::ReloadSummary => self.reload_summary_timer(id),
+            TimerPurpose::TreeRefresh(client) => self.tree_refresh_timer(client),
         }
     }
 
@@ -1214,6 +1406,12 @@ impl Editor {
         (number, self.session == Session::Server)
     }
 
+    /// The tab width the buffer's text is laid out with.
+    pub(crate) fn buffer_tab_width(&self, buffer: BufferId) -> usize {
+        usize::try_from(self.buffers[buffer].settings.tab_width)
+            .expect("tab_width is validated small")
+    }
+
     pub(crate) fn tab_width(&self) -> usize {
         usize::try_from(self.config.tab_width).expect("tab_width is validated small")
     }
@@ -1231,7 +1429,7 @@ impl Editor {
         let buffer = &self.buffers[frame.windows[window].buffer];
         frame
             .window_box(window)
-            .area(frame.cols(), buffer.menu.is_some())
+            .area(frame.width(), buffer.menu.is_some())
     }
 
     pub(crate) fn window_start(&self, client_id: ClientId, window: WindowId) -> ScreenLine {
@@ -1308,6 +1506,16 @@ impl Editor {
 
     pub(crate) fn signaled(&self, client_id: ClientId) -> bool {
         self.client(client_id).signaled
+    }
+
+    /// Only terminals can be suspended; other clients are told so.
+    pub(crate) fn suspend_client(&mut self, client_id: ClientId) {
+        if self.client(client_id).kind == ClientKind::Tui {
+            self.effects
+                .push(Effect::Send(client_id, ServerMsg::Suspend));
+        } else {
+            self.set_echo(client_id, NOT_SUSPENDABLE.to_string());
+        }
     }
 
     /// Only terminals have a bell.

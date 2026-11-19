@@ -262,7 +262,7 @@ pub(super) fn line_move(
     goal_column: Option<u64>,
 ) -> Result<bool, CommandError> {
     let text = ctx.buffer().text.clone();
-    let tab_width = ctx.editor().config().tab_width;
+    let tab_width = ctx.tab_width();
     let origin = ctx.point();
     if !(ctx.last_command_is(NEXT_LINE) || ctx.last_command_is(PREVIOUS_LINE)) {
         let column = current_column(&text, origin, tab_width)?;

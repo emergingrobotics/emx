@@ -27,7 +27,7 @@ const SELF_INSERT: &str = "self-insert-command";
 const DIGIT_ARGUMENT: &str = "digit-argument";
 const NEGATIVE_ARGUMENT: &str = "negative-argument";
 
-const DEFAULT_BINDINGS: [(&str, &str); 94] = [
+const DEFAULT_BINDINGS: [(&str, &str); 104] = [
     ("C-f", "forward-char"),
     ("<right>", "forward-char"),
     ("C-b", "backward-char"),
@@ -48,6 +48,7 @@ const DEFAULT_BINDINGS: [(&str, &str); 94] = [
     ("C-<end>", "end-of-buffer"),
     ("RET", "newline"),
     ("C-d", "delete-char"),
+    ("<delete>", "delete-forward-char"),
     ("DEL", "delete-backward-char"),
     ("C-k", "kill-line"),
     ("M-d", "kill-word"),
@@ -76,6 +77,7 @@ const DEFAULT_BINDINGS: [(&str, &str); 94] = [
     ("C-x s", "save-some-buffers"),
     ("C-x k", "kill-buffer"),
     ("C-x C-c", "save-buffers-kill-terminal"),
+    ("C-z", "suspend-frame"),
     ("C-x #", "server-edit"),
     ("C-x C-q", "read-only-mode"),
     ("C-x 2", "split-window-below"),
@@ -119,11 +121,33 @@ const DEFAULT_BINDINGS: [(&str, &str); 94] = [
     ("C-x r k", "kill-rectangle"),
     ("C-x r y", "yank-rectangle"),
     ("C-x r t", "string-rectangle"),
+    ("C-x r d", "delete-rectangle"),
+    ("C-x r M-w", "copy-rectangle-as-kill"),
+    ("C-x r c", "clear-rectangle"),
+    ("C-x r o", "open-rectangle"),
+    ("C-x r N", "rectangle-number-lines"),
     ("C-x (", "kmacro-start-macro"),
     ("C-x )", "kmacro-end-macro"),
     ("C-x e", "kmacro-end-and-call-macro"),
+    ("<f8>", "toggle-tree"),
+    ("M-;", "comment-dwim"),
+    ("C-x p f", "project-find-file"),
 ];
 const BUFFER_MENU_BINDINGS: [(&str, &str); 1] = [("RET", "Buffer-menu-this-window")];
+/// The file panel's keymap, modeled on dired's.
+const TREE_BINDINGS: [(&str, &str); 11] = [
+    ("n", "tree-next-line"),
+    ("p", "tree-previous-line"),
+    ("RET", "tree-open"),
+    ("TAB", "tree-toggle"),
+    ("^", "tree-up"),
+    ("g", "tree-refresh"),
+    ("i", "tree-toggle-ignored"),
+    ("+", "tree-create-directory"),
+    ("R", "tree-rename"),
+    ("d", "tree-delete"),
+    ("q", "toggle-tree"),
+];
 /// `occur-mode-map`.
 const OCCUR_BINDINGS: [(&str, &str); 8] = [
     ("RET", "occur-mode-goto-occurrence"),
@@ -232,6 +256,15 @@ impl Keymap {
     pub fn buffer_menu() -> Keymap {
         let mut keymap = Keymap::new();
         for (sequence, command) in BUFFER_MENU_BINDINGS {
+            keymap.bind_default(sequence, Binding::Command(command));
+        }
+        keymap
+    }
+
+    /// The file panel's map, looked up before the global map in a panel.
+    pub fn tree() -> Keymap {
+        let mut keymap = Keymap::new();
+        for (sequence, command) in TREE_BINDINGS {
             keymap.bind_default(sequence, Binding::Command(command));
         }
         keymap

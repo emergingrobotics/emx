@@ -31,6 +31,9 @@ const SPLITTABLE_MIN_HEIGHT: u16 = 2;
 const SPLITTABLE_MIN_WIDTH: u16 = 2;
 const SOLE_WINDOW: &str = "Attempt to delete minibuffer or sole ordinary window";
 const NO_OTHER_WINDOWS: &str = "No other windows to delete";
+/// What Emacs signals for a side window, which the file panel is.
+const SPLIT_SIDE_WINDOW: &str = "Cannot split side window or parent of side window";
+const SIDE_WINDOW_ONLY: &str = "Cannot make side window the only window";
 const NO_OTHER_WINDOW: &str = "No other window to select";
 const NEW_WINDOW_TOO_SMALL: &str = "Size of new window too small";
 /// Buffers whose names start with a space are internal: Emacs neither
@@ -50,6 +53,12 @@ impl Editor {
         }
         if buffer.occur.is_some() {
             match self.occur_keymap.lookup(keys) {
+                Lookup::Undefined => {}
+                found => return found,
+            }
+        }
+        if buffer.tree.is_some() {
+            match self.tree_keymap.lookup(keys) {
                 Lookup::Undefined => {}
                 found => return found,
             }
@@ -130,6 +139,9 @@ impl Editor {
         size: Option<i64>,
     ) -> Result<(), CommandError> {
         let window = self.selected_window_id(client);
+        if self.frame(client).is_panel(window) {
+            return Err(CommandError::User(SPLIT_SIDE_WINDOW.to_string()));
+        }
         let new_size = self.checked_split_size(client, window, side_by_side, size)?;
         self.split_window(client, window, side_by_side, new_size);
         Ok(())
@@ -216,6 +228,10 @@ impl Editor {
 
     /// `delete-window` (`C-x 0`).
     pub(crate) fn delete_window_command(&mut self, client: ClientId) -> Result<(), CommandError> {
+        if self.frame(client).is_panel(self.selected_window_id(client)) {
+            self.close_panel(client);
+            return Ok(());
+        }
         if self.frame(client).sole() {
             return Err(CommandError::User(SOLE_WINDOW.to_string()));
         }
@@ -248,10 +264,16 @@ impl Editor {
     }
 
     /// `delete-other-windows` (`C-x 1`).
-    pub(crate) fn delete_other_windows_command(&mut self, client: ClientId) {
+    pub(crate) fn delete_other_windows_command(
+        &mut self,
+        client: ClientId,
+    ) -> Result<(), CommandError> {
+        if self.frame(client).is_panel(self.selected_window_id(client)) {
+            return Err(CommandError::User(SIDE_WINDOW_ONLY.to_string()));
+        }
         if self.frame(client).sole() {
             self.set_echo(client, NO_OTHER_WINDOWS.to_string());
-            return;
+            return Ok(());
         }
         let selected = self.selected_window_id(client);
         let others: Vec<WindowId> = self
@@ -267,10 +289,11 @@ impl Editor {
         for (window, history) in removed {
             self.discard_window(window, history);
         }
+        Ok(())
     }
 
     /// Deletes the markers of a window that is gone.
-    fn discard_window(&mut self, window: Window, history: Vec<PrevBuffer>) {
+    pub(super) fn discard_window(&mut self, window: Window, history: Vec<PrevBuffer>) {
         let target = &mut self.buffers[window.buffer];
         target.delete_marker(window.point);
         target.delete_marker(window.start);
@@ -287,7 +310,7 @@ impl Editor {
     /// cyclic order, backwards when negative.
     pub(crate) fn other_window_command(&mut self, client: ClientId, count: i64) {
         let frame = self.frame(client);
-        let order = frame.order();
+        let order = frame.cycle_order();
         let current = order
             .iter()
             .position(|id| *id == frame.selected)
@@ -401,6 +424,12 @@ impl Editor {
     /// point` t: a buffer the window showed before comes back with that
     /// window's start and point.
     pub(super) fn switch_to_buffer(&mut self, client: ClientId, buffer: BufferId) {
+        // The panel shows only its tree, as a dedicated side window does:
+        // the buffer goes to the window last selected before it.
+        if self.frame(client).is_panel(self.selected_window_id(client)) {
+            let main = self.main_window(client);
+            self.select_window(client, main);
+        }
         let window = self.selected_window_id(client);
         if self.window(client, window).buffer != buffer {
             let entry = self.frame(client).prev_buffers[window]
@@ -704,10 +733,13 @@ impl Editor {
     ) -> Layout<'t> {
         let (cols, _) = self.window_size(client, window);
         let reader = Reader::new(text, fetch);
-        match self.window_hscroll(client, window) {
-            Some(hscroll) => Layout::truncating(reader, cols, self.tab_width(), hscroll),
-            None => Layout::new(reader, cols, self.tab_width()),
-        }
+        let buffer = self.window(client, window).buffer;
+        let tab_width = self.buffer_tab_width(buffer);
+        let layout = match self.window_hscroll(client, window) {
+            Some(hscroll) => Layout::truncating(reader, cols, tab_width, hscroll),
+            None => Layout::new(reader, cols, tab_width),
+        };
+        layout.with_ansi(self.buffers[buffer].ansi)
     }
 
     /// Emacs auto-hscroll (`hscroll_window_tree`, `hscroll-step` 0): a
@@ -729,7 +761,7 @@ impl Editor {
         let layout = Layout::truncating(
             Reader::new(&text, Fetch::CachedOnly),
             cols,
-            self.tab_width(),
+            self.buffer_tab_width(target.buffer),
             0,
         );
         let line_start = layout.line_start(point)?;
@@ -787,7 +819,7 @@ impl Editor {
         }
         if target.start_row_skip > 0 {
             let text = self.buffers[target.buffer].text.clone();
-            let tab_width = self.tab_width();
+            let tab_width = self.buffer_tab_width(target.buffer);
             let reader = Reader::new(&text, Fetch::CachedOnly);
             let start = self.window_start(client, window);
             let first_shown = Layout::new(reader, target.start_cols, tab_width).row_start(start)?;

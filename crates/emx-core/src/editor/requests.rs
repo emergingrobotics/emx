@@ -101,7 +101,78 @@ impl Editor {
             Request::DiffExternal { path } => {
                 self.request_diff_external(reply, &path.into_path_buf());
             }
+            Request::ApplyPatch { path, patch_b64 } => {
+                let result = self.request_apply_patch(&path.into_path_buf(), &patch_b64);
+                self.reply(reply, result.map(|()| Response::Ok));
+            }
         }
+    }
+
+    /// `emx apply-patch`: the hunks go into the buffer's text as it is,
+    /// unsaved edits and all, as one undoable change that the modeline
+    /// marks as external; or, if any hunk does not apply, nothing changes.
+    fn request_apply_patch(&mut self, path: &Path, patch_b64: &str) -> Result<(), WireError> {
+        let failed = |message: String| wire_error(error_code::PATCH_FAILED, message);
+        let Some(buffer) = self.buffer_visiting(path) else {
+            return Err(wire_error(
+                error_code::NO_BUFFER,
+                format!("no buffer visits {}", path.display()),
+            ));
+        };
+        let patch = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, patch_b64)
+            .map_err(|error| failed(format!("the patch is not base64: {error}")))?;
+        let limit = self.config.in_memory_max;
+        let target = &self.buffers[buffer];
+        target
+            .check_editable()
+            .map_err(|error| failed(format!("{}: {error}", target.name)))?;
+        if target.text.len() > limit {
+            return Err(failed(format!(
+                "{} is larger than in_memory_max ({limit} bytes)",
+                target.name
+            )));
+        }
+        let mut text = Vec::new();
+        target
+            .text
+            .read_cached(0..target.text.len(), &mut text)
+            .map_err(|error| failed(format!("{}: {error}", target.name)))?;
+        let hunks = crate::patch::parse(&patch).map_err(|error| failed(error.to_string()))?;
+        let edits =
+            crate::patch::locate(&text, &hunks).map_err(|error| failed(error.to_string()))?;
+        let target = &mut self.buffers[buffer];
+        let point = target.text.len();
+        target.undo.boundary(point);
+        for (range, bytes) in edits.into_iter().rev() {
+            let range = range.start as u64..range.end as u64;
+            let at = range.start;
+            target
+                .replace_range(range, &bytes, at, &mut self.journal_outbox)
+                .map_err(|error| failed(error.to_string()))?;
+        }
+        target.undo.boundary(point);
+        if let Some(file) = &mut target.file {
+            file.changed_since_viewed = true;
+        }
+        let name = target.name.clone();
+        let count = hunks.len();
+        let plural = if count == 1 { "" } else { "s" };
+        let showing: Vec<ClientId> = self
+            .clients
+            .keys()
+            .copied()
+            .filter(|client| {
+                self.client(*client).kind == ClientKind::Tui
+                    && self.selected_buffer(*client) == buffer
+            })
+            .collect();
+        for client in showing {
+            self.set_echo(
+                client,
+                format!("Applied a patch to {name} ({count} hunk{plural}); C-/ undoes it"),
+            );
+        }
+        Ok(())
     }
 
     /// Answers are dropped for a client that has gone.

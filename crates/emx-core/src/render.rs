@@ -12,6 +12,8 @@ use emx_types::{Cell, Face, Grid};
 use crate::buffer::{Buffer, BufferId, FileBinding};
 use crate::editor::Editor;
 use crate::event::ClientId;
+use crate::faces::FaceSpans;
+use crate::paren::{ParenMatch, show_paren};
 use crate::reload::ExternalState;
 use crate::window::{
     CONTINUATION_GLYPH, CursorTracker, Fetch, LineEvent, ScreenLine, TRUNCATION_GLYPH, WindowArea,
@@ -53,10 +55,14 @@ const MODELINE_POLLED: &str = "[poll] ";
 const MODELINE_LOADING: &str = " Loading";
 /// Added to the mode name while `auto-revert-tail-mode` is on.
 const MODELINE_TAIL: &str = " Tail";
+/// Added to the mode name while `ansi-color-mode` is on.
+const MODELINE_ANSI: &str = " ANSI";
 /// The vertical border between side-by-side windows on a terminal.
 const VERTICAL_BORDER_GLYPH: &str = "|";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
 const MODELINE_FILL: &str = "-";
+/// The panel's modeline before its root is known.
+const PANEL_MODELINE: &str = "Tree";
 const UNKNOWN_LINE: &str = "?";
 const NEWLINE: u8 = b'\n';
 /// `%p` computes differently above this size to avoid overflow.
@@ -80,7 +86,11 @@ pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>)
     let mut prefetch = Vec::new();
     let frame = editor.frame(client);
     let mut cursor = None;
-    for (window_id, _) in frame.boxes() {
+    let panel = frame.panel_box().map(|(window, _)| window);
+    let windows = panel
+        .into_iter()
+        .chain(frame.boxes().into_iter().map(|(window, _)| window));
+    for window_id in windows {
         let area = editor.window_area(client, window_id);
         let selected = window_id == frame.selected;
         let window_cursor = draw_window(
@@ -110,7 +120,13 @@ pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>)
             Some(at) => {
                 cursor = draw_minibuffer(&mut grid, row, &line, at, tab_width(editor));
             }
-            None => draw_echo(&mut grid, row, &line, tab_width(editor)),
+            None => draw_echo(
+                &mut grid,
+                row,
+                &line,
+                editor.echo_face(client),
+                tab_width(editor),
+            ),
         }
     }
     grid.cursor = cursor;
@@ -152,7 +168,26 @@ fn draw_window(
             requested
         }
     };
+    // Emacs highlights the parens of the selected window only.
+    let parens = (selected && editor.config().show_paren_mode)
+        .then(|| {
+            show_paren(
+                &buffer.text,
+                &buffer.faces,
+                point,
+                editor.config().show_paren_max_distance,
+            )
+        })
+        .flatten();
+    let ansi = if buffer.ansi {
+        ansi_colors(&buffer.text, start.line_start)
+    } else {
+        Vec::new()
+    };
     let marks = Marks {
+        ansi,
+        parens,
+        faces: &buffer.faces,
         region: active_region(buffer, point),
         search: search_marks(
             editor,
@@ -216,7 +251,10 @@ fn draw_window(
             },
         };
         let mut writer = RowWriter::within(grid, row, area, tab_width(editor));
-        draw_modeline(&mut writer, &modeline);
+        match &buffer.tree {
+            Some(tree) => draw_panel_modeline(&mut writer, tree, modeline.face),
+            None => draw_modeline(&mut writer, &modeline),
+        }
     }
     if let Some(col) = area.border {
         for row in area.box_top..area.box_top.saturating_add(area.box_rows) {
@@ -237,7 +275,14 @@ fn draw_window(
 }
 
 /// The parts of a window's text drawn in another face.
-struct Marks {
+struct Marks<'a> {
+    /// `ansi-color-mode`'s colors, sorted.
+    ansi: Vec<(Range<u64>, Face)>,
+    /// `show-paren-mode`'s parens, drawn over the region (its overlay
+    /// priority is higher).
+    parens: Option<ParenMatch>,
+    /// The buffer's own faces, under every other.
+    faces: &'a FaceSpans,
     region: Option<Range<u64>>,
     search: SearchMarks,
 }
@@ -309,6 +354,29 @@ fn search_marks(
     SearchMarks { current, lazy }
 }
 
+/// How far past a window's start `ansi-color-mode` colors text: well past
+/// what any terminal window shows.
+const ANSI_SCAN_BYTES: u64 = 256 * 1024;
+
+/// The colors SGR sequences give the text from `from` on, as far as it is
+/// cached; colors start plain at `from`.
+fn ansi_colors(text: &emx_text::Text, from: u64) -> Vec<(Range<u64>, Face)> {
+    let end = text.len().min(from.saturating_add(ANSI_SCAN_BYTES));
+    let mut bytes = Vec::new();
+    if text.read_cached(from..end, &mut bytes).is_err() {
+        return Vec::new();
+    }
+    crate::ansi::ansi_faces(&bytes, from)
+}
+
+fn ansi_face(spans: &[(Range<u64>, Face)], pos: u64) -> Option<Face> {
+    let index = spans.partition_point(|(range, _)| range.end <= pos);
+    spans
+        .get(index)
+        .filter(|(range, _)| range.start <= pos)
+        .map(|(_, face)| *face)
+}
+
 /// The region Transient Mark mode highlights, between point and an
 /// active mark.
 fn active_region(buffer: &Buffer, point: u64) -> Option<Range<u64>> {
@@ -345,16 +413,27 @@ fn draw_event(
             escape,
             ..
         } => {
+            let paren = marks
+                .parens
+                .filter(|found| found.here == *unit || found.there == Some(*unit));
             let face = if marks.search.current_contains(*unit) {
                 Face::IsearchMatch
             } else if marks.search.lazy_contains(*unit) {
                 Face::LazyHighlight
+            } else if let Some(found) = paren {
+                if found.matched {
+                    Face::ShowParenMatch
+                } else {
+                    Face::ShowParenMismatch
+                }
             } else if in_region(*unit) {
                 Face::Region
             } else if *escape {
                 Face::EscapeGlyph
+            } else if let Some(face) = ansi_face(&marks.ansi, *unit) {
+                face
             } else {
-                Face::Default
+                marks.faces.face_at(*unit).unwrap_or(Face::Default)
             };
             put_window_glyph(grid, area, row, *col, text, *width, face);
         }
@@ -562,6 +641,23 @@ impl RowWriter<'_> {
     }
 }
 
+/// The file panel's modeline: the name of the project it shows.
+fn draw_panel_modeline(writer: &mut RowWriter, tree: &crate::editor::TreeData, face: Face) {
+    let name = tree
+        .root
+        .as_ref()
+        .and_then(|root| root.file_name())
+        .map_or_else(
+            || PANEL_MODELINE.as_bytes().to_vec(),
+            |name| name.as_encoded_bytes().to_vec(),
+        );
+    writer.write(MODELINE_FRONT.as_bytes(), face, face);
+    writer.write(b" ", face, face);
+    writer.write(&name, face, Face::EscapeGlyph);
+    writer.write(b" ", face, face);
+    writer.fill(MODELINE_FILL.as_bytes(), face);
+}
+
 /// Emacs 29's default `mode-line-format` for a Fundamental-mode buffer as
 /// `emacs -nw -Q` (or `emacsclient -t`) shows it on screen, the rest of the
 /// row filled with dashes.
@@ -606,7 +702,8 @@ fn draw_modeline(writer: &mut RowWriter, modeline: &Modeline) {
     writer.write(MODELINE_MODES_GAP.as_bytes(), face, face);
     let loading = if buffer.loading { MODELINE_LOADING } else { "" };
     let tail = if buffer.tail { MODELINE_TAIL } else { "" };
-    let modes = format!("({}{loading}{tail}) ", buffer.mode_name());
+    let ansi = if buffer.ansi { MODELINE_ANSI } else { "" };
+    let modes = format!("({}{loading}{tail}{ansi}) ", buffer.mode_name());
     writer.write(modes.as_bytes(), face, face);
     if buffer.damaged {
         writer.write(MODELINE_DAMAGED.as_bytes(), face, face);
@@ -646,9 +743,9 @@ fn external_badge(binding: &FileBinding) -> Option<String> {
     }
 }
 
-fn draw_echo(grid: &mut Grid, row: u16, echo: &[u8], tab_width: usize) {
+fn draw_echo(grid: &mut Grid, row: u16, echo: &[u8], face: Face, tab_width: usize) {
     let mut writer = RowWriter::full_row(grid, row, tab_width);
-    writer.write(echo, Face::Default, Face::EscapeGlyph);
+    writer.write(echo, face, Face::EscapeGlyph);
 }
 
 /// One completion candidate above the echo area; the selected one is
@@ -737,7 +834,13 @@ mod tests {
     #[test]
     fn echo_escapes_control_and_invalid_bytes() {
         let mut grid = Grid::new(20, 1);
-        draw_echo(&mut grid, 0, "a\u{1b}b\u{9b}\tc".as_bytes(), 8);
+        draw_echo(
+            &mut grid,
+            0,
+            "a\u{1b}b\u{9b}\tc".as_bytes(),
+            Face::Default,
+            8,
+        );
         assert_eq!(row_text(&grid, 0), "a^[b\\233        c   ");
         assert_eq!(grid.row(0)[1].face, Face::EscapeGlyph);
         assert_eq!(grid.row(0)[0].face, Face::Default);
@@ -746,10 +849,16 @@ mod tests {
     #[test]
     fn echo_clips_a_wide_glyph_at_the_edge() {
         let mut grid = Grid::new(3, 1);
-        draw_echo(&mut grid, 0, "a\u{4e2d}\u{4e2d}".as_bytes(), 8);
+        draw_echo(
+            &mut grid,
+            0,
+            "a\u{4e2d}\u{4e2d}".as_bytes(),
+            Face::Default,
+            8,
+        );
         assert_eq!(row_text(&grid, 0), "a\u{4e2d}");
         let mut grid = Grid::new(2, 1);
-        draw_echo(&mut grid, 0, "a\u{4e2d}".as_bytes(), 8);
+        draw_echo(&mut grid, 0, "a\u{4e2d}".as_bytes(), Face::Default, 8);
         assert_eq!(row_text(&grid, 0), "a ");
     }
 }

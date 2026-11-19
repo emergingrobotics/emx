@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use emx_text::{ColumnCheckpoints, FileIdentity, ReadError, Text};
 use slotmap::SlotMap;
 
+use crate::faces::FaceSpans;
 use crate::marker::{InsertionType, Marker, MarkerId};
 use crate::reload::ExternalState;
 use crate::undo::{ChangeContext, UndoLimits, UndoList};
@@ -126,6 +127,9 @@ impl SaveProgress {
     }
 }
 
+/// How much of a file's start is looked at for NUL bytes.
+pub const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
 /// The buffer coding's modeline letter (Emacs `mode-line-mule-info`): a
 /// visited file whose bytes are all ASCII stays undecided (`-`) until a
 /// save writes something else; everything else is UTF-8 (`U`).
@@ -133,6 +137,9 @@ impl SaveProgress {
 pub enum CodingMnemonic {
     Undecided,
     Utf8,
+    /// A binary file (Emacs `no-conversion`): its bytes are shown escaped
+    /// and saved as they are.
+    Binary,
 }
 
 impl CodingMnemonic {
@@ -140,6 +147,27 @@ impl CodingMnemonic {
         match self {
             CodingMnemonic::Undecided => '-',
             CodingMnemonic::Utf8 => 'U',
+            CodingMnemonic::Binary => '=',
+        }
+    }
+
+    /// A file with a NUL byte in its first `BINARY_SNIFF_BYTES` is binary,
+    /// as Emacs's `inhibit-null-byte-detection` default decides.
+    pub fn sniff(bytes: &[u8]) -> CodingMnemonic {
+        let start = &bytes[..bytes.len().min(BINARY_SNIFF_BYTES)];
+        if start.contains(&0) {
+            CodingMnemonic::Binary
+        } else if bytes.is_ascii() {
+            CodingMnemonic::Undecided
+        } else {
+            CodingMnemonic::Utf8
+        }
+    }
+
+    pub fn is_binary(self) -> bool {
+        match self {
+            CodingMnemonic::Binary => true,
+            CodingMnemonic::Undecided | CodingMnemonic::Utf8 => false,
         }
     }
 }
@@ -193,6 +221,8 @@ const FUNDAMENTAL_MODE: &str = "Fundamental";
 const BUFFER_MENU_MODE: &str = "Buffer Menu";
 /// Emacs `mode-name` of `messages-buffer-mode`.
 const MESSAGES_MODE: &str = "Messages";
+/// The mode name of the file panel's buffer.
+const TREE_MODE: &str = "Tree";
 
 #[derive(Debug)]
 pub struct Buffer {
@@ -212,6 +242,8 @@ pub struct Buffer {
     pub indexing: Option<IndexingProgress>,
     /// Progress of a save in flight, `None` when no save is running.
     pub saving_progress: Option<SaveProgress>,
+    /// `ansi-color-mode`: SGR sequences are hidden and color the text.
+    pub ansi: bool,
     /// Emacs `auto-revert-tail-mode`: follow appends to the visited file,
     /// keeping the end of the buffer in view like `tail -f`.
     pub tail: bool,
@@ -237,6 +269,14 @@ pub struct Buffer {
     pub(crate) occur: Option<OccurData>,
     /// The mode name of a special buffer (`*Occur*`, `*Help*`).
     pub(crate) special_mode: Option<&'static str>,
+    /// Set while the buffer is a client's file panel.
+    pub(crate) tree: Option<Box<crate::editor::TreeData>>,
+    /// The language the buffer's file is in, for highlighting,
+    /// indentation and comments.
+    pub(crate) language: crate::editor::LanguageState,
+    /// Tab width, indentation and save-time settings for the file.
+    pub(crate) settings: crate::config::FileSettings,
+    pub(crate) highlight: crate::editor::HighlightState,
     /// Emacs `recent-auto-save-p`: auto-saved since last read or saved, so
     /// the auto-save file is this session's and a save may delete it.
     pub(crate) auto_saved_since_save: bool,
@@ -245,6 +285,9 @@ pub struct Buffer {
     /// start. Cleared whenever the text changes, since edits shift the byte
     /// offsets the checkpoints are keyed by.
     pub(crate) checkpoints: ColumnCheckpoints,
+    /// Faces the text is drawn in (Emacs `face` text properties): the file
+    /// panel's markers, syntax highlighting. They move with edits.
+    pub(crate) faces: FaceSpans,
     markers: SlotMap<MarkerId, Marker>,
     modified_tick: u64,
     save_tick: u64,
@@ -273,6 +316,7 @@ impl Buffer {
             indexing: None,
             saving_progress: None,
             tail: false,
+            ansi: false,
             coding: CodingMnemonic::Utf8,
             damaged: false,
             recovered: false,
@@ -282,8 +326,20 @@ impl Buffer {
             messages: false,
             occur: None,
             special_mode: None,
+            tree: None,
+            language: crate::editor::LanguageState::default(),
+            // The editor sets the config's settings as it creates the
+            // buffer, and the file's once it knows which file it visits.
+            settings: crate::config::FileSettings {
+                tab_width: crate::config::TAB_WIDTH,
+                indent_tabs_mode: crate::config::INDENT_TABS_MODE,
+                require_final_newline: false,
+                delete_trailing_whitespace: false,
+            },
+            highlight: crate::editor::HighlightState::default(),
             auto_saved_since_save: false,
             checkpoints,
+            faces: FaceSpans::new(),
             markers: SlotMap::with_key(),
             modified_tick: 0,
             save_tick: 0,
@@ -295,10 +351,14 @@ impl Buffer {
     pub(crate) fn mode_name(&self) -> &'static str {
         if self.menu.is_some() {
             BUFFER_MENU_MODE
+        } else if self.tree.is_some() {
+            TREE_MODE
         } else if let Some(mode) = self.special_mode {
             mode
         } else if self.messages {
             MESSAGES_MODE
+        } else if let Some(language) = self.language.language {
+            language.mode_name()
         } else {
             FUNDAMENTAL_MODE
         }
@@ -322,6 +382,7 @@ impl Buffer {
         self.undo = UndoList::new(limits);
         self.modified_tick += 1;
         self.checkpoints.clear();
+        self.faces.clear();
         self.set_unmodified();
     }
 
@@ -336,6 +397,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.adjust_for_insert(at, bytes.len() as u64);
         }
+        self.faces.adjust_for_insert(at, bytes.len() as u64);
         self.modified_tick += 1;
         self.checkpoints.clear();
         Ok(())
@@ -350,6 +412,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.adjust_for_delete(&range);
         }
+        self.faces.adjust_for_delete(&range);
         self.modified_tick += 1;
         self.checkpoints.clear();
         Ok(())
@@ -500,6 +563,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.adjust_for_insert(at, length);
         }
+        self.faces.adjust_for_insert(at, length);
         self.modified_tick += 1;
         self.checkpoints.clear();
         recorder.record(
@@ -594,6 +658,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.adjust_for_delete(&range);
         }
+        self.faces.adjust_for_delete(&range);
         self.modified_tick += 1;
         self.checkpoints.clear();
         recorder.record(
@@ -614,6 +679,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.pos = marker.pos.min(length);
         }
+        self.faces.clear();
         self.modified_tick += 1;
         self.checkpoints.clear();
         recorder.record(self.id, &Change::ReplaceAll { text });
@@ -636,6 +702,7 @@ impl Buffer {
         for marker in self.markers.values_mut() {
             marker.adjust_for_insert(at, length);
         }
+        self.faces.adjust_for_insert(at, length);
         self.modified_tick += 1;
         self.checkpoints.clear();
     }

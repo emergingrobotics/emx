@@ -1,11 +1,11 @@
 //! The command-line tools of the socket API (DESIGN section 2): `emx open`,
-//! `list-buffers`, `reload`, `goto`, `save-all`, `events` and
-//! `diff-external`. Each connects to the running server as a CLI client,
+//! `list-buffers`, `reload`, `goto`, `save-all`, `events`, `diff-external`
+//! and `apply-patch`. Each connects to the running server as a CLI client,
 //! sends one request and reports its answer. They never start a server:
 //! a script asking a session that does not exist is told so.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -55,6 +55,10 @@ pub enum Tool {
     /// `emx events`: JSON lines on stdout until interrupted.
     Events,
     DiffExternal {
+        file: OsString,
+    },
+    /// `emx apply-patch FILE`, the patch on stdin.
+    ApplyPatch {
         file: OsString,
     },
 }
@@ -160,6 +164,19 @@ fn request_for(tool: &Tool) -> anyhow::Result<Request> {
         Tool::DiffExternal { file } => Request::DiffExternal {
             path: wire(Path::new(file)),
         },
+        Tool::ApplyPatch { file } => {
+            let mut patch = Vec::new();
+            io::stdin()
+                .read_to_end(&mut patch)
+                .context("reading the patch from stdin")?;
+            Request::ApplyPatch {
+                path: wire(Path::new(file)),
+                patch_b64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    patch,
+                ),
+            }
+        }
     })
 }
 

@@ -11,12 +11,13 @@ mod rect;
 mod register;
 mod replace;
 mod search;
+mod syntax;
 mod window;
 
 pub(crate) use dabbrev::DabbrevState;
-pub(crate) use kill::{xterm_paste, yank_from_kill_ring};
+pub(crate) use kill::{copy_region_as_kill, xterm_paste, yank_from_kill_ring};
 pub(crate) use mark::push_mark;
-pub(crate) use misc::RecenterPosition;
+pub(crate) use misc::{RecenterPosition, scroll_window_lines};
 pub(crate) use r#move::{
     char_after, char_before, forward_line, goto_line_offset_cached, goto_line_to, is_word,
     line_end, line_start, scan_words,
@@ -186,6 +187,10 @@ static COMMANDS: &[CommandSpec] = &[
         run: edit::delete_backward_char,
     },
     CommandSpec {
+        name: "delete-forward-char",
+        run: edit::delete_forward_char,
+    },
+    CommandSpec {
         name: "undo",
         run: edit::undo,
     },
@@ -246,12 +251,28 @@ static COMMANDS: &[CommandSpec] = &[
         run: misc::keyboard_quit,
     },
     CommandSpec {
+        name: "suspend-frame",
+        run: misc::suspend_frame,
+    },
+    CommandSpec {
         name: "execute-extended-command",
         run: misc::execute_extended_command,
     },
     CommandSpec {
         name: "auto-revert-tail-mode",
         run: misc::auto_revert_tail_mode,
+    },
+    CommandSpec {
+        name: "xterm-mouse-mode",
+        run: misc::xterm_mouse_mode,
+    },
+    CommandSpec {
+        name: "ansi-color-mode",
+        run: misc::ansi_color_mode,
+    },
+    CommandSpec {
+        name: "comment-dwim",
+        run: syntax::comment_dwim,
     },
     CommandSpec {
         name: "scroll-up-command",
@@ -336,6 +357,54 @@ static COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "other-window",
         run: window::other_window,
+    },
+    CommandSpec {
+        name: "toggle-tree",
+        run: window::toggle_tree,
+    },
+    CommandSpec {
+        name: "tree-next-line",
+        run: window::tree_next_line,
+    },
+    CommandSpec {
+        name: "tree-previous-line",
+        run: window::tree_previous_line,
+    },
+    CommandSpec {
+        name: "tree-open",
+        run: window::tree_open,
+    },
+    CommandSpec {
+        name: "tree-toggle",
+        run: window::tree_toggle,
+    },
+    CommandSpec {
+        name: "tree-up",
+        run: window::tree_up,
+    },
+    CommandSpec {
+        name: "tree-refresh",
+        run: window::tree_refresh,
+    },
+    CommandSpec {
+        name: "tree-toggle-ignored",
+        run: window::tree_toggle_ignored,
+    },
+    CommandSpec {
+        name: "tree-create-directory",
+        run: window::tree_create_directory,
+    },
+    CommandSpec {
+        name: "tree-rename",
+        run: window::tree_rename,
+    },
+    CommandSpec {
+        name: "tree-delete",
+        run: window::tree_delete,
+    },
+    CommandSpec {
+        name: "project-find-file",
+        run: window::project_find_file,
     },
     CommandSpec {
         name: "switch-to-buffer",
@@ -490,6 +559,26 @@ static COMMANDS: &[CommandSpec] = &[
         run: rect::string_rectangle,
     },
     CommandSpec {
+        name: "delete-rectangle",
+        run: rect::delete_rectangle,
+    },
+    CommandSpec {
+        name: "copy-rectangle-as-kill",
+        run: rect::copy_rectangle_as_kill,
+    },
+    CommandSpec {
+        name: "clear-rectangle",
+        run: rect::clear_rectangle,
+    },
+    CommandSpec {
+        name: "open-rectangle",
+        run: rect::open_rectangle,
+    },
+    CommandSpec {
+        name: "rectangle-number-lines",
+        run: rect::rectangle_number_lines,
+    },
+    CommandSpec {
         name: "kmacro-start-macro",
         run: r#macro::kmacro_start_macro,
     },
@@ -630,6 +719,16 @@ impl<'a> CommandContext<'a> {
     }
 
     /// The command's `last-command` is `name`.
+    /// Emacs `tab-width` in the buffer.
+    pub(crate) fn tab_width(&self) -> u64 {
+        self.buffer().settings.tab_width
+    }
+
+    /// Emacs `indent-tabs-mode` in the buffer.
+    pub(crate) fn indent_tabs_mode(&self) -> bool {
+        self.buffer().settings.indent_tabs_mode
+    }
+
     pub fn last_command_is(&self, name: &str) -> bool {
         self.last_command == Some(name)
     }

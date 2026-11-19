@@ -70,6 +70,14 @@ pub(super) fn digit_argument(ctx: &mut CommandContext) -> Result<(), CommandErro
 
 /// Emacs `keyboard-quit`: deactivate the mark, abort any keyboard macro in
 /// progress, then signal `quit`.
+/// Emacs `suspend-frame` (`C-z`): a terminal client stops itself, as the
+/// shell's job control would, until `fg` resumes it.
+pub(super) fn suspend_frame(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let client = ctx.client;
+    ctx.editor().suspend_client(client);
+    Ok(())
+}
+
 pub(super) fn keyboard_quit(ctx: &mut CommandContext) -> Result<(), CommandError> {
     ctx.buffer_mut().mark_active = false;
     // An occur still searching on a worker is quit too, as Emacs's
@@ -134,6 +142,15 @@ fn scroll_command(ctx: &mut CommandContext, direction: i64) -> Result<(), Comman
             false,
         ),
     }
+}
+
+/// Scrolls the context's window `count` rows: up (later text) when
+/// positive. For `mwheel-scroll`.
+pub(crate) fn scroll_window_lines(
+    ctx: &mut CommandContext,
+    count: i64,
+) -> Result<(), CommandError> {
+    window_scroll(ctx, count, false)
 }
 
 /// window.c `window_scroll_line_based`, which Emacs uses on terminals,
@@ -263,6 +280,29 @@ pub(super) fn auto_revert_tail_mode(ctx: &mut CommandContext) -> Result<(), Comm
     };
     let state = if enabled { "enabled" } else { "disabled" };
     ctx.message(format!("Auto-Revert Tail mode {state}"));
+    Ok(())
+}
+
+/// `ansi-color-mode`, for the buffer: SGR color sequences are hidden and
+/// color the text after them; the text itself is unchanged.
+pub(super) fn ansi_color_mode(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let enabled = {
+        let buffer = ctx.buffer_mut();
+        buffer.ansi = !buffer.ansi;
+        buffer.ansi
+    };
+    ctx.request_full_redraw();
+    let state = if enabled { "enabled" } else { "disabled" };
+    ctx.message(format!("Ansi-Color mode {state} in current buffer"));
+    Ok(())
+}
+
+/// Emacs `xterm-mouse-mode`, global: every terminal client of the
+/// session reports the mouse, or stops.
+pub(super) fn xterm_mouse_mode(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let enabled = ctx.editor().toggle_mouse_mode();
+    let state = if enabled { "enabled" } else { "disabled" };
+    ctx.message(format!("Xterm-Mouse mode {state}"));
     Ok(())
 }
 

@@ -67,6 +67,19 @@ fn client_messages() -> Vec<ClientMsg> {
             wait_for: None,
         },
         ClientMsg::Key { key: sample_key() },
+        ClientMsg::Mouse {
+            event: emx_types::MouseEvent {
+                kind: emx_types::MouseKind::Drag,
+                button: emx_types::MouseButton::Left,
+                col: 3,
+                row: 4,
+                mods: emx_types::Mods {
+                    ctrl: true,
+                    ..emx_types::Mods::default()
+                },
+                clicks: 2,
+            },
+        },
         ClientMsg::Paste {
             data_b64: "aGk=".to_string(),
             r#final: false,
@@ -169,6 +182,7 @@ fn server_messages() -> Vec<ServerMsg> {
             cursor: None,
         },
         ServerMsg::Bell,
+        ServerMsg::Modes { mouse: true },
         ServerMsg::Response {
             id: 1,
             result: Ok(Response::Ok),
@@ -200,22 +214,24 @@ fn server_messages() -> Vec<ServerMsg> {
 fn every_message_has_version() {
     for message in client_messages() {
         let value: serde_json::Value = serde_json::from_slice(&encode(&message)).unwrap();
-        assert_eq!(value["v"], 1, "{message:?}");
+        assert_eq!(value["v"], PROTOCOL_VERSION, "{message:?}");
         assert!(value["type"].is_string(), "{message:?}");
     }
     for message in server_messages() {
         let value: serde_json::Value = serde_json::from_slice(&encode(&message)).unwrap();
-        assert_eq!(value["v"], 1, "{message:?}");
+        assert_eq!(value["v"], PROTOCOL_VERSION, "{message:?}");
         assert!(value["type"].is_string(), "{message:?}");
     }
 }
 
 #[test]
 fn wrong_version_rejected() {
-    let line = b"{\"v\":2,\"type\":\"bell\"}\n".to_vec();
+    // A peer from before version 2 (an old server still running after an
+    // upgrade) is refused, not misread.
+    let line = b"{\"v\":1,\"type\":\"bell\"}\n".to_vec();
     let mut reader = LineReader::new(Cursor::new(line));
     match reader.read_msg::<ServerMsg>() {
-        Err(ProtoError::Version { got: 2, want: 1 }) => {}
+        Err(ProtoError::Version { got: 1, want: 2 }) => {}
         other => panic!("unexpected {other:?}"),
     }
 }

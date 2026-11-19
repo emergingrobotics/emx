@@ -1,9 +1,9 @@
-use emx_term::{InputEvent, KittyDecoder, MAX_PENDING_SEQUENCE, PASTE_CHUNK_MAX};
+use emx_term::{Decoder, InputEvent, MAX_PENDING_SEQUENCE, PASTE_CHUNK_MAX, Protocol};
 use emx_types::{Key, KeyCode, Mods, parse_kbd};
 use proptest::prelude::*;
 
 fn decode(bytes: &[u8]) -> Vec<InputEvent> {
-    KittyDecoder::new().feed(bytes)
+    Decoder::new(Protocol::Kitty).feed(bytes)
 }
 
 fn paste(data: &[u8]) -> InputEvent {
@@ -197,6 +197,11 @@ fn decode_terminal_replies() {
         decode(b"\x1b[?1;2c"),
         vec![InputEvent::PrimaryDeviceAttributes]
     );
+    assert_eq!(
+        decode(b"\x1b[?62;c"),
+        vec![InputEvent::PrimaryDeviceAttributes],
+        "an empty field still ends the probe"
+    );
 }
 
 #[test]
@@ -212,12 +217,12 @@ fn decode_split_sequence_across_feeds() {
     let whole = decode(&input);
     assert_eq!(whole.len(), 11);
     for split in 0..=input.len() {
-        let mut decoder = KittyDecoder::new();
+        let mut decoder = Decoder::new(Protocol::Kitty);
         let mut events = decoder.feed(&input[..split]);
         events.extend(decoder.feed(&input[split..]));
         assert_eq!(events, whole, "split at {split}");
     }
-    let mut decoder = KittyDecoder::new();
+    let mut decoder = Decoder::new(Protocol::Kitty);
     let mut events = Vec::new();
     for byte in &input {
         events.extend(decoder.feed(std::slice::from_ref(byte)));
@@ -250,12 +255,12 @@ fn decode_paste_split_across_feeds_is_reassembled() {
     let input = b"a\x1b[200~one\r\ntwo\r\x1b[201~b";
     let expected = vec![kbd("a"), paste(b"one\ntwo\n"), kbd("b")];
     for split in 0..=input.len() {
-        let mut decoder = KittyDecoder::new();
+        let mut decoder = Decoder::new(Protocol::Kitty);
         let mut events = decoder.feed(&input[..split]);
         events.extend(decoder.feed(&input[split..]));
         assert_eq!(events, expected, "split at {split}");
     }
-    let mut decoder = KittyDecoder::new();
+    let mut decoder = Decoder::new(Protocol::Kitty);
     let mut events = Vec::new();
     for byte in input {
         events.extend(decoder.feed(&[*byte]));
@@ -265,7 +270,7 @@ fn decode_paste_split_across_feeds_is_reassembled() {
 
 #[test]
 fn decode_paste_crlf_split_across_feeds() {
-    let mut decoder = KittyDecoder::new();
+    let mut decoder = Decoder::new(Protocol::Kitty);
     let mut events = decoder.feed(b"\x1b[200~a\r");
     events.extend(decoder.feed(b"\nb\x1b[201~"));
     assert_eq!(events, vec![paste(b"a\nb")]);
@@ -306,7 +311,7 @@ fn decode_unknown_and_garbled_sequences() {
 
 #[test]
 fn decode_pending_sequence_is_capped_and_its_tail_discarded() {
-    let mut decoder = KittyDecoder::new();
+    let mut decoder = Decoder::new(Protocol::Kitty);
     let mut input = b"\x1b[".to_vec();
     input.extend(std::iter::repeat_n(b'1', MAX_PENDING_SEQUENCE + 100));
     let events = decoder.feed(&input);
@@ -318,7 +323,7 @@ fn decode_pending_sequence_is_capped_and_its_tail_discarded() {
     assert_eq!(decoder.feed(b"22;5u"), Vec::new());
     assert_eq!(decoder.feed(b"x"), vec![kbd("x")]);
 
-    let mut decoder = KittyDecoder::new();
+    let mut decoder = Decoder::new(Protocol::Kitty);
     let mut events = Vec::new();
     for _ in 0..MAX_PENDING_SEQUENCE {
         events.extend(decoder.feed(b"\x1b[1"));
@@ -347,7 +352,7 @@ fn decode_overflow_tail_is_feed_boundary_independent() {
             kbd("c"),
         ]
     );
-    let mut decoder = KittyDecoder::new();
+    let mut decoder = Decoder::new(Protocol::Kitty);
     let mut events = Vec::new();
     for byte in &input {
         events.extend(decoder.feed(std::slice::from_ref(byte)));
@@ -380,7 +385,7 @@ fn decode_string_sequences_are_unknown_through_their_terminator() {
         decode(b"\x1b]0;t\x1b[A"),
         vec![unknown(b"\x1b]0;t"), kbd("<up>")]
     );
-    let mut decoder = KittyDecoder::new();
+    let mut decoder = Decoder::new(Protocol::Kitty);
     assert_eq!(decoder.feed(b"\x1b]0;abc\x1b"), Vec::new());
     assert_eq!(
         decoder.feed(b"\\d"),
@@ -463,7 +468,7 @@ fn decode_large_paste_is_chunked_across_feeds() {
         index += 1;
     }
     let input = [b"\x1b[200~".as_slice(), &content, b"\x1b[201~x"].concat();
-    let mut decoder = KittyDecoder::new();
+    let mut decoder = Decoder::new(Protocol::Kitty);
     let mut events = Vec::new();
     for piece in input.chunks(100_003) {
         events.extend(decoder.feed(piece));
@@ -479,7 +484,7 @@ fn decode_large_paste_is_chunked_across_feeds() {
 
 #[test]
 fn decode_unterminated_paste_emits_chunks_as_data_arrives() {
-    let mut decoder = KittyDecoder::new();
+    let mut decoder = Decoder::new(Protocol::Kitty);
     assert_eq!(decoder.feed(b"\x1b[200~"), Vec::new());
     let mut events = Vec::new();
     for _ in 0..5 {
@@ -534,11 +539,11 @@ proptest! {
             input.splice(0..0, b"\x1b[200~".iter().copied());
             input.extend_from_slice(b"\x1b[201~");
         }
-        let mut whole_decoder = KittyDecoder::new();
+        let mut whole_decoder = Decoder::new(Protocol::Kitty);
         let whole = whole_decoder.feed(&input);
         let mut points: Vec<usize> = splits.iter().map(|index| index.index(input.len() + 1)).collect();
         points.sort_unstable();
-        let mut decoder = KittyDecoder::new();
+        let mut decoder = Decoder::new(Protocol::Kitty);
         let mut events = Vec::new();
         let mut start = 0;
         for point in points {

@@ -62,13 +62,21 @@ pub(super) fn kill_region_command(ctx: &mut CommandContext) -> Result<(), Comman
 
 /// `M-w`: Emacs `kill-ring-save`, through `copy-region-as-kill`.
 pub(super) fn kill_ring_save(ctx: &mut CommandContext) -> Result<(), CommandError> {
+    copy_region_as_kill(ctx)?;
+    ctx.request_deactivate_mark();
+    Ok(())
+}
+
+/// Emacs `copy-region-as-kill`, leaving the mark as it is. The copy is
+/// announced once it reaches the clipboard.
+pub(crate) fn copy_region_as_kill(ctx: &mut CommandContext) -> Result<(), CommandError> {
     let (mark, point) = ctx.mark_and_point()?;
     let mut copied = Vec::new();
     ctx.buffer()
         .text
         .read(mark.min(point)..mark.max(point), &mut copied)?;
     save_kill(ctx, copied, point < mark);
-    ctx.request_deactivate_mark();
+    ctx.editor().request_clipboard_notice();
     Ok(())
 }
 

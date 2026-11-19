@@ -14,19 +14,20 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use emx_core::{KeyboardEncoding, ThemeChoice};
 use emx_proto::{ClientKind, ClientMsg, LineReader, Request, ServerMsg, WirePath, write_msg};
 use emx_term::{
-    InputEvent, KittyDecoder, Screen, StdinSource, Terminal, UNSUPPORTED_TERMINAL_MESSAGE,
-    probe_kitty,
+    Decoder, InputEvent, KEYBOARD_ENV, Protocol, Screen, StdinSource, Terminal, Theme, ThemeBase,
+    keyboard_override, mouse_sequence, probe_protocol,
 };
-use emx_types::Grid;
+use emx_types::{Face, Grid, MouseButton, MouseEvent, MouseKind};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGWINCH};
 use signal_hook::iterator::Signals;
 
@@ -36,6 +37,13 @@ use crate::server::client_conn::{MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS, peer_uid}
 /// How long a terminal has to answer the keyboard protocol probe; one
 /// that stays silent this long does not speak it.
 pub const KITTY_PROBE_TIMEOUT_MS: u64 = 1000;
+/// How long a legacy terminal's ESC waits for the rest of a key sequence
+/// before it is the Escape key. Terminals send a sequence's bytes together,
+/// so this only needs to cover a slow link.
+pub const LEGACY_ESCAPE_TIMEOUT_MS: u64 = 50;
+/// Emacs `double-click-time`: presses of one button on one cell this
+/// close together count as a double or triple click.
+pub const DOUBLE_CLICK_MS: u64 = 500;
 pub const CONNECTION_LOST: &str = "emx: server connection lost";
 /// Debug builds panic after drawing the first frame when this is set, so
 /// tests can check that a panicking client restores the terminal.
@@ -116,6 +124,7 @@ pub fn parse_file_arguments(arguments: &[OsString]) -> Vec<FileArgument> {
 /// Runs the terminal client of the session server.
 pub fn run(options: ClientOptions) -> anyhow::Result<ExitCode> {
     let files = parse_file_arguments(&options.files);
+    let settings = ClientSettings::from_config(&crate::server::load_config()?)?;
     let socket = socket_path()?;
     // Connect before taking over the terminal, so a server that cannot
     // start is reported on a usable terminal.
@@ -129,6 +138,7 @@ pub fn run(options: ClientOptions) -> anyhow::Result<ExitCode> {
         events,
         &files,
         options.wait,
+        settings,
     )?;
     Ok(end.report())
 }
@@ -365,6 +375,7 @@ pub fn run_tui(
     events: Receiver<UiEvent>,
     files: &[FileArgument],
     wait: bool,
+    settings: ClientSettings,
 ) -> anyhow::Result<End> {
     // Registered before the terminal is taken over: from here on SIGTERM
     // and SIGWINCH queue until the client handles them, instead of killing
@@ -378,11 +389,47 @@ pub fn run_tui(
         connect,
         sender,
         &events,
-        files,
-        wait,
+        Startup {
+            files,
+            wait,
+            settings,
+        },
     );
     drop(terminal);
     outcome
+}
+
+/// What the client starts with: the files to open, whether to wait for
+/// them, and the client's settings.
+struct Startup<'a> {
+    files: &'a [FileArgument],
+    wait: bool,
+    settings: ClientSettings,
+}
+
+/// What the terminal client takes from the config: how to read keys and
+/// the colors to draw with.
+pub struct ClientSettings {
+    pub keyboard: KeyboardEncoding,
+    pub theme: Theme,
+}
+
+impl ClientSettings {
+    pub fn from_config(config: &emx_core::Config) -> anyhow::Result<ClientSettings> {
+        let mut theme = Theme::new(match config.theme {
+            ThemeChoice::Dark => ThemeBase::Dark,
+            ThemeChoice::Light => ThemeBase::Light,
+        });
+        for (name, parameters) in &config.faces {
+            let face = Face::from_name(name)
+                .with_context(|| format!("the config names no face {name}"))?;
+            theme.set(face, parameters)?;
+        }
+        Ok(ClientSettings {
+            keyboard: config.keyboard_encoding,
+            theme,
+        })
+    }
 }
 
 fn session(
@@ -391,20 +438,35 @@ fn session(
     connect: impl FnOnce(&Sender<UiEvent>) -> anyhow::Result<Box<dyn Link>>,
     sender: Sender<UiEvent>,
     events: &Receiver<UiEvent>,
-    files: &[FileArgument],
-    wait: bool,
+    startup: Startup,
 ) -> anyhow::Result<End> {
+    let Startup {
+        files,
+        wait,
+        settings,
+    } = startup;
+    let ClientSettings { keyboard, theme } = settings;
     let mut input = StdinSource::new();
-    let probe = probe_kitty(
-        &mut input,
-        &mut io::stdout(),
-        Duration::from_millis(KITTY_PROBE_TIMEOUT_MS),
-    )?;
-    if !probe.supported {
-        return Ok(End::failure(UNSUPPORTED_TERMINAL_MESSAGE));
-    }
-    let mut decoder = KittyDecoder::new();
-    let typed_during_probe = decoder.feed(&probe.leftover);
+    let configured = match keyboard {
+        KeyboardEncoding::Auto => None,
+        KeyboardEncoding::Kitty => Some(Protocol::Kitty),
+        KeyboardEncoding::Legacy => Some(Protocol::Legacy),
+    };
+    let overridden = keyboard_override(std::env::var_os(KEYBOARD_ENV).as_deref())?;
+    let (protocol, leftover) = match overridden.or(configured) {
+        Some(protocol) => (protocol, Vec::new()),
+        None => {
+            let probe = probe_protocol(
+                &mut input,
+                &mut io::stdout(),
+                Duration::from_millis(KITTY_PROBE_TIMEOUT_MS),
+            )?;
+            (probe.protocol, probe.leftover)
+        }
+    };
+    terminal.set_protocol(protocol)?;
+    let mut decoder = Decoder::new(protocol);
+    let typed_during_probe = decoder.feed(&leftover);
     startup_delay_seam();
     let link = connect(&sender)?;
     let (cols, rows) = clamp_size(terminal.size()?);
@@ -412,7 +474,9 @@ fn session(
     let mut client = Client {
         link,
         decoder,
-        display: Display::new(cols, rows),
+        display: Display::new(cols, rows, theme),
+        mouse: false,
+        clicks: ClickCounter::default(),
         cwd,
         files: files.to_vec(),
         wait,
@@ -433,9 +497,24 @@ fn session(
     start_input_thread(input, sender.clone())?;
     start_signal_thread(signals, sender)?;
     loop {
-        let event = events
-            .recv()
-            .context("every source of client events closed")?;
+        let event = if client.decoder.waiting_for_escape() {
+            match events.recv_timeout(Duration::from_millis(LEGACY_ESCAPE_TIMEOUT_MS)) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Some(end) = client.escape_timeout() {
+                        return Ok(end);
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("every source of client events closed")
+                }
+            }
+        } else {
+            events
+                .recv()
+                .context("every source of client events closed")?
+        };
         if let Some(end) = client.handle(event, terminal)? {
             return Ok(end);
         }
@@ -534,8 +613,11 @@ fn start_signal_thread(mut signals: Signals, sender: Sender<UiEvent>) -> anyhow:
 
 struct Client {
     link: Box<dyn Link>,
-    decoder: KittyDecoder,
+    decoder: Decoder,
     display: Display,
+    /// The server asked for mouse reports.
+    mouse: bool,
+    clicks: ClickCounter,
     cwd: PathBuf,
     files: Vec<FileArgument>,
     wait: bool,
@@ -624,15 +706,27 @@ impl Client {
         })
     }
 
+    /// A legacy terminal's ESC was not followed by the rest of a sequence.
+    fn escape_timeout(&mut self) -> Option<End> {
+        let events = self.decoder.timeout();
+        events.into_iter().find_map(|event| self.input_event(event))
+    }
+
     fn input_event(&mut self, event: InputEvent) -> Option<End> {
         match event {
             InputEvent::Key(key) => self.send(ClientMsg::Key { key }),
+            InputEvent::Mouse(event) if self.mouse => {
+                let event = self.clicks.count(event, Instant::now());
+                self.send(ClientMsg::Mouse { event })
+            }
             InputEvent::Paste { data, last } => self.send(ClientMsg::Paste {
                 data_b64: STANDARD.encode(data),
                 r#final: last,
             }),
-            // Late probe replies and sequences no key maps to.
-            InputEvent::KittyFlags(_)
+            // Late probe replies, sequences no key maps to, and mouse
+            // reports from before the server turned reporting off.
+            InputEvent::Mouse(_)
+            | InputEvent::KittyFlags(_)
             | InputEvent::PrimaryDeviceAttributes
             | InputEvent::Unknown(_) => None,
         }
@@ -672,6 +766,19 @@ impl Client {
                 terminal.write(BELL)?;
                 None
             }
+            ServerMsg::Suspend => self.suspend(terminal)?,
+            ServerMsg::Clipboard { data_b64 } => {
+                terminal.write(&osc52(&data_b64))?;
+                None
+            }
+            ServerMsg::Modes { mouse } => {
+                if mouse != self.mouse {
+                    self.mouse = mouse;
+                    self.clicks = ClickCounter::default();
+                    terminal.write(mouse_sequence(mouse))?;
+                }
+                None
+            }
             ServerMsg::Response { id, result } => {
                 if !self.waiting.remove(&id) {
                     // Answers to plain opens: the editor shows its own
@@ -694,6 +801,27 @@ impl Client {
         })
     }
 
+    /// `suspend-frame`: restores the terminal and stops the process group,
+    /// as SIGTSTP from the shell would; once `fg` continues it, takes the
+    /// terminal again and asks for a whole frame, of a new size if the
+    /// terminal was resized meanwhile.
+    fn suspend(&mut self, terminal: &mut Terminal) -> anyhow::Result<Option<End>> {
+        terminal.suspend()?;
+        rustix::process::kill_current_process_group(rustix::process::Signal::TSTP)
+            .context("suspending emx")?;
+        // Execution continues here on SIGCONT.
+        terminal.resume()?;
+        if self.mouse {
+            terminal.write(mouse_sequence(true))?;
+        }
+        let (cols, rows) = clamp_size(terminal.size()?);
+        if self.display.resize(cols, rows) {
+            return Ok(self.send(ClientMsg::Resize { cols, rows }));
+        }
+        self.display = self.display.fresh();
+        Ok(self.send(ClientMsg::Redraw))
+    }
+
     /// The connection ended. One that ends before the first frame is
     /// retried once: the server may have been exiting as it was reached.
     fn lost(&mut self, error: Option<String>) -> Option<End> {
@@ -702,8 +830,7 @@ impl Client {
             if let Some(reconnected) = self.link.reconnect() {
                 return match reconnected {
                     Ok(()) => {
-                        let (cols, rows) = self.display.size();
-                        self.display = Display::new(cols, rows);
+                        self.display = self.display.fresh();
                         self.greet()
                     }
                     Err(error) => Some(End::failure(format!("{CONNECTION_LOST}: {error:#}"))),
@@ -734,6 +861,51 @@ impl Client {
     }
 }
 
+/// Sets the terminal's clipboard (selection `c`) to the base64 text.
+fn osc52(data_b64: &str) -> Vec<u8> {
+    format!("\x1b]52;c;{data_b64}\x07").into_bytes()
+}
+
+/// Counts clicks: presses of one button on one cell, each within
+/// `DOUBLE_CLICK_MS` of the last. A drag or release carries the count of
+/// the press it follows, as Emacs's drag events do.
+#[derive(Debug, Default)]
+struct ClickCounter {
+    last: Option<(MouseButton, u16, u16, Instant)>,
+    count: u8,
+}
+
+impl ClickCounter {
+    fn count(&mut self, mut event: MouseEvent, now: Instant) -> MouseEvent {
+        match event.kind {
+            MouseKind::Press if !event.button.is_wheel() => {
+                let again = self.last.is_some_and(|(button, col, row, at)| {
+                    (button, col, row) == (event.button, event.col, event.row)
+                        && now.saturating_duration_since(at)
+                            <= Duration::from_millis(DOUBLE_CLICK_MS)
+                });
+                self.count = if again {
+                    self.count.saturating_add(1)
+                } else {
+                    1
+                };
+                self.last = Some((event.button, event.col, event.row, now));
+                event.clicks = self.count;
+            }
+            MouseKind::Press | MouseKind::Move => event.clicks = 1,
+            MouseKind::Drag | MouseKind::Release => {
+                event.clicks = self.count.max(1);
+                if event.kind == MouseKind::Drag {
+                    // A drag ends the run: the next press starts counting
+                    // anew.
+                    self.last = None;
+                }
+            }
+        }
+        event
+    }
+}
+
 /// What became of a frame.
 #[derive(Debug, PartialEq, Eq)]
 enum FrameOutcome {
@@ -761,14 +933,19 @@ struct Display {
 
 impl Display {
     /// The server's first frame for a client is always whole.
-    fn new(cols: u16, rows: u16) -> Display {
+    fn new(cols: u16, rows: u16, theme: Theme) -> Display {
         Display {
             cols,
             rows,
             grid: None,
-            screen: Screen::new(),
+            screen: Screen::with_theme(theme),
             whole_frame_due: true,
         }
+    }
+
+    /// A display of the same size and colors that has drawn nothing.
+    fn fresh(&self) -> Display {
+        Display::new(self.cols, self.rows, self.screen.theme().clone())
     }
 
     fn size(&self) -> (u16, u16) {
@@ -936,7 +1113,7 @@ mod tests {
 
     #[test]
     fn whole_frames_then_diffs_are_drawn() {
-        let mut display = Display::new(4, 2);
+        let mut display = Display::new(4, 2, Theme::default());
         assert!(matches!(
             display.apply(&whole(4, 2, "ab")),
             FrameOutcome::Drawn(_)
@@ -949,7 +1126,7 @@ mod tests {
 
     #[test]
     fn a_frame_for_another_size_is_refused_and_a_redraw_asked_once() {
-        let mut display = Display::new(4, 2);
+        let mut display = Display::new(4, 2, Theme::default());
         display.apply(&whole(4, 2, "ab"));
         assert_eq!(
             display.apply(&whole(5, 2, "ab")),
@@ -977,7 +1154,7 @@ mod tests {
 
     #[test]
     fn malformed_frames_are_refused_never_drawn() {
-        let mut display = Display::new(4, 2);
+        let mut display = Display::new(4, 2, Theme::default());
         display.apply(&whole(4, 2, "ab"));
         let outside = ServerMsg::Frame {
             full: false,
@@ -1045,7 +1222,7 @@ mod tests {
 
     #[test]
     fn a_resize_waits_for_a_whole_frame_of_the_new_size() {
-        let mut display = Display::new(4, 2);
+        let mut display = Display::new(4, 2, Theme::default());
         display.apply(&whole(4, 2, "ab"));
         assert!(display.resize(6, 3));
         assert!(!display.resize(6, 3), "unchanged");
@@ -1070,6 +1247,64 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "refusing the server at /run/user/1000/emx/server.sock: it runs as uid 0, not uid 1000"
+        );
+    }
+
+    fn press(col: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseKind::Press,
+            button: MouseButton::Left,
+            col,
+            row: 0,
+            mods: emx_types::Mods::default(),
+            clicks: 1,
+        }
+    }
+
+    #[test]
+    fn clicks_are_counted_on_one_cell_within_the_double_click_time() {
+        let mut counter = ClickCounter::default();
+        let start = Instant::now();
+        let soon = |milliseconds| start + Duration::from_millis(milliseconds);
+        assert_eq!(counter.count(press(3), start).clicks, 1);
+        assert_eq!(counter.count(press(3), soon(200)).clicks, 2);
+        assert_eq!(counter.count(press(3), soon(400)).clicks, 3);
+        let release = MouseEvent {
+            kind: MouseKind::Release,
+            ..press(3)
+        };
+        assert_eq!(counter.count(release, soon(450)).clicks, 3);
+        assert_eq!(
+            counter
+                .count(press(3), soon(400 + DOUBLE_CLICK_MS + 1))
+                .clicks,
+            1,
+            "too late"
+        );
+        assert_eq!(
+            counter.count(press(4), soon(1000)).clicks,
+            1,
+            "another cell"
+        );
+        let drag = MouseEvent {
+            kind: MouseKind::Drag,
+            ..press(5)
+        };
+        assert_eq!(counter.count(drag, soon(1050)).clicks, 1);
+        assert_eq!(
+            counter.count(press(4), soon(1100)).clicks,
+            1,
+            "a drag ends the run"
+        );
+        let wheel = MouseEvent {
+            button: MouseButton::WheelUp,
+            ..press(4)
+        };
+        assert_eq!(counter.count(wheel, soon(1150)).clicks, 1);
+        assert_eq!(
+            counter.count(press(4), soon(1200)).clicks,
+            2,
+            "the wheel does not break a run"
         );
     }
 
