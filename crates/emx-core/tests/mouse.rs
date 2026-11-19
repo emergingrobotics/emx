@@ -279,3 +279,82 @@ fn a_terminal_attaching_with_the_mode_on_is_told() {
             .contains(&ServerMsg::Modes { mouse: true })
     );
 }
+
+fn drag_copy_harness(text: &str) -> Harness {
+    let mut harness = Harness::with_config(Config {
+        mouse: true,
+        mouse_drag_copy_region: true,
+        ..Config::default()
+    });
+    harness.set_text(text);
+    harness
+}
+
+fn drag(harness: &mut Harness, from: u16, to: u16, row: u16) {
+    send(
+        harness,
+        report(MouseKind::Press, MouseButton::Left, from, row, 1),
+    );
+    send(
+        harness,
+        report(MouseKind::Drag, MouseButton::Left, to, row, 1),
+    );
+    send(
+        harness,
+        report(MouseKind::Release, MouseButton::Left, to, row, 1),
+    );
+}
+
+fn sent_to_clipboard(harness: &mut Harness) -> bool {
+    harness
+        .take_sent()
+        .iter()
+        .any(|message| matches!(message, ServerMsg::Clipboard { .. }))
+}
+
+#[test]
+fn releasing_a_drag_copies_the_region_when_asked_to() {
+    let mut harness = drag_copy_harness("|one two three\n");
+    harness.take_sent();
+    drag(&mut harness, 4, 7, 0);
+    assert_eq!(harness.kill_ring(), vec!["two".to_string()]);
+    assert!(sent_to_clipboard(&mut harness));
+    assert_eq!(harness.echo_line(), "Copied to clipboard");
+    assert_eq!(region(&harness), Some((4, 7)), "the region stays");
+}
+
+#[test]
+fn a_double_click_copies_the_word_when_asked_to() {
+    let mut harness = drag_copy_harness("|let foo_bar = 1;\n");
+    clicks(&mut harness, 5, 0, 2);
+    assert_eq!(harness.kill_ring(), vec!["foo".to_string()]);
+}
+
+#[test]
+fn a_plain_click_copies_nothing() {
+    let mut harness = drag_copy_harness("|one two three\n");
+    harness.take_sent();
+    click(&mut harness, 4, 0);
+    assert!(harness.kill_ring().is_empty());
+    assert!(!sent_to_clipboard(&mut harness));
+    assert_eq!(harness.echo_line(), "");
+}
+
+#[test]
+fn a_drag_copies_nothing_by_default() {
+    let mut harness = mouse_harness("|one two three\n");
+    drag(&mut harness, 4, 7, 0);
+    assert_eq!(region(&harness), Some((4, 7)));
+    assert!(harness.kill_ring().is_empty());
+}
+
+#[test]
+fn successive_drag_copies_do_not_append() {
+    let mut harness = drag_copy_harness("|one two three\n");
+    drag(&mut harness, 0, 3, 0);
+    drag(&mut harness, 4, 7, 0);
+    assert_eq!(
+        harness.kill_ring(),
+        vec!["two".to_string(), "one".to_string()]
+    );
+}

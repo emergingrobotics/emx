@@ -11,7 +11,7 @@ use emx_text::Text;
 use emx_types::{MouseButton, MouseEvent, MouseKind};
 
 use super::Editor;
-use crate::command::{CommandContext, scroll_window_lines};
+use crate::command::{CommandContext, copy_region_as_kill, scroll_window_lines};
 use crate::event::{ClientId, Effect};
 use crate::window::{Fetch, LineEvent, WindowId};
 
@@ -107,7 +107,7 @@ impl Editor {
             (MouseKind::Press, MouseButton::Left) => self.mouse_press(client_id, event),
             (MouseKind::Press, MouseButton::Right) => self.mouse_extend(client_id, event),
             (MouseKind::Drag, MouseButton::Left) => self.mouse_drag_to(client_id, event),
-            (MouseKind::Release, _) => self.client_mut(client_id).mouse_drag = None,
+            (MouseKind::Release, _) => self.mouse_release(client_id),
             _ => {}
         }
     }
@@ -347,6 +347,29 @@ impl Editor {
                 });
             }
         }
+    }
+
+    /// Ends a drag. With Emacs `mouse-drag-copy-region`, a drag or a double
+    /// or triple click that leaves a region copies it.
+    fn mouse_release(&mut self, client_id: ClientId) {
+        let drag = self.client_mut(client_id).mouse_drag.take();
+        if !self.config.mouse_drag_copy_region {
+            return;
+        }
+        let Some(MouseDrag::Text { window, .. }) = drag else {
+            return;
+        };
+        let buffer = self.selected_buffer(client_id);
+        if window != self.frame(client_id).selected || !self.buffers[buffer].mark_active {
+            return;
+        }
+        self.run_command(client_id, "mouse-set-region", None, |ctx| {
+            if ctx.use_region() {
+                copy_region_as_kill(ctx)
+            } else {
+                Ok(())
+            }
+        });
     }
 
     /// Emacs `mouse-save-then-kill` without the kill: the region runs from

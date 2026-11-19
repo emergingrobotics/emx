@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use emx_proto::{ClientKind, ServerMsg, diff_grids};
 use emx_text::{ColumnCheckpoints, ReadError, Sources, Text};
-use emx_types::{Grid, Key, KeyCode, Mods};
+use emx_types::{Face, Grid, Key, KeyCode, Mods};
 use slotmap::SlotMap;
 
 use crate::buffer::{Buffer, BufferId, ChangeRecorder};
@@ -80,6 +80,10 @@ const PASTE_COMMAND: &str = "xterm-paste";
 const PASTE_EVENT_DESCRIPTION: &str = "<xterm-paste>";
 /// `suspend-frame` from a client with no terminal to give back.
 const NOT_SUSPENDABLE: &str = "This client cannot be suspended";
+const COPIED_NOTICE: &str = "Copied to clipboard";
+/// An echo-area notice delay meaning it stays until the next input, as
+/// `clipboard_notice_ms = 0` asks.
+const NO_EXPIRY: u64 = 0;
 const QUIT_KEY: Key = command::QUIT_KEY;
 
 /// Emacs's per-keyboard command-loop state.
@@ -179,8 +183,21 @@ struct Client {
     pending_goto: Option<PendingGoto>,
     /// The mouse drag the last press started, until its release.
     mouse_drag: Option<mouse::MouseDrag>,
+    /// A notice in the echo area drawn in its own face.
+    echo_flash: Option<EchoFlash>,
     /// A `project-find-file` waiting for the project's files.
     quick_open: Option<panel::QuickOpen>,
+}
+
+/// A notice shown in the echo area in its own face. The face applies only
+/// while the echo area still shows the notice's text, so any later message
+/// is drawn plainly without every writer of the echo area clearing this.
+#[derive(Debug)]
+struct EchoFlash {
+    text: String,
+    face: Face,
+    /// Clears the notice; `None` leaves it to the next input.
+    timer: Option<TimerId>,
 }
 
 /// A `goto-line` whose target line is not yet indexed: the jump completes
@@ -217,6 +234,8 @@ enum TimerPurpose {
     /// Clears a message shown over the client's minibuffer, if it is still
     /// the one with this serial.
     MinibufferMessage(ClientId, u64),
+    /// Clears the client's echo-area notice, if this is still its timer.
+    EchoFlash(ClientId),
     /// Emacs `auto-save-timeout`.
     AutoSaveIdle,
     /// The client's cursor may be reported to `emx events` again.
@@ -361,6 +380,9 @@ pub struct Editor {
     panel_width: u16,
     /// The kill ring generation last sent to a terminal's clipboard.
     clipboard_generation: u64,
+    /// The current event made a copy that is announced once it reaches the
+    /// clipboard.
+    clipboard_notice: bool,
     /// The terminal client whose input the current event is.
     input_client: Option<ClientId>,
 }
@@ -449,6 +471,7 @@ impl Editor {
             trees: BTreeMap::new(),
             panel_width: u16::try_from(config.panel_width).expect("panel_width is validated small"),
             clipboard_generation: 0,
+            clipboard_notice: false,
             input_client: None,
             config,
         };
@@ -786,6 +809,7 @@ impl Editor {
                 dabbrev: None,
                 pending_goto: None,
                 mouse_drag: None,
+                echo_flash: None,
                 quick_open: None,
             },
         );
@@ -848,8 +872,11 @@ impl Editor {
     }
 
     /// A new kill goes to the system clipboard of the terminal whose input
-    /// made it (DESIGN section 7: kill ring to clipboard only).
+    /// made it (DESIGN section 7: kill ring to clipboard only). A copy asked
+    /// to be announced flashes a notice, or warns when it is too large to
+    /// send.
     fn send_clipboard(&mut self) {
+        let notice = std::mem::take(&mut self.clipboard_notice);
         let generation = self.kill_ring.generation();
         if generation == self.clipboard_generation {
             return;
@@ -864,17 +891,69 @@ impl Editor {
         let Some(text) = self.kill_ring.newest() else {
             return;
         };
-        if text.len() as u64 > self.config.osc52_max_bytes
-            || self
-                .clients
-                .get(&client)
-                .is_none_or(|state| state.kind != ClientKind::Tui)
+        if self
+            .clients
+            .get(&client)
+            .is_none_or(|state| state.kind != ClientKind::Tui)
         {
+            return;
+        }
+        let length = text.len() as u64;
+        let limit = self.config.osc52_max_bytes;
+        if length > limit {
+            if notice {
+                let message = format!(
+                    "Not copied to clipboard: {length} bytes is over osc52_max_bytes ({limit})"
+                );
+                self.flash_echo(client, message, Face::Warning, NO_EXPIRY);
+            }
             return;
         }
         let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text);
         self.effects
             .push(Effect::Send(client, ServerMsg::Clipboard { data_b64 }));
+        if notice {
+            let delay = self.config.clipboard_notice_ms;
+            self.flash_echo(client, COPIED_NOTICE.to_string(), Face::Success, delay);
+        }
+    }
+
+    pub(crate) fn request_clipboard_notice(&mut self) {
+        self.clipboard_notice = true;
+    }
+
+    /// Shows `text` in the echo area in `face`, cleared after `delay_ms`
+    /// unless that is `NO_EXPIRY`, which leaves it to the next input.
+    fn flash_echo(&mut self, client_id: ClientId, text: String, face: Face, delay_ms: u64) {
+        self.set_echo(client_id, text.clone());
+        let timer = (delay_ms != NO_EXPIRY)
+            .then(|| self.set_timer(TimerPurpose::EchoFlash(client_id), delay_ms));
+        self.client_mut(client_id).echo_flash = Some(EchoFlash { text, face, timer });
+    }
+
+    fn echo_flash_expired(&mut self, client_id: ClientId, id: TimerId) {
+        let Some(client) = self.clients.get_mut(&client_id) else {
+            return;
+        };
+        let Some(flash) = &client.echo_flash else {
+            return;
+        };
+        if flash.timer != Some(id) {
+            return;
+        }
+        if client.echo == flash.text {
+            client.echo.clear();
+        }
+        client.echo_flash = None;
+    }
+
+    /// The face the echo area's message is drawn in.
+    pub(crate) fn echo_face(&self, client_id: ClientId) -> Face {
+        let client = self.client(client_id);
+        match &client.echo_flash {
+            Some(flash) if client.minibuffer.is_none() && client.echo == flash.text => flash.face,
+            _ => Face::Default,
+        }
     }
 
     fn set_timer(&mut self, purpose: TimerPurpose, after_ms: u64) -> TimerId {
@@ -916,6 +995,7 @@ impl Editor {
             TimerPurpose::MinibufferMessage(client, serial) => {
                 self.minibuffer_message_expired(client, serial);
             }
+            TimerPurpose::EchoFlash(client) => self.echo_flash_expired(client, id),
             TimerPurpose::AutoSaveIdle => self.auto_save_idle(id),
             TimerPurpose::CursorEvent(client) => self.cursor_timer_expired(client, id),
             TimerPurpose::Settle(buffer) => self.settle_timer(buffer, id),

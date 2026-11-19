@@ -39,6 +39,8 @@ pub fn face_sgr(face: Face) -> &'static str {
         Face::EscapeGlyph => "0;33",
         Face::Error => "0;1;31",
         Face::Warning => "0;1;33",
+        // Emacs `success` is bold green on both backgrounds.
+        Face::Success => "0;1;32",
         Face::ChangedMarker => "0;35",
         // `icomplete-selected-match` is `highlight`: darkseagreen2 behind
         // the text on a light terminal, nearest ANSI green.

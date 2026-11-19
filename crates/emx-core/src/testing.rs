@@ -737,6 +737,12 @@ impl Harness {
         }
     }
 
+    /// The timers pending now, which are then no longer fired by
+    /// `fire_timers`; for firing them later, out of order.
+    pub fn take_timers(&mut self) -> Vec<TimerId> {
+        std::mem::take(&mut self.timers)
+    }
+
     /// Messages sent to clients since the last call.
     pub fn take_sent(&mut self) -> Vec<ServerMsg> {
         std::mem::take(&mut self.sent)

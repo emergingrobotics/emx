@@ -1,0 +1,96 @@
+version: 2
+
+project_name: emx
+
+# Linux only: linking for darwin needs a macOS SDK, which the release host
+# does not have. macOS users install with `cargo install --locked emx`.
+# The musl targets give static binaries (with mimalloc, see src/main.rs) that
+# run on any Linux of their architecture. `make prereqs` installs the rustup
+# targets, cargo-zigbuild and zig that this builder needs.
+builds:
+  - id: emx
+    builder: rust
+    binary: emx
+    command: zigbuild
+    flags:
+      - --release
+      - --package=emx
+    targets:
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
+
+archives:
+  - id: emx
+    ids:
+      - emx
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE-MIT
+      - LICENSE-APACHE
+
+checksum:
+  name_template: "checksums.txt"
+
+# A release takes its version from the vX.Y.Z tag at HEAD. A snapshot would
+# take it from the nearest tag (the m* milestone tags are not versions), so
+# `make snapshot` passes the Cargo.toml version in EMX_VERSION instead; a
+# Debian version must start with a digit.
+snapshot:
+  version_template: "{{ .Env.EMX_VERSION }}-SNAPSHOT-{{ .ShortCommit }}"
+
+# The binaries are static, so the packages declare no library dependencies
+# and install on any Debian or Ubuntu of their architecture.
+nfpms:
+  - id: emx
+    ids:
+      - emx
+    package_name: emx
+    maintainer: "Greg Herlein <gherlein@herlein.com>"
+    homepage: "https://github.com/emergingrobotics/emx"
+    description: |-
+      Fast terminal editor with Emacs keybindings, built for working alongside coding agents
+      emx watches files that agents, build tools and git rewrite, shows what
+      changed, never loses either side's work, and can be driven over a socket.
+      It handles multi-GB files and ships as one static binary.
+    license: "MIT OR Apache-2.0"
+    section: editors
+    priority: optional
+    formats:
+      - deb
+    bindir: /usr/bin
+    # The checkout's modes vary (0664 under a group-writable umask); packaged
+    # docs are 0644.
+    contents:
+      - src: README.md
+        dst: /usr/share/doc/emx/README.md
+        file_info:
+          mode: 0644
+      - src: LICENSE-MIT
+        dst: /usr/share/doc/emx/LICENSE-MIT
+        file_info:
+          mode: 0644
+      - src: LICENSE-APACHE
+        dst: /usr/share/doc/emx/LICENSE-APACHE
+        file_info:
+          mode: 0644
+
+# `brews` is deprecated by GoReleaser in favor of `homebrew_casks`, which is
+# macOS-only (casks, not formulae) -- wrong fit for a Linux-only CLI like
+# emx. `goreleaser check` reports the deprecation; it is accepted.
+brews:
+  - name: emx
+    ids:
+      - emx
+    repository:
+      owner: gherlein
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/emergingrobotics/emx"
+    description: "Fast terminal editor with Emacs keybindings, built for working alongside coding agents"
+    license: "MIT OR Apache-2.0"
+    test: |
+      system "#{bin}/emx", "--version"
+    install: |
+      bin.install "emx"

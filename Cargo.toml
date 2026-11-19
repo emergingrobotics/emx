@@ -9,25 +9,6 @@ readme = "VISION.md"
 keywords = ["editor", "emacs", "terminal", "tui"]
 categories = ["text-editors", "command-line-utilities"]
 
-# cargo-deb packaging (make deb). The assets point at target/release; with
-# --target, cargo-deb reads target/<triple>/release instead. The musl builds
-# are static, so the package declares no library dependencies.
-[package.metadata.deb]
-maintainer = "Greg Herlein <gherlein@herlein.com>"
-section = "editors"
-priority = "optional"
-depends = ""
-extended-description = """\
-emx watches files that agents, build tools and git rewrite, shows what \
-changed, never loses either side's work, and can be driven over a socket. \
-It handles multi-GB files and ships as one static binary."""
-assets = [
-    ["target/release/emx", "usr/bin/", "755"],
-    ["README.md", "usr/share/doc/emx/", "644"],
-    ["LICENSE-MIT", "usr/share/doc/emx/", "644"],
-    ["LICENSE-APACHE", "usr/share/doc/emx/", "644"],
-]
-
 [workspace]
 members = ["crates/*"]
 resolver = "3"

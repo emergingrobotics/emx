@@ -15,7 +15,7 @@ mod syntax;
 mod window;
 
 pub(crate) use dabbrev::DabbrevState;
-pub(crate) use kill::{xterm_paste, yank_from_kill_ring};
+pub(crate) use kill::{copy_region_as_kill, xterm_paste, yank_from_kill_ring};
 pub(crate) use mark::push_mark;
 pub(crate) use misc::{RecenterPosition, scroll_window_lines};
 pub(crate) use r#move::{

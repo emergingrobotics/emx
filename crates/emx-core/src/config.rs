@@ -57,6 +57,8 @@ pub const COMPLETION_ROWS_MAX: u64 = 1000;
 /// Mouse reporting is off until asked for: it takes over the terminal's
 /// own drag-to-select, as Emacs `-nw` leaves `xterm-mouse-mode` off.
 pub const MOUSE: bool = false;
+/// Emacs `mouse-drag-copy-region`: off, so a drag only sets the region.
+pub const MOUSE_DRAG_COPY_REGION: bool = false;
 /// Emacs `mouse-wheel-scroll-amount`'s first element.
 pub const MOUSE_WHEEL_LINES: u64 = 5;
 /// The most lines one wheel step may scroll.
@@ -78,6 +80,9 @@ pub const OSC52_CLIPBOARD: bool = true;
 /// Longer kills are not sent: terminals refuse large OSC 52 payloads
 /// (xterm's limit is about 100 KB of base64).
 pub const OSC52_MAX_BYTES: u64 = 74_994;
+/// How long "Copied to clipboard" stays in the echo area; zero keeps it
+/// until the next input, as an Emacs message.
+pub const CLIPBOARD_NOTICE_MS: u64 = 1500;
 /// Emacs `show-paren-mode`, on by default since Emacs 28.
 pub const SHOW_PAREN_MODE: bool = true;
 /// How far a paren's match is looked for (Emacs
@@ -162,6 +167,7 @@ pub struct Config {
     pub cursor_event_interval_ms: u64,
     pub completion_rows: u64,
     pub mouse: bool,
+    pub mouse_drag_copy_region: bool,
     pub mouse_wheel_lines: u64,
     pub panel_width: u64,
     pub quick_open_max_files: u64,
@@ -171,6 +177,8 @@ pub struct Config {
     pub show_paren_max_distance: u64,
     pub osc52_clipboard: bool,
     pub osc52_max_bytes: u64,
+    /// Zero is valid: the notice then stays until the next input.
+    pub clipboard_notice_ms: u64,
     pub theme: ThemeChoice,
     /// Face name to SGR parameters (`keyword = "1;34"`), over the theme's.
     pub faces: BTreeMap<String, String>,
@@ -212,6 +220,7 @@ impl Default for Config {
             cursor_event_interval_ms: CURSOR_EVENT_INTERVAL_MS,
             completion_rows: COMPLETION_ROWS,
             mouse: MOUSE,
+            mouse_drag_copy_region: MOUSE_DRAG_COPY_REGION,
             mouse_wheel_lines: MOUSE_WHEEL_LINES,
             panel_width: PANEL_WIDTH,
             quick_open_max_files: QUICK_OPEN_MAX_FILES,
@@ -221,6 +230,7 @@ impl Default for Config {
             show_paren_max_distance: SHOW_PAREN_MAX_DISTANCE,
             osc52_clipboard: OSC52_CLIPBOARD,
             osc52_max_bytes: OSC52_MAX_BYTES,
+            clipboard_notice_ms: CLIPBOARD_NOTICE_MS,
             theme: ThemeChoice::Dark,
             faces: BTreeMap::new(),
             require_final_newline: false,
@@ -520,10 +530,11 @@ mod tests {
              amalgamation_limit = 17\ncolumn_checkpoint_interval = 18\n\
              long_line_threshold = 19\necho_keystrokes_ms = 0\nmark_ring_max = 20\n\
              indent_tabs_mode = false\ncursor_event_interval_ms = 21\ncompletion_rows = 22\n\
-             keyboard_encoding = \"legacy\"\nmouse = true\nmouse_wheel_lines = 23\n\
+             keyboard_encoding = \"legacy\"\nmouse = true\nmouse_drag_copy_region = true\n\
+             mouse_wheel_lines = 23\n\
              panel_width = 24\nquick_open_max_files = 25\nhighlight_max_file = 26\n\
              highlight_max_line = 27\nshow_paren_mode = false\nshow_paren_max_distance = 28\n\
-             osc52_clipboard = false\nosc52_max_bytes = 29\ntheme = \"light\"\n\
+             osc52_clipboard = false\nosc52_max_bytes = 29\nclipboard_notice_ms = 0\ntheme = \"light\"\n\
              require_final_newline = true\ndelete_trailing_whitespace = true\n\
              [faces]\nkeyword = \"1;34\"\n[file_types.go]\nindent_tabs_mode = true\n",
         )
@@ -558,6 +569,7 @@ mod tests {
             cursor_event_interval_ms: 21,
             completion_rows: 22,
             mouse: true,
+            mouse_drag_copy_region: true,
             mouse_wheel_lines: 23,
             panel_width: 24,
             quick_open_max_files: 25,
@@ -567,6 +579,7 @@ mod tests {
             show_paren_max_distance: 28,
             osc52_clipboard: false,
             osc52_max_bytes: 29,
+            clipboard_notice_ms: 0,
             theme: ThemeChoice::Light,
             faces: BTreeMap::from([("keyword".to_string(), "1;34".to_string())]),
             require_final_newline: true,

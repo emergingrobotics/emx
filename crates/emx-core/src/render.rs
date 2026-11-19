@@ -120,7 +120,13 @@ pub fn render(editor: &Editor, client: ClientId) -> (Grid, Vec<PrefetchRequest>)
             Some(at) => {
                 cursor = draw_minibuffer(&mut grid, row, &line, at, tab_width(editor));
             }
-            None => draw_echo(&mut grid, row, &line, tab_width(editor)),
+            None => draw_echo(
+                &mut grid,
+                row,
+                &line,
+                editor.echo_face(client),
+                tab_width(editor),
+            ),
         }
     }
     grid.cursor = cursor;
@@ -737,9 +743,9 @@ fn external_badge(binding: &FileBinding) -> Option<String> {
     }
 }
 
-fn draw_echo(grid: &mut Grid, row: u16, echo: &[u8], tab_width: usize) {
+fn draw_echo(grid: &mut Grid, row: u16, echo: &[u8], face: Face, tab_width: usize) {
     let mut writer = RowWriter::full_row(grid, row, tab_width);
-    writer.write(echo, Face::Default, Face::EscapeGlyph);
+    writer.write(echo, face, Face::EscapeGlyph);
 }
 
 /// One completion candidate above the echo area; the selected one is
@@ -828,7 +834,13 @@ mod tests {
     #[test]
     fn echo_escapes_control_and_invalid_bytes() {
         let mut grid = Grid::new(20, 1);
-        draw_echo(&mut grid, 0, "a\u{1b}b\u{9b}\tc".as_bytes(), 8);
+        draw_echo(
+            &mut grid,
+            0,
+            "a\u{1b}b\u{9b}\tc".as_bytes(),
+            Face::Default,
+            8,
+        );
         assert_eq!(row_text(&grid, 0), "a^[b\\233        c   ");
         assert_eq!(grid.row(0)[1].face, Face::EscapeGlyph);
         assert_eq!(grid.row(0)[0].face, Face::Default);
@@ -837,10 +849,16 @@ mod tests {
     #[test]
     fn echo_clips_a_wide_glyph_at_the_edge() {
         let mut grid = Grid::new(3, 1);
-        draw_echo(&mut grid, 0, "a\u{4e2d}\u{4e2d}".as_bytes(), 8);
+        draw_echo(
+            &mut grid,
+            0,
+            "a\u{4e2d}\u{4e2d}".as_bytes(),
+            Face::Default,
+            8,
+        );
         assert_eq!(row_text(&grid, 0), "a\u{4e2d}");
         let mut grid = Grid::new(2, 1);
-        draw_echo(&mut grid, 0, "a\u{4e2d}".as_bytes(), 8);
+        draw_echo(&mut grid, 0, "a\u{4e2d}".as_bytes(), Face::Default, 8);
         assert_eq!(row_text(&grid, 0), "a ");
     }
 }

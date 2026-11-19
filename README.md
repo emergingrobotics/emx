@@ -4,9 +4,27 @@ A fast terminal editor with Emacs keybindings, built for humans working alongsid
 
 ## Install
 
-emx runs on Linux. Building it needs Rust 1.88 or later; [rustup](https://rustup.rs) installs one. Distribution `cargo` packages are often older and fail with "this version of Cargo is older than the `2024` edition"; run `rustup update stable`, or use a static binary (below).
+emx runs on Linux. Prebuilt static binaries for x86_64 and aarch64 need nothing else installed. Building from source needs Rust 1.88 or later; [rustup](https://rustup.rs) installs one. Distribution `cargo` packages are often older and fail with "this version of Cargo is older than the `2024` edition"; run `rustup update stable`, or use a prebuilt binary.
 
-From crates.io:
+With Homebrew (Linux):
+
+```sh
+brew tap gherlein/tap
+brew trust gherlein/tap
+brew install emx
+```
+
+Homebrew refuses to load formulae from a tap it does not trust, so the `brew trust` step is required. `brew upgrade emx` picks up new releases.
+
+On Debian or Ubuntu, download the `.deb` for your architecture (`amd64` or `arm64`) from [Releases](https://github.com/emergingrobotics/emx/releases) and install it, which puts `emx` in `/usr/bin`:
+
+```sh
+sudo apt install ./emx_X.Y.Z_linux_amd64.deb
+```
+
+The same page has `.tar.gz` archives holding the bare binary, for any other Linux.
+
+From crates.io (this also works on macOS, for which there is no prebuilt binary):
 
 ```sh
 cargo install --locked emx
@@ -17,9 +35,13 @@ This puts `emx` in `~/.cargo/bin`. To install into `~/.local/bin` instead, add `
 From a checkout of this repository:
 
 ```sh
-make install                      # builds and copies emx to ~/.local/bin
-make install-sys                  # builds and copies emx to /usr/local/bin (uses sudo)
+make install                      # builds and copies emx to /usr/local/bin (asks for sudo)
+make install-user                 # builds and copies emx to ~/.local/bin (no sudo)
+make install PREFIX=/opt/emx      # any other prefix; sudo only if PREFIX/bin is not writable
+make uninstall                    # removes it again (pass the same PREFIX used to install)
 ```
+
+`make install-sys` is an alias for `make install`. Only the copy runs under sudo, so do not run `sudo make install`: it would build as root and leave root-owned files in `target/`. A system-wide install puts `emx` on the path `sudo` searches, so `sudo emx` works. If an older `~/.local/bin/emx` is still there it shadows the system copy for you; remove it and check with `type -a emx`.
 
 ### Other hosts
 
@@ -31,7 +53,7 @@ scp target/x86_64-unknown-linux-musl/release/emx  HOST:.local/bin/emx   # x86_64
 scp target/aarch64-unknown-linux-musl/release/emx HOST:.local/bin/emx   # aarch64
 ```
 
-`make deb` packages the same binaries as `.deb` files.
+`make deb` builds the same static binaries packaged as `.deb` files in `dist/`. `make prereqs` installs the musl targets, cargo-zigbuild and zig these need, if missing.
 
 ### Upgrading
 
@@ -125,7 +147,7 @@ Rust, C, Go, Python, JavaScript, Bash, JSON, TOML and YAML files are highlighted
 
 ### Clipboard
 
-Text you kill or copy also goes to the system clipboard through the terminal (OSC 52). Inside tmux, set `set -g set-clipboard on`. Turn it off with `osc52_clipboard = false`.
+Text you kill or copy also goes to the system clipboard through the terminal (OSC 52). Inside tmux, set `set -g set-clipboard on`. Turn it off with `osc52_clipboard = false`. A copy (`M-w`, or a mouse selection with `mouse_drag_copy_region`) flashes "Copied to clipboard" in the `success` face for `clipboard_notice_ms` (default 1500; 0 keeps it until the next key). A copy larger than `osc52_max_bytes` is not sent and says so in the `warning` face; it is still in the kill ring. emx cannot tell whether the terminal accepted the text: OSC 52 has no reply.
 
 ### Colors and per-file settings
 
@@ -147,7 +169,7 @@ delete_trailing_whitespace = true
 
 ### Mouse
 
-Mouse support is off by default, because turning it on takes over the terminal's own drag-to-select. Turn it on with `mouse = true` in the config, or for the session with `M-x xterm-mouse-mode`. Then a click moves the cursor or selects a window, a drag selects text, double and triple clicks select a word and a line, the right button extends the selection, the wheel scrolls the window under the pointer, and dragging a modeline or border resizes windows and the file panel. Hold Shift to use the terminal's own selection. Inside tmux, also `set -g mouse on`.
+Mouse support is off by default, because turning it on takes over the terminal's own drag-to-select. Turn it on with `mouse = true` in the config, or for the session with `M-x xterm-mouse-mode`. Then a click moves the cursor or selects a window, a drag selects text, double and triple clicks select a word and a line, the right button extends the selection, the wheel scrolls the window under the pointer, and dragging a modeline or border resizes windows and the file panel. Hold Shift to use the terminal's own selection. Inside tmux, also `set -g mouse on`. With `mouse_drag_copy_region = true` (Emacs `mouse-drag-copy-region`), releasing a drag, or a double or triple click, also copies the selection to the kill ring and the clipboard, as a terminal or multiplexer selection does.
 
 ### Terminals
 
@@ -166,6 +188,27 @@ make build        # release binary at bin/emx
 make test         # all workspace tests
 make check        # fmt check, clippy, tests
 ```
+
+### Releasing
+
+Releases are built by [GoReleaser](https://goreleaser.com) from `.goreleaser.yaml`: static musl binaries for Linux x86_64 and aarch64, `.tar.gz` archives, `.deb` packages, checksums, and the Homebrew formula pushed to [gherlein/homebrew-tap](https://github.com/gherlein/homebrew-tap). There are no macOS binaries, because linking for macOS needs Apple's SDK.
+
+```sh
+make prereqs      # installs missing tools: musl targets, cargo-zigbuild, zig, goreleaser
+make snapshot     # builds everything into dist/ and publishes nothing
+```
+
+To release, set the workspace `version` in `Cargo.toml`, commit and push, then tag that commit with the same version and run the release:
+
+```sh
+git tag -a vX.Y.Z -m "emx X.Y.Z"
+git push origin vX.Y.Z
+export GITHUB_TOKEN=$(gh auth token)
+export HOMEBREW_TAP_TOKEN=$GITHUB_TOKEN
+make release
+```
+
+`make release` refuses to run unless HEAD carries the `v` tag matching `Cargo.toml`, since that version is what `emx --version` reports. Both tokens are needed: without `HOMEBREW_TAP_TOKEN` the GitHub release is created but the formula push fails with `401 Bad credentials`. In that case do not run the release again; open a pull request to the tap with `dist/homebrew/Formula/emx.rb` instead.
 
 ## Documentation
 

@@ -15,6 +15,8 @@ pub enum Face {
     EscapeGlyph,
     Error,
     Warning,
+    /// Emacs `success`: an action reported as done, as a copy.
+    Success,
     ChangedMarker,
     /// The selected completion candidate (Emacs `icomplete-selected-match`).
     CompletionSelected,
@@ -49,7 +51,7 @@ pub enum Face {
 }
 
 impl Face {
-    pub const ALL: [Face; 29] = [
+    pub const ALL: [Face; 30] = [
         Face::Default,
         Face::ModeLine,
         Face::ModeLineInactive,
@@ -61,6 +63,7 @@ impl Face {
         Face::EscapeGlyph,
         Face::Error,
         Face::Warning,
+        Face::Success,
         Face::ChangedMarker,
         Face::CompletionSelected,
         Face::PanelDirectory,
@@ -95,6 +98,7 @@ impl Face {
             Face::EscapeGlyph => "escape_glyph",
             Face::Error => "error",
             Face::Warning => "warning",
+            Face::Success => "success",
             Face::ChangedMarker => "changed_marker",
             Face::CompletionSelected => "completion_selected",
             Face::PanelDirectory => "panel_directory",
