@@ -61,6 +61,8 @@ const MODELINE_ANSI: &str = " ANSI";
 const VERTICAL_BORDER_GLYPH: &str = "|";
 /// `mode-line-end-spaces` on a terminal: `-%-` fills with dashes.
 const MODELINE_FILL: &str = "-";
+/// Closes a window's modeline so the editor is not mistaken for Emacs.
+const MODELINE_PROGRAM: &str = " emx -";
 /// The panel's modeline before its root is known.
 const PANEL_MODELINE: &str = "Tree";
 const UNKNOWN_LINE: &str = "?";
@@ -601,6 +603,22 @@ impl<'g> RowWriter<'g> {
         }
     }
 
+    /// Fills like `fill`, ending the row with `tail` when it fits after at
+    /// least one fill unit.
+    fn fill_with_tail(&mut self, bytes: &[u8], tail: &str, face: Face) {
+        let tail_columns = tail.len();
+        let fits = self.col + bytes.len() + tail_columns <= self.right;
+        if !fits {
+            self.fill(bytes, face);
+            return;
+        }
+        let right = self.right;
+        self.right -= tail_columns;
+        self.fill(bytes, face);
+        self.right = right;
+        self.write(tail.as_bytes(), face, face);
+    }
+
     fn pad_to(&mut self, column: usize, face: Face) {
         while self.col < column {
             self.write(b" ", face, face);
@@ -722,7 +740,7 @@ fn draw_modeline(writer: &mut RowWriter, modeline: &Modeline) {
         let badge = format!("Saving {}% ", progress.percent());
         writer.write(badge.as_bytes(), face, face);
     }
-    writer.fill(MODELINE_FILL.as_bytes(), face);
+    writer.fill_with_tail(MODELINE_FILL.as_bytes(), MODELINE_PROGRAM, face);
 }
 
 /// The modeline notice for what happened to the visited file on disk. A

@@ -40,10 +40,19 @@ fn top_line(harness: &Harness) -> String {
     harness.screen()[0].trim_end().to_string()
 }
 
+/// emx's own name at the right end of a modeline, when the row has room.
+const PROGRAM_TAIL: &str = " emx -";
+
 /// The modeline Emacs shows for this state, with the dashes `%-` adds up
-/// to the window width.
+/// to the window width, ending in emx's name where it fits after a dash.
 fn modeline(prefix: &str, cols: usize) -> String {
-    format!("{prefix:-<cols$}")
+    if prefix.len() + 1 + PROGRAM_TAIL.len() > cols {
+        let mut line = format!("{prefix:-<cols$}");
+        line.truncate(cols);
+        return line;
+    }
+    let dashed = cols - PROGRAM_TAIL.len();
+    format!("{prefix:-<dashed$}{PROGRAM_TAIL}")
 }
 
 fn frames(sent: &[ServerMsg]) -> Vec<&ServerMsg> {
@@ -84,11 +93,7 @@ fn modeline_matches_the_emacs_nw_screen() {
         harness.resize(cols, 24);
         let width = usize::from(cols);
         let modeline = |harness: &Harness| harness.screen()[22].clone();
-        let expected = |prefix: &str| {
-            let mut line = format!("{prefix:-<width$}");
-            line.truncate(width);
-            line
-        };
+        let expected = |prefix: &str| self::modeline(prefix, width);
         assert_eq!(
             modeline(&harness),
             expected("-UUU:---  F1  *scratch*      All   L1     (Fundamental) ")
